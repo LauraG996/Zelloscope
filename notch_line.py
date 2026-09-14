@@ -2,11 +2,11 @@
 """Draw a reference line connecting the two "shoulder" points of a V-notch.
 
 The shoulder points are where the notch void meets the material at its top
-(where the notch ceiling meets the left and right legs). To find them
-reliably regardless of the object's tilt, the mask is first leveled using
-the same PCA-based rotation as straighten.py, the shoulder points are found
-on the leveled (axis-aligned) mask, and then mapped back into the original
-image's coordinates.
+(where the notch ceiling meets the left and right legs). The notch is found
+as the gap between the object's convex hull and the object itself (hull
+minus mask); fitting a minimum-area rotated rectangle to that gap gives its
+top edge regardless of how tilted the object is, without needing any
+separate rotation-detection step.
 """
 import argparse
 import sys
@@ -15,16 +15,11 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from straighten import IMAGE_EXTS, largest_foreground_mask, principal_axis_angle, rotation_matrix_expand
+from straighten import IMAGE_EXTS, largest_foreground_mask
 
 
 def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Locate the two points where the notch void meets the material at its top.
-
-    Assumes the notch ceiling is roughly horizontal (call this on a leveled mask).
-    The notch is found as the gap between the object's convex hull and the
-    object itself (hull minus mask); its topmost row gives the two shoulder points.
-    """
+    """Locate the two points where the notch void meets the material at its top."""
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise ValueError("No object found in image")
@@ -38,32 +33,15 @@ def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple
     if num_labels <= 1:
         raise ValueError("No notch (concavity) found on the object's contour")
     notch_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    notch_mask = np.where(labels == notch_label, 255, 0).astype(np.uint8)
 
-    ys, xs = np.where(labels == notch_label)
-    top_y = ys.min()
-    row_xs = xs[ys == top_y]
-    left = (int(row_xs.min()), int(top_y))
-    right = (int(row_xs.max()), int(top_y))
-    return left, right
+    notch_contours, _ = cv2.findContours(notch_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    notch_contour = max(notch_contours, key=cv2.contourArea)
 
-
-def find_shoulder_points_original_frame(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Level the mask so the notch ceiling is horizontal, find the shoulders there,
-    then map them back into the original (un-leveled) image's coordinates."""
-    h, w = mask.shape
-    angle = principal_axis_angle(mask)
-    matrix, new_w, new_h = rotation_matrix_expand(h, w, -angle)
-
-    leveled_mask = cv2.warpAffine(
-        mask, matrix, (new_w, new_h),
-        flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT, borderValue=0,
-    )
-    left, right = find_notch_shoulder_points(leveled_mask)
-
-    inverse = cv2.invertAffineTransform(matrix)
-    points = np.array([left, right], dtype=np.float64)
-    mapped = cv2.transform(points.reshape(-1, 1, 2), inverse).reshape(-1, 2)
-    (lx, ly), (rx, ry) = mapped
+    box = cv2.boxPoints(cv2.minAreaRect(notch_contour))
+    top_two = box[np.argsort(box[:, 1])[:2]]
+    top_two = top_two[np.argsort(top_two[:, 0])]  # order left-to-right
+    (lx, ly), (rx, ry) = top_two
     return (int(round(lx)), int(round(ly))), (int(round(rx)), int(round(ry)))
 
 
@@ -79,7 +57,7 @@ def extend_line_to_edges(p1: tuple[int, int], p2: tuple[int, int], width: int, h
 def draw_shoulder_line(image: np.ndarray, extend: bool = True) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     mask = largest_foreground_mask(gray)
-    p1, p2 = find_shoulder_points_original_frame(mask)
+    p1, p2 = find_notch_shoulder_points(mask)
 
     output = image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     if extend:
