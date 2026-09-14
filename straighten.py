@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """Auto-straighten tilted microscopy images by rotating them level.
 
-Segments the bright foreground object from a dark background, finds its
-principal axis with PCA, and rotates the image so that axis is vertical.
-Works on single files or a whole directory of images.
+Segments the bright foreground object from a dark background, finds the two
+points where its outer top cap transitions into the legs (see
+find_top_border_shoulder_points), and rotates the image so the line between
+them is horizontal. Works on single files or a whole directory of images.
 """
 import argparse
 import sys
@@ -30,24 +31,66 @@ def largest_foreground_mask(gray: np.ndarray) -> np.ndarray:
     return np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
 
-def principal_axis_angle(mask: np.ndarray) -> float:
-    """Angle (degrees) to rotate the image so the object's long axis is vertical."""
-    ys, xs = np.where(mask > 0)
-    coords = np.column_stack((xs, ys)).astype(np.float64)
+# Width (px) of the moving-average smoothing applied to the top profile,
+# to average out foam-cell texture noise before slope estimation.
+SMOOTH_WINDOW = 31
+# Column step (px) used to estimate local slope of the top profile.
+SLOPE_STEP = 40
+# dy/dx magnitude beyond which the profile is considered to have left the
+# rounded top cap and entered a leg's side.
+SLOPE_THRESHOLD = 0.6
 
-    mean, eigenvectors = cv2.PCACompute(coords, mean=None)
-    principal = eigenvectors[0]  # direction of greatest variance
-    vx, vy = principal
 
-    # Angle between the principal axis and the vertical (0, 1) axis.
-    angle_deg = np.degrees(np.arctan2(vx, vy))
+def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Locate the two points where the object's rounded top cap transitions into its legs.
 
-    # Keep the correction within +/-90 degrees (axis has no inherent direction).
-    if angle_deg > 90:
-        angle_deg -= 180
-    elif angle_deg < -90:
-        angle_deg += 180
-    return angle_deg
+    Traces the outer top boundary (topmost foreground pixel per column),
+    smooths it to average out foam-cell texture noise, and walks outward
+    from its peak until the local slope steepens past a threshold.
+    """
+    ys_all, xs_all = np.where(mask > 0)
+    if len(xs_all) == 0:
+        raise ValueError("No object found in image")
+    x_min, x_max = xs_all.min(), xs_all.max()
+    w = x_max - x_min + 1
+    if w < 2 * SLOPE_STEP:
+        raise ValueError("Object too narrow to reliably locate its top-border shoulders")
+
+    top_row_per_col = np.full(w, -1, dtype=np.int64)
+    for col in range(w):
+        col_ys = np.where(mask[:, x_min + col] > 0)[0]
+        if len(col_ys):
+            top_row_per_col[col] = col_ys.min()
+    has_fg = top_row_per_col >= 0
+    xs = np.where(has_fg)[0] + x_min
+    ys = top_row_per_col[has_fg]
+
+    kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
+    ys_smooth = np.convolve(ys.astype(float), kernel, mode="same")
+
+    center = int(np.argmin(ys_smooth))  # peak of the top cap
+    left = center
+    while left - SLOPE_STEP > 0:
+        slope = (ys_smooth[left] - ys_smooth[left - SLOPE_STEP]) / SLOPE_STEP
+        if slope < -SLOPE_THRESHOLD:
+            break
+        left -= 1
+    right = center
+    while right + SLOPE_STEP < len(xs) - 1:
+        slope = (ys_smooth[right + SLOPE_STEP] - ys_smooth[right]) / SLOPE_STEP
+        if slope > SLOPE_THRESHOLD:
+            break
+        right += 1
+
+    left_point = (int(xs[left]), int(round(ys_smooth[left])))
+    right_point = (int(xs[right]), int(round(ys_smooth[right])))
+    return left_point, right_point
+
+
+def shoulder_line_angle(mask: np.ndarray) -> float:
+    """Angle (degrees) of the line through the top-border shoulder points, from horizontal."""
+    (x1, y1), (x2, y2) = find_top_border_shoulder_points(mask)
+    return np.degrees(np.arctan2(y2 - y1, x2 - x1))
 
 
 def rotation_matrix_expand(h: int, w: int, angle_deg: float) -> tuple[np.ndarray, int, int]:
@@ -76,8 +119,8 @@ def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
 def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     mask = largest_foreground_mask(gray)
-    angle = principal_axis_angle(mask)
-    # Rotate by -angle to bring the axis to vertical (cv2 rotates CCW for +angle).
+    angle = shoulder_line_angle(mask)
+    # Rotate by -angle to bring the shoulder line to horizontal (cv2 rotates CCW for +angle).
     return rotate_bound(image, -angle), angle
 
 
