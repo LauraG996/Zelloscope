@@ -120,8 +120,9 @@ def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     mask = largest_foreground_mask(gray)
     angle = shoulder_line_angle(mask)
-    # Rotate by -angle to bring the shoulder line to horizontal (cv2 rotates CCW for +angle).
-    return rotate_bound(image, -angle), angle
+    # Rotating by the measured angle itself brings the shoulder line to horizontal
+    # (cv2's rotation direction convention already matches atan2's here).
+    return rotate_bound(image, angle), angle
 
 
 def process_file(src: Path, dst: Path) -> float:
