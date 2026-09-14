@@ -4,9 +4,13 @@
 Segments the bright foreground object from a dark background, finds the two
 points where its outer top cap transitions into the legs (see
 find_top_border_shoulder_points), and rotates the image so the line between
-them is horizontal. Works on single files or a whole directory of images.
+them is horizontal. Also measures the distance between the two "inner"
+shoulder points (where the V-notch meets the material) on the rotated
+image. Works on single files or a whole directory of images; for a
+directory, also writes a measurements.csv summary.
 """
 import argparse
+import csv
 import sys
 from pathlib import Path
 
@@ -93,6 +97,69 @@ def shoulder_line_angle(mask: np.ndarray) -> float:
     return np.degrees(np.arctan2(y2 - y1, x2 - x1))
 
 
+def _notch_mask(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("No object found in image")
+    contour = max(contours, key=cv2.contourArea)
+
+    hull_mask = np.zeros_like(mask)
+    cv2.fillConvexPoly(hull_mask, cv2.convexHull(contour), 255)
+    defect_mask = cv2.bitwise_and(hull_mask, cv2.bitwise_not(mask))
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(defect_mask, connectivity=8)
+    if num_labels <= 1:
+        raise ValueError("No notch (concavity) found on the object's contour")
+    notch_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    notch_mask = np.where(labels == notch_label, 255, 0).astype(np.uint8)
+    x, y, w, h = stats[notch_label, :4]
+    return notch_mask, (x, y, w, h)
+
+
+def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Locate the two "inner" shoulder points, where the notch void meets the material.
+
+    Same profile-walk technique as find_top_border_shoulder_points, applied to
+    the notch's own top boundary instead of the object's outer top boundary.
+    """
+    notch_mask, (x, y, w, h) = _notch_mask(mask)
+
+    region = notch_mask[y:y + h, x:x + w]
+    top_row_per_col = region.argmax(axis=0)
+    has_fg = region.any(axis=0)
+    if has_fg.sum() < 2 * SLOPE_STEP:
+        raise ValueError("Notch too small to reliably locate its shoulders")
+    xs = np.where(has_fg)[0] + x
+    ys = top_row_per_col[has_fg] + y
+
+    kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
+    ys_smooth = np.convolve(ys.astype(float), kernel, mode="same")
+
+    center = len(xs) // 2
+    left = center
+    while left - SLOPE_STEP > 0:
+        slope = (ys_smooth[left] - ys_smooth[left - SLOPE_STEP]) / SLOPE_STEP
+        if slope < -SLOPE_THRESHOLD:
+            break
+        left -= 1
+    right = center
+    while right + SLOPE_STEP < len(xs) - 1:
+        slope = (ys_smooth[right + SLOPE_STEP] - ys_smooth[right]) / SLOPE_STEP
+        if slope > SLOPE_THRESHOLD:
+            break
+        right += 1
+
+    left_point = (int(xs[left]), int(round(ys_smooth[left])))
+    right_point = (int(xs[right]), int(round(ys_smooth[right])))
+    return left_point, right_point
+
+
+def inner_shoulder_distance(mask: np.ndarray) -> float:
+    """Euclidean distance (px) between the two inner (notch) shoulder points."""
+    (x1, y1), (x2, y2) = find_notch_shoulder_points(mask)
+    return float(np.hypot(x2 - x1, y2 - y1))
+
+
 def rotation_matrix_expand(h: int, w: int, angle_deg: float) -> tuple[np.ndarray, int, int]:
     """Rotation matrix for angle_deg (CCW positive) plus the canvas size needed to avoid cropping."""
     cx, cy = w / 2, h / 2
@@ -125,14 +192,22 @@ def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
     return rotate_bound(image, angle), angle
 
 
-def process_file(src: Path, dst: Path) -> float:
+def process_file(src: Path, dst: Path) -> tuple[float, float]:
+    """Straighten src, save to dst, and return (rotation_deg, inner_shoulder_distance_px).
+
+    The distance is measured on the straightened (rotated) image, not the original.
+    """
     image = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise ValueError(f"Could not read image: {src}")
     straightened, angle = straighten(image)
     dst.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(dst), straightened)
-    return angle
+
+    gray = cv2.cvtColor(straightened, cv2.COLOR_BGR2GRAY) if straightened.ndim == 3 else straightened
+    mask = largest_foreground_mask(gray)
+    distance = inner_shoulder_distance(mask)
+    return angle, distance
 
 
 def main() -> None:
@@ -146,12 +221,24 @@ def main() -> None:
         files = sorted(p for p in args.input.iterdir() if p.suffix.lower() in IMAGE_EXTS)
         if not files:
             sys.exit(f"No images found in {args.input}")
-        for src in files:
-            angle = process_file(src, args.output / src.name)
-            print(f"{src.name}: rotated {angle:+.2f} deg -> {args.output / src.name}")
+        csv_path = args.output / "measurements.csv"
+        with open(csv_path, "w", newline="") as f:
+            writer = csv.writer(f)
+            writer.writerow(["filename", "rotation_deg", "inner_shoulder_distance_px"])
+            for src in files:
+                angle, distance = process_file(src, args.output / src.name)
+                print(
+                    f"{src.name}: rotated {angle:+.2f} deg, "
+                    f"inner shoulder distance {distance:.1f} px -> {args.output / src.name}"
+                )
+                writer.writerow([src.name, f"{angle:.2f}", f"{distance:.1f}"])
+        print(f"Measurements written to {csv_path}")
     else:
-        angle = process_file(args.input, args.output)
-        print(f"{args.input.name}: rotated {angle:+.2f} deg -> {args.output}")
+        angle, distance = process_file(args.input, args.output)
+        print(
+            f"{args.input.name}: rotated {angle:+.2f} deg, "
+            f"inner shoulder distance {distance:.1f} px -> {args.output}"
+        )
 
 
 if __name__ == "__main__":
