@@ -50,11 +50,9 @@ def principal_axis_angle(mask: np.ndarray) -> float:
     return angle_deg
 
 
-def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
-    """Rotate image by angle_deg (counter-clockwise positive) expanding the canvas."""
-    h, w = image.shape[:2]
+def rotation_matrix_expand(h: int, w: int, angle_deg: float) -> tuple[np.ndarray, int, int]:
+    """Rotation matrix for angle_deg (CCW positive) plus the canvas size needed to avoid cropping."""
     cx, cy = w / 2, h / 2
-
     matrix = cv2.getRotationMatrix2D((cx, cy), angle_deg, 1.0)
     cos, sin = abs(matrix[0, 0]), abs(matrix[0, 1])
     new_w = int((h * sin) + (w * cos))
@@ -62,7 +60,13 @@ def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
 
     matrix[0, 2] += (new_w / 2) - cx
     matrix[1, 2] += (new_h / 2) - cy
+    return matrix, new_w, new_h
 
+
+def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
+    """Rotate image by angle_deg (counter-clockwise positive) expanding the canvas."""
+    h, w = image.shape[:2]
+    matrix, new_w, new_h = rotation_matrix_expand(h, w, angle_deg)
     return cv2.warpAffine(
         image, matrix, (new_w, new_h),
         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0),
