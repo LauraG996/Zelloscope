@@ -160,6 +160,35 @@ def inner_shoulder_distance(mask: np.ndarray) -> float:
     return float(np.hypot(x2 - x1, y2 - y1))
 
 
+def draw_inner_shoulder_measurement(
+    image: np.ndarray,
+    p1: tuple[int, int],
+    p2: tuple[int, int],
+    distance_px: float,
+    pix2mm: float | None = None,
+) -> np.ndarray:
+    """Draw the two inner shoulder points, the segment between them, and a distance label."""
+    output = image.copy()
+    scale = max(image.shape[:2]) / 1500  # so markers stay visible at any resolution
+    radius = max(6, int(round(8 * scale)))
+    thickness = max(2, int(round(3 * scale)))
+
+    cv2.line(output, p1, p2, (0, 0, 255), thickness, cv2.LINE_AA)
+    cv2.circle(output, p1, radius, (0, 255, 0), -1)
+    cv2.circle(output, p2, radius, (0, 255, 0), -1)
+
+    label = f"{distance_px:.1f}px"
+    if pix2mm is not None:
+        label += f" / {distance_px * pix2mm:.2f}mm"
+    mx, my = (p1[0] + p2[0]) // 2, min(p1[1], p2[1])
+    font_scale = max(0.6, 1.2 * scale)
+    cv2.putText(
+        output, label, (mx, max(0, my - int(20 * scale))),
+        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), max(1, int(round(2 * scale))), cv2.LINE_AA,
+    )
+    return output
+
+
 def rotation_matrix_expand(h: int, w: int, angle_deg: float) -> tuple[np.ndarray, int, int]:
     """Rotation matrix for angle_deg (CCW positive) plus the canvas size needed to avoid cropping."""
     cx, cy = w / 2, h / 2
@@ -192,28 +221,43 @@ def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
     return rotate_bound(image, angle), angle
 
 
-def process_file(src: Path, dst: Path) -> tuple[float, float]:
-    """Straighten src, save to dst, and return (rotation_deg, inner_shoulder_distance_px).
+def process_file(src: Path, dst: Path, pix2mm: float | None = None) -> tuple[float, float, float | None]:
+    """Straighten src, draw the inner-shoulder measurement on it, save to dst.
 
-    The distance is measured on the straightened (rotated) image, not the original.
+    Returns (rotation_deg, inner_shoulder_distance_px, inner_shoulder_distance_mm).
+    The measurement is drawn and computed on the straightened (rotated) image.
     """
     image = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise ValueError(f"Could not read image: {src}")
     straightened, angle = straighten(image)
-    dst.parent.mkdir(parents=True, exist_ok=True)
-    cv2.imwrite(str(dst), straightened)
 
     gray = cv2.cvtColor(straightened, cv2.COLOR_BGR2GRAY) if straightened.ndim == 3 else straightened
     mask = largest_foreground_mask(gray)
-    distance = inner_shoulder_distance(mask)
-    return angle, distance
+    p1, p2 = find_notch_shoulder_points(mask)
+    distance_px = float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
+    distance_mm = distance_px * pix2mm if pix2mm is not None else None
+
+    annotated = draw_inner_shoulder_measurement(straightened, p1, p2, distance_px, pix2mm)
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(dst), annotated)
+    return angle, distance_px, distance_mm
+
+
+def _format_distance(distance_px: float, distance_mm: float | None) -> str:
+    if distance_mm is not None:
+        return f"{distance_px:.1f} px ({distance_mm:.2f} mm)"
+    return f"{distance_px:.1f} px"
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="Input image file or directory")
     parser.add_argument("output", type=Path, help="Output image file or directory")
+    parser.add_argument(
+        "--pix2mm", type=float, default=None,
+        help="Millimeters per pixel, to also report the inner shoulder distance in mm",
+    )
     args = parser.parse_args()
 
     if args.input.is_dir():
@@ -222,22 +266,29 @@ def main() -> None:
         if not files:
             sys.exit(f"No images found in {args.input}")
         csv_path = args.output / "measurements.csv"
+        header = ["filename", "rotation_deg", "inner_shoulder_distance_px"]
+        if args.pix2mm is not None:
+            header.append("inner_shoulder_distance_mm")
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
-            writer.writerow(["filename", "rotation_deg", "inner_shoulder_distance_px"])
+            writer.writerow(header)
             for src in files:
-                angle, distance = process_file(src, args.output / src.name)
+                angle, distance_px, distance_mm = process_file(src, args.output / src.name, args.pix2mm)
                 print(
                     f"{src.name}: rotated {angle:+.2f} deg, "
-                    f"inner shoulder distance {distance:.1f} px -> {args.output / src.name}"
+                    f"inner shoulder distance {_format_distance(distance_px, distance_mm)} "
+                    f"-> {args.output / src.name}"
                 )
-                writer.writerow([src.name, f"{angle:.2f}", f"{distance:.1f}"])
+                row = [src.name, f"{angle:.2f}", f"{distance_px:.1f}"]
+                if distance_mm is not None:
+                    row.append(f"{distance_mm:.2f}")
+                writer.writerow(row)
         print(f"Measurements written to {csv_path}")
     else:
-        angle, distance = process_file(args.input, args.output)
+        angle, distance_px, distance_mm = process_file(args.input, args.output, args.pix2mm)
         print(
             f"{args.input.name}: rotated {angle:+.2f} deg, "
-            f"inner shoulder distance {distance:.1f} px -> {args.output}"
+            f"inner shoulder distance {_format_distance(distance_px, distance_mm)} -> {args.output}"
         )
 
 
