@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
-"""Draw a reference line connecting the two "shoulder" points of a V-notch.
+"""Draw a reference line across the object's outer top border.
 
-The shoulder points are where the notch void meets the material at its top
-(where the notch ceiling meets the left and right legs). Found by tracing
-the notch's top boundary profile (topmost background pixel per column) and
-walking outward from its center until the profile's local slope steepens
-past a threshold -- i.e. until the boundary stops being the roughly flat
-ceiling and starts being a leg wall.
+Traces the outer top boundary (topmost foreground pixel per column across
+the whole object), smooths it to average out foam-cell texture noise, and
+walks outward from its peak until the local slope steepens past a
+threshold -- i.e. until the boundary leaves the rounded top cap and enters
+a leg's relatively straight side. The line connects those two points.
 """
 import argparse
 import sys
@@ -23,45 +22,33 @@ SMOOTH_WINDOW = 31
 # Column step (px) used to estimate local slope of the top profile.
 SLOPE_STEP = 40
 # dy/dx magnitude beyond which the profile is considered to have left the
-# notch ceiling and entered a leg wall.
+# rounded top cap and entered a leg's side.
 SLOPE_THRESHOLD = 0.6
 
 
-def _notch_mask(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
+def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Locate the two points where the rounded top cap transitions into the legs."""
+    ys_all, xs_all = np.where(mask > 0)
+    if len(xs_all) == 0:
         raise ValueError("No object found in image")
-    contour = max(contours, key=cv2.contourArea)
+    x_min, x_max = xs_all.min(), xs_all.max()
+    w = x_max - x_min + 1
+    if w < 2 * SLOPE_STEP:
+        raise ValueError("Object too narrow to reliably locate its top-border shoulders")
 
-    hull_mask = np.zeros_like(mask)
-    cv2.fillConvexPoly(hull_mask, cv2.convexHull(contour), 255)
-    defect_mask = cv2.bitwise_and(hull_mask, cv2.bitwise_not(mask))
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(defect_mask, connectivity=8)
-    if num_labels <= 1:
-        raise ValueError("No notch (concavity) found on the object's contour")
-    notch_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    notch_mask = np.where(labels == notch_label, 255, 0).astype(np.uint8)
-    x, y, w, h = stats[notch_label, :4]
-    return notch_mask, (x, y, w, h)
-
-
-def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Locate the two points where the notch void meets the material at its top."""
-    notch_mask, (x, y, w, h) = _notch_mask(mask)
-
-    region = notch_mask[y:y + h, x:x + w]
-    top_row_per_col = region.argmax(axis=0)
-    has_fg = region.any(axis=0)
-    if has_fg.sum() < 2 * SLOPE_STEP:
-        raise ValueError("Notch too small to reliably locate its shoulders")
-    xs = np.where(has_fg)[0] + x
-    ys = top_row_per_col[has_fg] + y
+    top_row_per_col = np.full(w, -1, dtype=np.int64)
+    for col in range(w):
+        col_ys = np.where(mask[:, x_min + col] > 0)[0]
+        if len(col_ys):
+            top_row_per_col[col] = col_ys.min()
+    has_fg = top_row_per_col >= 0
+    xs = np.where(has_fg)[0] + x_min
+    ys = top_row_per_col[has_fg]
 
     kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
     ys_smooth = np.convolve(ys.astype(float), kernel, mode="same")
 
-    center = len(xs) // 2
+    center = int(np.argmin(ys_smooth))  # peak of the top cap
     left = center
     while left - SLOPE_STEP > 0:
         slope = (ys_smooth[left] - ys_smooth[left - SLOPE_STEP]) / SLOPE_STEP
@@ -92,7 +79,7 @@ def extend_line_to_edges(p1: tuple[int, int], p2: tuple[int, int], width: int, h
 def draw_shoulder_line(image: np.ndarray, extend: bool = True) -> np.ndarray:
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     mask = largest_foreground_mask(gray)
-    p1, p2 = find_notch_shoulder_points(mask)
+    p1, p2 = find_top_border_shoulder_points(mask)
 
     output = image.copy() if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
     if extend:
