@@ -2,11 +2,11 @@
 """Draw a reference line connecting the two "shoulder" points of a V-notch.
 
 The shoulder points are where the notch void meets the material at its top
-(where the notch ceiling meets the left and right legs). The notch is found
-as the gap between the object's convex hull and the object itself (hull
-minus mask); fitting a minimum-area rotated rectangle to that gap gives its
-top edge regardless of how tilted the object is, without needing any
-separate rotation-detection step.
+(where the notch ceiling meets the left and right legs). Found by tracing
+the notch's top boundary profile (topmost background pixel per column) and
+walking outward from its center until the profile's local slope steepens
+past a threshold -- i.e. until the boundary stops being the roughly flat
+ceiling and starts being a leg wall.
 """
 import argparse
 import sys
@@ -17,9 +17,17 @@ import numpy as np
 
 from straighten import IMAGE_EXTS, largest_foreground_mask
 
+# Width (px) of the moving-average smoothing applied to the top profile,
+# to average out foam-cell texture noise before slope estimation.
+SMOOTH_WINDOW = 31
+# Column step (px) used to estimate local slope of the top profile.
+SLOPE_STEP = 40
+# dy/dx magnitude beyond which the profile is considered to have left the
+# notch ceiling and entered a leg wall.
+SLOPE_THRESHOLD = 0.6
 
-def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Locate the two points where the notch void meets the material at its top."""
+
+def _notch_mask(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
     contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
         raise ValueError("No object found in image")
@@ -34,15 +42,42 @@ def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple
         raise ValueError("No notch (concavity) found on the object's contour")
     notch_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
     notch_mask = np.where(labels == notch_label, 255, 0).astype(np.uint8)
+    x, y, w, h = stats[notch_label, :4]
+    return notch_mask, (x, y, w, h)
 
-    notch_contours, _ = cv2.findContours(notch_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    notch_contour = max(notch_contours, key=cv2.contourArea)
 
-    box = cv2.boxPoints(cv2.minAreaRect(notch_contour))
-    top_two = box[np.argsort(box[:, 1])[:2]]
-    top_two = top_two[np.argsort(top_two[:, 0])]  # order left-to-right
-    (lx, ly), (rx, ry) = top_two
-    return (int(round(lx)), int(round(ly))), (int(round(rx)), int(round(ry)))
+def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Locate the two points where the notch void meets the material at its top."""
+    notch_mask, (x, y, w, h) = _notch_mask(mask)
+
+    region = notch_mask[y:y + h, x:x + w]
+    top_row_per_col = region.argmax(axis=0)
+    has_fg = region.any(axis=0)
+    if has_fg.sum() < 2 * SLOPE_STEP:
+        raise ValueError("Notch too small to reliably locate its shoulders")
+    xs = np.where(has_fg)[0] + x
+    ys = top_row_per_col[has_fg] + y
+
+    kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
+    ys_smooth = np.convolve(ys.astype(float), kernel, mode="same")
+
+    center = len(xs) // 2
+    left = center
+    while left - SLOPE_STEP > 0:
+        slope = (ys_smooth[left] - ys_smooth[left - SLOPE_STEP]) / SLOPE_STEP
+        if slope < -SLOPE_THRESHOLD:
+            break
+        left -= 1
+    right = center
+    while right + SLOPE_STEP < len(xs) - 1:
+        slope = (ys_smooth[right + SLOPE_STEP] - ys_smooth[right]) / SLOPE_STEP
+        if slope > SLOPE_THRESHOLD:
+            break
+        right += 1
+
+    left_point = (int(xs[left]), int(round(ys_smooth[left])))
+    right_point = (int(xs[right]), int(round(ys_smooth[right])))
+    return left_point, right_point
 
 
 def extend_line_to_edges(p1: tuple[int, int], p2: tuple[int, int], width: int, height: int):
