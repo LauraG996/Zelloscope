@@ -5,9 +5,9 @@ Segments the bright foreground object from a dark background, finds the two
 points where its outer top cap transitions into the legs (see
 find_top_border_shoulder_points), and rotates the image so the line between
 them is horizontal. Then, on that rotated image, measures the distance
-between the two "inner" shoulder points where the V-notch meets the
-material (see find_notch_shoulder_points) -- a different pair of points
-from the ones used for rotation. Works on single files or a whole
+between the notch's two widest ("vertex") points (see
+find_notch_vertex_points) -- a different pair of points from the ones
+used for rotation. Works on single files or a whole
 directory of images; for a directory, also writes a measurements.csv
 summary.
 """
@@ -123,65 +123,41 @@ def _notch_mask(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]
     return notch_mask, (x, y, w, h)
 
 
-def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Locate the two "inner" shoulder points, where the notch void meets the material.
+def find_notch_vertex_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Locate the notch's leftmost and rightmost points (its widest extent).
 
-    Same profile-walk technique as find_top_border_shoulder_points, applied to
-    the notch's own top boundary instead of the object's outer top boundary.
+    Simpler and more robust than the slope-threshold walk: no smoothing or
+    threshold to tune, and it isn't thrown off by small debris hanging into
+    the notch (which typically doesn't extend past the true walls). Since
+    the notch is widest near its mouth and narrows going down, these land
+    close to (but usually a bit below/wider than) the shoulder corners.
     """
-    notch_mask, (x, y, w, h) = _notch_mask(mask)
-
-    region = notch_mask[y:y + h, x:x + w]
-    top_row_per_col = region.argmax(axis=0)
-    has_fg = region.any(axis=0)
-    if has_fg.sum() < 2 * SLOPE_STEP:
-        raise ValueError("Notch too small to reliably locate its shoulders")
-    xs = np.where(has_fg)[0] + x
-    ys = top_row_per_col[has_fg] + y
-
-    kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
-    ys_smooth = np.convolve(ys.astype(float), kernel, mode="same")
-
-    center = len(xs) // 2
-    left = center
-    while left - SLOPE_STEP > 0:
-        slope = (ys_smooth[left] - ys_smooth[left - SLOPE_STEP]) / SLOPE_STEP
-        if slope < -SLOPE_THRESHOLD:
-            break
-        left -= 1
-    right = center
-    while right + SLOPE_STEP < len(xs) - 1:
-        slope = (ys_smooth[right + SLOPE_STEP] - ys_smooth[right]) / SLOPE_STEP
-        if slope > SLOPE_THRESHOLD:
-            break
-        right += 1
-
-    left_point = (int(xs[left]), int(round(ys_smooth[left])))
-    right_point = (int(xs[right]), int(round(ys_smooth[right])))
+    notch_mask, _ = _notch_mask(mask)
+    ys_all, xs_all = np.where(notch_mask > 0)
+    if len(xs_all) == 0:
+        raise ValueError("No notch (concavity) found on the object's contour")
+    left_idx = int(np.argmin(xs_all))
+    right_idx = int(np.argmax(xs_all))
+    left_point = (int(xs_all[left_idx]), int(ys_all[left_idx]))
+    right_point = (int(xs_all[right_idx]), int(ys_all[right_idx]))
     return left_point, right_point
-
-
-def inner_shoulder_line_angle(mask: np.ndarray) -> float:
-    """Angle (degrees) of the line through the inner (notch) shoulder points, from horizontal."""
-    (x1, y1), (x2, y2) = find_notch_shoulder_points(mask)
-    return np.degrees(np.arctan2(y2 - y1, x2 - x1))
 
 
 def find_notch_wall_points_at_depth(
     mask: np.ndarray, offset_pct: float = 0.0
 ) -> tuple[tuple[int, int], tuple[int, int]]:
-    """Locate the two wall points offset_pct further down each wall than the shoulder corners.
+    """Locate the two wall points offset_pct further down each wall than the notch's vertices.
 
-    offset_pct=0 returns the same points as find_notch_shoulder_points.
+    offset_pct=0 returns the notch's vertex points (find_notch_vertex_points).
     offset_pct is a percentage of the notch's total height (e.g. 10 = 10%
-    of the way from the shoulder toward the notch's bottom). Each side's
-    point is moved straight down by that amount from its own shoulder
-    corner, then snapped onto the actual wall at that row (leftmost/
-    rightmost notch-void pixel in that row) -- so the line tracks the real
-    material edge rather than a straight offset.
+    of the way from the vertex toward the notch's bottom). Each side's
+    point is moved straight down by that amount from its own vertex, then
+    snapped onto the actual wall at that row (leftmost/rightmost notch-void
+    pixel in that row) -- so the line tracks the real material edge rather
+    than a straight offset.
     """
     notch_mask, (x, y, w, h) = _notch_mask(mask)
-    (lx, ly), (rx, ry) = find_notch_shoulder_points(mask)
+    (lx, ly), (rx, ry) = find_notch_vertex_points(mask)
     if offset_pct <= 0:
         return (lx, ly), (rx, ry)
 
