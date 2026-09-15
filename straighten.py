@@ -2,11 +2,14 @@
 """Auto-straighten tilted microscopy images by rotating them level.
 
 Segments the bright foreground object from a dark background, finds the two
-"inner" shoulder points where the V-notch meets the material (see
-find_notch_shoulder_points), and rotates the image so the line between them
-is horizontal. Also measures the distance between those same two points on
-the rotated image. Works on single files or a whole directory of images;
-for a directory, also writes a measurements.csv summary.
+points where its outer top cap transitions into the legs (see
+find_top_border_shoulder_points), and rotates the image so the line between
+them is horizontal. Then, on that rotated image, measures the distance
+between the two "inner" shoulder points where the V-notch meets the
+material (see find_notch_shoulder_points) -- a different pair of points
+from the ones used for rotation. Works on single files or a whole
+directory of images; for a directory, also writes a measurements.csv
+summary.
 """
 import argparse
 import csv
@@ -254,17 +257,18 @@ def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
 
 
 def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
-    # The shoulder-point detector scans by image column, so its result is itself
-    # somewhat orientation-dependent: a single rotation by the measured angle
-    # doesn't always fully zero out the residual tilt (especially on a notch
-    # whose corner is a gradual curve rather than a sharp point). Iterate a
-    # few times, re-measuring on each rotated result, until it converges.
+    # Levels by the OUTER top-border shoulder line (not the inner notch line --
+    # the inner shoulder distance is measured separately, after this rotation,
+    # by process_file). The detector scans by image column, so its result is
+    # itself somewhat orientation-dependent: a single rotation by the measured
+    # angle doesn't always fully zero out the residual tilt. Iterate a few
+    # times, re-measuring on each rotated result, until it converges.
     current = image
     total_angle = 0.0
     for _ in range(MAX_STRAIGHTEN_ITERATIONS):
         gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY) if current.ndim == 3 else current
         mask = largest_foreground_mask(gray)
-        angle = inner_shoulder_line_angle(mask)
+        angle = shoulder_line_angle(mask)
         if abs(angle) < STRAIGHTEN_TOLERANCE_DEG:
             break
         # Rotating by the measured angle itself brings the shoulder line to horizontal
