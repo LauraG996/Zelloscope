@@ -154,9 +154,37 @@ def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple
     return left_point, right_point
 
 
-def inner_shoulder_distance(mask: np.ndarray) -> float:
-    """Euclidean distance (px) between the two inner (notch) shoulder points."""
-    (x1, y1), (x2, y2) = find_notch_shoulder_points(mask)
+def find_notch_wall_points_at_depth(
+    mask: np.ndarray, offset_px: int = 0
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    """Locate the two wall points offset_px further down each wall than the shoulder corners.
+
+    offset_px=0 returns the same points as find_notch_shoulder_points. For
+    offset_px>0, each side's point is moved straight down by that many
+    pixels from its own shoulder corner, then snapped onto the actual wall
+    at that row (leftmost/rightmost notch-void pixel in that row) -- so the
+    line tracks the real material edge rather than a straight offset.
+    """
+    notch_mask, (x, y, w, h) = _notch_mask(mask)
+    (lx, ly), (rx, ry) = find_notch_shoulder_points(mask)
+    if offset_px <= 0:
+        return (lx, ly), (rx, ry)
+
+    bottom = y + h - 1
+    left_row = min(bottom, ly + offset_px)
+    xs = np.where(notch_mask[left_row, :] > 0)[0]
+    left_point = (int(xs.min()), left_row) if len(xs) else (lx, ly)
+
+    right_row = min(bottom, ry + offset_px)
+    xs = np.where(notch_mask[right_row, :] > 0)[0]
+    right_point = (int(xs.max()), right_row) if len(xs) else (rx, ry)
+
+    return left_point, right_point
+
+
+def inner_shoulder_distance(mask: np.ndarray, offset_px: int = 0) -> float:
+    """Euclidean distance (px) between the two inner (notch) points, offset_px below the shoulders."""
+    (x1, y1), (x2, y2) = find_notch_wall_points_at_depth(mask, offset_px)
     return float(np.hypot(x2 - x1, y2 - y1))
 
 
@@ -221,11 +249,15 @@ def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
     return rotate_bound(image, angle), angle
 
 
-def process_file(src: Path, dst: Path, pix2mm: float | None = None) -> tuple[float, float, float | None]:
+def process_file(
+    src: Path, dst: Path, pix2mm: float | None = None, shoulder_offset_px: int = 0
+) -> tuple[float, float, float | None]:
     """Straighten src, draw the inner-shoulder measurement on it, save to dst.
 
     Returns (rotation_deg, inner_shoulder_distance_px, inner_shoulder_distance_mm).
     The measurement is drawn and computed on the straightened (rotated) image.
+    shoulder_offset_px moves the measurement points that many pixels down each
+    wall from the detected shoulder corner (0 = at the corner itself).
     """
     image = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if image is None:
@@ -234,7 +266,7 @@ def process_file(src: Path, dst: Path, pix2mm: float | None = None) -> tuple[flo
 
     gray = cv2.cvtColor(straightened, cv2.COLOR_BGR2GRAY) if straightened.ndim == 3 else straightened
     mask = largest_foreground_mask(gray)
-    p1, p2 = find_notch_shoulder_points(mask)
+    p1, p2 = find_notch_wall_points_at_depth(mask, shoulder_offset_px)
     distance_px = float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
     distance_mm = distance_px * pix2mm if pix2mm is not None else None
 
@@ -258,6 +290,11 @@ def main() -> None:
         "--pix2mm", type=float, default=None,
         help="Millimeters per pixel, to also report the inner shoulder distance in mm",
     )
+    parser.add_argument(
+        "--shoulder-offset", type=int, default=0,
+        help="Move the measurement points this many pixels down each wall from the "
+             "detected shoulder corner before measuring (0 = at the corner itself)",
+    )
     args = parser.parse_args()
 
     if args.input.is_dir():
@@ -273,7 +310,9 @@ def main() -> None:
             writer = csv.writer(f)
             writer.writerow(header)
             for src in files:
-                angle, distance_px, distance_mm = process_file(src, args.output / src.name, args.pix2mm)
+                angle, distance_px, distance_mm = process_file(
+                    src, args.output / src.name, args.pix2mm, args.shoulder_offset
+                )
                 print(
                     f"{src.name}: rotated {angle:+.2f} deg, "
                     f"inner shoulder distance {_format_distance(distance_px, distance_mm)} "
@@ -285,7 +324,9 @@ def main() -> None:
                 writer.writerow(row)
         print(f"Measurements written to {csv_path}")
     else:
-        angle, distance_px, distance_mm = process_file(args.input, args.output, args.pix2mm)
+        angle, distance_px, distance_mm = process_file(
+            args.input, args.output, args.pix2mm, args.shoulder_offset
+        )
         print(
             f"{args.input.name}: rotated {angle:+.2f} deg, "
             f"inner shoulder distance {_format_distance(distance_px, distance_mm)} -> {args.output}"
