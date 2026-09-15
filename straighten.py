@@ -2,12 +2,11 @@
 """Auto-straighten tilted microscopy images by rotating them level.
 
 Segments the bright foreground object from a dark background, finds the two
-points where its outer top cap transitions into the legs (see
-find_top_border_shoulder_points), and rotates the image so the line between
-them is horizontal. Also measures the distance between the two "inner"
-shoulder points (where the V-notch meets the material) on the rotated
-image. Works on single files or a whole directory of images; for a
-directory, also writes a measurements.csv summary.
+"inner" shoulder points where the V-notch meets the material (see
+find_notch_shoulder_points), and rotates the image so the line between them
+is horizontal. Also measures the distance between those same two points on
+the rotated image. Works on single files or a whole directory of images;
+for a directory, also writes a measurements.csv summary.
 """
 import argparse
 import csv
@@ -43,6 +42,11 @@ SLOPE_STEP = 40
 # dy/dx magnitude beyond which the profile is considered to have left the
 # rounded top cap and entered a leg's side.
 SLOPE_THRESHOLD = 0.6
+
+# straighten(): stop iterating once the residual angle is below this (degrees),
+# or after this many rotation passes, whichever comes first.
+STRAIGHTEN_TOLERANCE_DEG = 0.1
+MAX_STRAIGHTEN_ITERATIONS = 5
 
 
 def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -154,6 +158,12 @@ def find_notch_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple
     return left_point, right_point
 
 
+def inner_shoulder_line_angle(mask: np.ndarray) -> float:
+    """Angle (degrees) of the line through the inner (notch) shoulder points, from horizontal."""
+    (x1, y1), (x2, y2) = find_notch_shoulder_points(mask)
+    return np.degrees(np.arctan2(y2 - y1, x2 - x1))
+
+
 def find_notch_wall_points_at_depth(
     mask: np.ndarray, offset_pct: float = 0.0
 ) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -244,12 +254,24 @@ def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
 
 
 def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
-    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
-    mask = largest_foreground_mask(gray)
-    angle = shoulder_line_angle(mask)
-    # Rotating by the measured angle itself brings the shoulder line to horizontal
-    # (cv2's rotation direction convention already matches atan2's here).
-    return rotate_bound(image, angle), angle
+    # The shoulder-point detector scans by image column, so its result is itself
+    # somewhat orientation-dependent: a single rotation by the measured angle
+    # doesn't always fully zero out the residual tilt (especially on a notch
+    # whose corner is a gradual curve rather than a sharp point). Iterate a
+    # few times, re-measuring on each rotated result, until it converges.
+    current = image
+    total_angle = 0.0
+    for _ in range(MAX_STRAIGHTEN_ITERATIONS):
+        gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY) if current.ndim == 3 else current
+        mask = largest_foreground_mask(gray)
+        angle = inner_shoulder_line_angle(mask)
+        if abs(angle) < STRAIGHTEN_TOLERANCE_DEG:
+            break
+        # Rotating by the measured angle itself brings the shoulder line to horizontal
+        # (cv2's rotation direction convention already matches atan2's here).
+        current = rotate_bound(current, angle)
+        total_angle += angle
+    return current, total_angle
 
 
 def process_file(
