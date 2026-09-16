@@ -1,4 +1,4 @@
-# Open Cell Segmentation
+# Different Foams
 
 Segmentation work for open-cell foam images, kept separate from the
 closed-cell notch/straighten scripts at the repo root.
