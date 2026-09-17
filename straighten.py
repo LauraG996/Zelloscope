@@ -51,6 +51,11 @@ SLOPE_THRESHOLD = 0.6
 STRAIGHTEN_TOLERANCE_DEG = 0.1
 MAX_STRAIGHTEN_ITERATIONS = 5
 
+# straighten(): images whose detected tilt is below this (degrees) are left
+# untouched entirely, rather than applying a tiny "correction" that would
+# just add padding/interpolation for no real benefit.
+DEFAULT_MIN_ROTATION_DEG = 1.0
+
 
 def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
     """Locate the two points where the object's rounded top cap transitions into its legs.
@@ -256,13 +261,23 @@ def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
     )
 
 
-def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
+def straighten(
+    image: np.ndarray, min_rotation_deg: float = DEFAULT_MIN_ROTATION_DEG
+) -> tuple[np.ndarray, float]:
     # Levels by the OUTER top-border shoulder line (not the inner notch line --
     # the inner shoulder distance is measured separately, after this rotation,
     # by process_file). The detector scans by image column, so its result is
     # itself somewhat orientation-dependent: a single rotation by the measured
     # angle doesn't always fully zero out the residual tilt. Iterate a few
     # times, re-measuring on each rotated result, until it converges.
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
+    mask = largest_foreground_mask(gray)
+    initial_angle = shoulder_line_angle(mask)
+    if abs(initial_angle) < min_rotation_deg:
+        # Already straight enough -- leave the image untouched rather than
+        # applying a tiny "correction" that just adds padding/interpolation.
+        return image, 0.0
+
     current = image
     total_angle = 0.0
     for _ in range(MAX_STRAIGHTEN_ITERATIONS):
@@ -279,7 +294,11 @@ def straighten(image: np.ndarray) -> tuple[np.ndarray, float]:
 
 
 def process_file(
-    src: Path, dst: Path, pix2mm: float | None = None, shoulder_offset_pct: float = 0.0
+    src: Path,
+    dst: Path,
+    pix2mm: float | None = None,
+    shoulder_offset_pct: float = 0.0,
+    min_rotation_deg: float = DEFAULT_MIN_ROTATION_DEG,
 ) -> tuple[float, float, float | None]:
     """Straighten src, draw the inner-shoulder measurement on it, save to dst.
 
@@ -287,12 +306,13 @@ def process_file(
     The measurement is drawn and computed on the straightened (rotated) image.
     shoulder_offset_pct moves the measurement points that percentage of the
     notch's height down each wall from the detected shoulder corner (0 = at
-    the corner itself).
+    the corner itself). min_rotation_deg: images tilted less than this are
+    left unrotated (rotation_deg will read 0.0 for those).
     """
     image = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if image is None:
         raise ValueError(f"Could not read image: {src}")
-    straightened, angle = straighten(image)
+    straightened, angle = straighten(image, min_rotation_deg)
 
     gray = cv2.cvtColor(straightened, cv2.COLOR_BGR2GRAY) if straightened.ndim == 3 else straightened
     mask = largest_foreground_mask(gray)
@@ -326,6 +346,12 @@ def main() -> None:
              "notch's height from the detected shoulder corner before measuring "
              "(0 = at the corner itself, e.g. 10 = 10%% of the way down)",
     )
+    parser.add_argument(
+        "--min-rotation-deg", type=float, default=DEFAULT_MIN_ROTATION_DEG,
+        help=f"Images tilted less than this many degrees are left unrotated "
+             f"entirely, rather than applying a tiny correction (default: "
+             f"{DEFAULT_MIN_ROTATION_DEG})",
+    )
     args = parser.parse_args()
 
     if args.input.is_dir():
@@ -342,10 +368,12 @@ def main() -> None:
             writer.writerow(header)
             for src in files:
                 angle, distance_px, distance_mm = process_file(
-                    src, args.output / src.name, args.pix2mm, args.shoulder_offset_pct
+                    src, args.output / src.name, args.pix2mm,
+                    args.shoulder_offset_pct, args.min_rotation_deg,
                 )
+                rotated_note = f"rotated {angle:+.2f} deg" if angle != 0.0 else "left unrotated"
                 print(
-                    f"{src.name}: rotated {angle:+.2f} deg, "
+                    f"{src.name}: {rotated_note}, "
                     f"inner shoulder distance {_format_distance(distance_px, distance_mm)} "
                     f"-> {args.output / src.name}"
                 )
@@ -356,10 +384,12 @@ def main() -> None:
         print(f"Measurements written to {csv_path}")
     else:
         angle, distance_px, distance_mm = process_file(
-            args.input, args.output, args.pix2mm, args.shoulder_offset_pct
+            args.input, args.output, args.pix2mm,
+            args.shoulder_offset_pct, args.min_rotation_deg,
         )
+        rotated_note = f"rotated {angle:+.2f} deg" if angle != 0.0 else "left unrotated"
         print(
-            f"{args.input.name}: rotated {angle:+.2f} deg, "
+            f"{args.input.name}: {rotated_note}, "
             f"inner shoulder distance {_format_distance(distance_px, distance_mm)} -> {args.output}"
         )
 
