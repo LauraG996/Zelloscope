@@ -4,11 +4,12 @@
 Segments the bright foreground object from a dark background, then finds
 the rotation angle that makes its top boundary as left-right symmetric as
 possible (see estimate_symmetry_tilt) and rotates the image by that angle.
-Then, on that rotated image, measures the distance between the two "inner"
-shoulder points where the V-notch meets the material (see
-find_notch_shoulder_points) -- unrelated to the angle used for rotation.
-Works on single files or a whole directory of images; for a directory,
-also writes a measurements.csv summary.
+Then, on that rotated image, draws both the outer border line (the top
+cap/legs transition) and the inner border line (the V-notch's shoulders),
+and measures the horizontal distance between the inner shoulders plus the
+vertical wall thickness between the outer and inner borders at the
+object's center. Works on single files or a whole directory of images;
+for a directory, also writes a measurements.csv summary.
 """
 import argparse
 import csv
@@ -274,32 +275,102 @@ def inner_shoulder_distance(mask: np.ndarray, offset_pct: float = 0.0) -> float:
     return float(np.hypot(x2 - x1, y2 - y1))
 
 
-def draw_inner_shoulder_measurement(
+def vertical_wall_thickness(mask: np.ndarray) -> tuple[float, tuple[int, int], tuple[int, int]]:
+    """Vertical distance (px) from the outer top surface to the inner notch's top surface.
+
+    Measured at the object's own horizontal center (midpoint of its overall
+    bounding box) rather than at the corner points found by
+    find_top_border_shoulder_points, since that corner detection can be
+    thrown off by local texture -- a plain column scan at the center is far
+    more robust and, after straighten()'s symmetry-based rotation, the
+    center column is where the top surface and notch are expected to align.
+
+    Returns (thickness_px, outer_point, inner_point).
+    """
+    ys, xs = np.where(mask > 0)
+    if len(xs) == 0:
+        raise ValueError("No object found in image")
+    cx = int((xs.min() + xs.max()) // 2)
+
+    outer_col = np.where(mask[:, cx] > 0)[0]
+    if len(outer_col) == 0:
+        raise ValueError("Object does not span its own center column")
+    outer_y = int(outer_col.min())
+
+    notch_mask, _ = _notch_mask(mask)
+    inner_col = np.where(notch_mask[:, cx] > 0)[0]
+    if len(inner_col) == 0:
+        raise ValueError("Notch does not span the object's center column")
+    inner_y = int(inner_col.min())
+
+    return float(inner_y - outer_y), (cx, outer_y), (cx, inner_y)
+
+
+def _extend_line_to_edges(
+    p1: tuple[int, int], p2: tuple[int, int], width: int, height: int
+) -> tuple[tuple[int, int], tuple[int, int]]:
+    (x1, y1), (x2, y2) = p1, p2
+    if x1 == x2:
+        return (x1, 0), (x1, height - 1)
+    slope = (y2 - y1) / (x2 - x1)
+    y_at = lambda x: y1 + slope * (x - x1)
+    return (0, int(round(y_at(0)))), (width - 1, int(round(y_at(width - 1))))
+
+
+def draw_measurements(
     image: np.ndarray,
-    p1: tuple[int, int],
-    p2: tuple[int, int],
-    distance_px: float,
+    outer_points: tuple[tuple[int, int], tuple[int, int]],
+    inner_points: tuple[tuple[int, int], tuple[int, int]],
+    inner_distance_px: float,
+    thickness_px: float,
+    thickness_points: tuple[tuple[int, int], tuple[int, int]],
     pix2mm: float | None = None,
 ) -> np.ndarray:
-    """Draw the two inner shoulder points, the segment between them, and a distance label."""
+    """Draw the outer border line, inner border line, and vertical wall-thickness indicator."""
     output = image.copy()
-    scale = max(image.shape[:2]) / 1500  # so markers stay visible at any resolution
+    h, w = image.shape[:2]
+    scale = max(h, w) / 1500  # so markers/lines stay visible at any resolution
     radius = max(6, int(round(8 * scale)))
-    thickness = max(2, int(round(3 * scale)))
-
-    cv2.line(output, p1, p2, (0, 0, 255), thickness, cv2.LINE_AA)
-    cv2.circle(output, p1, radius, (0, 255, 0), -1)
-    cv2.circle(output, p2, radius, (0, 255, 0), -1)
-
-    label = f"{distance_px:.1f}px"
-    if pix2mm is not None:
-        label += f" / {distance_px * pix2mm:.2f}mm"
-    mx, my = (p1[0] + p2[0]) // 2, min(p1[1], p2[1])
+    line_thickness = max(2, int(round(3 * scale)))
     font_scale = max(0.6, 1.2 * scale)
-    cv2.putText(
-        output, label, (mx, max(0, my - int(20 * scale))),
-        cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 255), max(1, int(round(2 * scale))), cv2.LINE_AA,
+    font_thickness = max(1, int(round(2 * scale)))
+
+    def label(text: str, pos: tuple[int, int], color: tuple[int, int, int]) -> None:
+        cv2.putText(
+            output, text, pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thickness, cv2.LINE_AA,
+        )
+
+    # Outer border line (blue), extended across the full image width.
+    outer_e1, outer_e2 = _extend_line_to_edges(outer_points[0], outer_points[1], w, h)
+    cv2.line(output, outer_e1, outer_e2, (255, 150, 0), line_thickness, cv2.LINE_AA)
+    for p in outer_points:
+        cv2.circle(output, p, radius, (255, 255, 0), -1)
+
+    # Inner border line (red), just the measured segment.
+    p1, p2 = inner_points
+    cv2.line(output, p1, p2, (0, 0, 255), line_thickness, cv2.LINE_AA)
+    for p in inner_points:
+        cv2.circle(output, p, radius, (0, 255, 0), -1)
+    inner_label = f"{inner_distance_px:.1f}px"
+    if pix2mm is not None:
+        inner_label += f" / {inner_distance_px * pix2mm:.2f}mm"
+    mx, my = (p1[0] + p2[0]) // 2, min(p1[1], p2[1])
+    label(inner_label, (mx, max(0, my - int(20 * scale))), (0, 0, 255))
+
+    # Vertical wall-thickness indicator (yellow), from outer surface down to inner surface.
+    outer_pt, inner_pt = thickness_points
+    cv2.line(output, outer_pt, inner_pt, (0, 255, 255), line_thickness, cv2.LINE_AA)
+    cv2.circle(output, outer_pt, radius, (0, 255, 255), -1)
+    cv2.circle(output, inner_pt, radius, (0, 255, 255), -1)
+    thickness_label = f"{thickness_px:.1f}px"
+    if pix2mm is not None:
+        thickness_label += f" / {thickness_px * pix2mm:.2f}mm"
+    label(
+        thickness_label,
+        (min(w - 10, outer_pt[0] + int(15 * scale)), (outer_pt[1] + inner_pt[1]) // 2),
+        (0, 255, 255),
     )
+
     return output
 
 
@@ -345,21 +416,38 @@ def straighten(
     return rotate_bound(image, angle), angle
 
 
+class Measurement:
+    """Results from process_file: rotation applied plus both measurements, in px and (if
+    pix2mm was given) mm. mm fields are None when no pix2mm was provided."""
+
+    def __init__(
+        self, rotation_deg: float,
+        inner_distance_px: float, inner_distance_mm: float | None,
+        thickness_px: float, thickness_mm: float | None,
+    ):
+        self.rotation_deg = rotation_deg
+        self.inner_distance_px = inner_distance_px
+        self.inner_distance_mm = inner_distance_mm
+        self.thickness_px = thickness_px
+        self.thickness_mm = thickness_mm
+
+
 def process_file(
     src: Path,
     dst: Path,
     pix2mm: float | None = None,
     shoulder_offset_pct: float = 0.0,
     min_rotation_deg: float = DEFAULT_MIN_ROTATION_DEG,
-) -> tuple[float, float, float | None]:
-    """Straighten src, draw the inner-shoulder measurement on it, save to dst.
+) -> Measurement:
+    """Straighten src, draw the outer/inner border lines and thickness indicator, save to dst.
 
-    Returns (rotation_deg, inner_shoulder_distance_px, inner_shoulder_distance_mm).
-    The measurement is drawn and computed on the straightened (rotated) image.
-    shoulder_offset_pct moves the measurement points that percentage of the
-    notch's height down each wall from the detected shoulder corner (0 = at
-    the corner itself). min_rotation_deg: images tilted less than this are
-    left unrotated (rotation_deg will read 0.0 for those).
+    The measurements are drawn and computed on the straightened (rotated)
+    image. shoulder_offset_pct moves the inner-distance measurement points
+    that percentage of the notch's height down each wall from the detected
+    shoulder corner (0 = at the corner itself) -- the wall-thickness
+    measurement is unaffected by this and is always taken at the top.
+    min_rotation_deg: images tilted less than this are left unrotated
+    (rotation_deg will read 0.0 for those).
     """
     image = cv2.imread(str(src), cv2.IMREAD_UNCHANGED)
     if image is None:
@@ -368,14 +456,24 @@ def process_file(
 
     gray = cv2.cvtColor(straightened, cv2.COLOR_BGR2GRAY) if straightened.ndim == 3 else straightened
     mask = largest_foreground_mask(gray)
-    p1, p2 = find_notch_wall_points_at_depth(mask, shoulder_offset_pct)
-    distance_px = float(np.hypot(p2[0] - p1[0], p2[1] - p1[1]))
-    distance_mm = distance_px * pix2mm if pix2mm is not None else None
 
-    annotated = draw_inner_shoulder_measurement(straightened, p1, p2, distance_px, pix2mm)
+    outer_points = find_top_border_shoulder_points(mask)
+    inner_points = find_notch_wall_points_at_depth(mask, shoulder_offset_pct)
+    inner_distance_px = float(np.hypot(
+        inner_points[1][0] - inner_points[0][0], inner_points[1][1] - inner_points[0][1],
+    ))
+    thickness_px, outer_thickness_pt, inner_thickness_pt = vertical_wall_thickness(mask)
+
+    inner_distance_mm = inner_distance_px * pix2mm if pix2mm is not None else None
+    thickness_mm = thickness_px * pix2mm if pix2mm is not None else None
+
+    annotated = draw_measurements(
+        straightened, outer_points, inner_points, inner_distance_px,
+        thickness_px, (outer_thickness_pt, inner_thickness_pt), pix2mm,
+    )
     dst.parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(dst), annotated)
-    return angle, distance_px, distance_mm
+    return Measurement(angle, inner_distance_px, inner_distance_mm, thickness_px, thickness_mm)
 
 
 def _format_distance(distance_px: float, distance_mm: float | None) -> str:
@@ -412,37 +510,39 @@ def main() -> None:
         if not files:
             sys.exit(f"No images found in {args.input}")
         csv_path = args.output / "measurements.csv"
-        header = ["filename", "rotation_deg", "inner_shoulder_distance_px"]
+        header = ["filename", "rotation_deg", "inner_shoulder_distance_px", "wall_thickness_px"]
         if args.pix2mm is not None:
-            header.append("inner_shoulder_distance_mm")
+            header += ["inner_shoulder_distance_mm", "wall_thickness_mm"]
         with open(csv_path, "w", newline="") as f:
             writer = csv.writer(f)
             writer.writerow(header)
             for src in files:
-                angle, distance_px, distance_mm = process_file(
+                m = process_file(
                     src, args.output / src.name, args.pix2mm,
                     args.shoulder_offset_pct, args.min_rotation_deg,
                 )
-                rotated_note = f"rotated {angle:+.2f} deg" if angle != 0.0 else "left unrotated"
+                rotated_note = f"rotated {m.rotation_deg:+.2f} deg" if m.rotation_deg != 0.0 else "left unrotated"
                 print(
                     f"{src.name}: {rotated_note}, "
-                    f"inner shoulder distance {_format_distance(distance_px, distance_mm)} "
+                    f"inner shoulder distance {_format_distance(m.inner_distance_px, m.inner_distance_mm)}, "
+                    f"wall thickness {_format_distance(m.thickness_px, m.thickness_mm)} "
                     f"-> {args.output / src.name}"
                 )
-                row = [src.name, f"{angle:.2f}", f"{distance_px:.1f}"]
-                if distance_mm is not None:
-                    row.append(f"{distance_mm:.2f}")
+                row = [src.name, f"{m.rotation_deg:.2f}", f"{m.inner_distance_px:.1f}", f"{m.thickness_px:.1f}"]
+                if args.pix2mm is not None:
+                    row += [f"{m.inner_distance_mm:.2f}", f"{m.thickness_mm:.2f}"]
                 writer.writerow(row)
         print(f"Measurements written to {csv_path}")
     else:
-        angle, distance_px, distance_mm = process_file(
+        m = process_file(
             args.input, args.output, args.pix2mm,
             args.shoulder_offset_pct, args.min_rotation_deg,
         )
-        rotated_note = f"rotated {angle:+.2f} deg" if angle != 0.0 else "left unrotated"
+        rotated_note = f"rotated {m.rotation_deg:+.2f} deg" if m.rotation_deg != 0.0 else "left unrotated"
         print(
             f"{args.input.name}: {rotated_note}, "
-            f"inner shoulder distance {_format_distance(distance_px, distance_mm)} -> {args.output}"
+            f"inner shoulder distance {_format_distance(m.inner_distance_px, m.inner_distance_mm)}, "
+            f"wall thickness {_format_distance(m.thickness_px, m.thickness_mm)} -> {args.output}"
         )
 
 
