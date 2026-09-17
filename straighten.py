@@ -306,68 +306,61 @@ def vertical_wall_thickness(mask: np.ndarray) -> tuple[float, tuple[int, int], t
     return float(inner_y - outer_y), (cx, outer_y), (cx, inner_y)
 
 
-def _extend_line_to_edges(
-    p1: tuple[int, int], p2: tuple[int, int], width: int, height: int
-) -> tuple[tuple[int, int], tuple[int, int]]:
-    (x1, y1), (x2, y2) = p1, p2
-    if x1 == x2:
-        return (x1, 0), (x1, height - 1)
-    slope = (y2 - y1) / (x2 - x1)
-    y_at = lambda x: y1 + slope * (x - x1)
-    return (0, int(round(y_at(0)))), (width - 1, int(round(y_at(width - 1))))
+def _largest_contour(mask: np.ndarray):
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        raise ValueError("No contour found")
+    return max(contours, key=cv2.contourArea)
+
+
+def _format_measurement(value_px: float, pix2mm: float | None) -> str:
+    return f"{value_px * pix2mm:.2f} mm" if pix2mm is not None else f"{value_px:.1f} px"
 
 
 def draw_measurements(
     image: np.ndarray,
-    outer_points: tuple[tuple[int, int], tuple[int, int]],
+    mask: np.ndarray,
     inner_points: tuple[tuple[int, int], tuple[int, int]],
     inner_distance_px: float,
     thickness_px: float,
     thickness_points: tuple[tuple[int, int], tuple[int, int]],
     pix2mm: float | None = None,
 ) -> np.ndarray:
-    """Draw the outer border line, inner border line, and vertical wall-thickness indicator."""
+    """Trace the outer and inner border contours, and draw the two measurements."""
     output = image.copy()
     h, w = image.shape[:2]
-    scale = max(h, w) / 1500  # so markers/lines stay visible at any resolution
-    radius = max(6, int(round(8 * scale)))
-    line_thickness = max(2, int(round(3 * scale)))
-    font_scale = max(0.6, 1.2 * scale)
-    font_thickness = max(1, int(round(2 * scale)))
+    scale = max(h, w) / 1500  # so lines/text stay proportional at any resolution
+    contour_thickness = max(2, int(round(2.5 * scale)))
+    measure_thickness = max(1, int(round(2 * scale)))
+    font_scale = max(0.5, 0.9 * scale)
+    font_thickness = max(1, int(round(1.5 * scale)))
 
     def label(text: str, pos: tuple[int, int], color: tuple[int, int, int]) -> None:
         cv2.putText(
             output, text, pos, cv2.FONT_HERSHEY_SIMPLEX, font_scale, color, font_thickness, cv2.LINE_AA,
         )
 
-    # Outer border line (blue), extended across the full image width.
-    outer_e1, outer_e2 = _extend_line_to_edges(outer_points[0], outer_points[1], w, h)
-    cv2.line(output, outer_e1, outer_e2, (255, 150, 0), line_thickness, cv2.LINE_AA)
-    for p in outer_points:
-        cv2.circle(output, p, radius, (255, 255, 0), -1)
+    # Outer border contour (green) -- the object's own outline, as actually seen in frame.
+    outer_contour = _largest_contour(mask)
+    cv2.drawContours(output, [outer_contour], -1, (0, 220, 0), contour_thickness, cv2.LINE_AA)
 
-    # Inner border line (red), just the measured segment.
+    # Inner border contour (orange) -- the notch void's outline.
+    notch_mask, _ = _notch_mask(mask)
+    inner_contour = _largest_contour(notch_mask)
+    cv2.drawContours(output, [inner_contour], -1, (0, 140, 255), contour_thickness, cv2.LINE_AA)
+
+    # Horizontal inner-shoulder distance (cyan).
     p1, p2 = inner_points
-    cv2.line(output, p1, p2, (0, 0, 255), line_thickness, cv2.LINE_AA)
-    for p in inner_points:
-        cv2.circle(output, p, radius, (0, 255, 0), -1)
-    inner_label = f"{inner_distance_px:.1f}px"
-    if pix2mm is not None:
-        inner_label += f" / {inner_distance_px * pix2mm:.2f}mm"
+    cv2.line(output, p1, p2, (255, 255, 0), measure_thickness, cv2.LINE_AA)
     mx, my = (p1[0] + p2[0]) // 2, min(p1[1], p2[1])
-    label(inner_label, (mx, max(0, my - int(20 * scale))), (0, 0, 255))
+    label(_format_measurement(inner_distance_px, pix2mm), (mx, max(0, my - int(15 * scale))), (255, 255, 0))
 
-    # Vertical wall-thickness indicator (yellow), from outer surface down to inner surface.
+    # Vertical wall thickness (yellow), from outer surface down to inner surface.
     outer_pt, inner_pt = thickness_points
-    cv2.line(output, outer_pt, inner_pt, (0, 255, 255), line_thickness, cv2.LINE_AA)
-    cv2.circle(output, outer_pt, radius, (0, 255, 255), -1)
-    cv2.circle(output, inner_pt, radius, (0, 255, 255), -1)
-    thickness_label = f"{thickness_px:.1f}px"
-    if pix2mm is not None:
-        thickness_label += f" / {thickness_px * pix2mm:.2f}mm"
+    cv2.line(output, outer_pt, inner_pt, (0, 255, 255), measure_thickness, cv2.LINE_AA)
     label(
-        thickness_label,
-        (min(w - 10, outer_pt[0] + int(15 * scale)), (outer_pt[1] + inner_pt[1]) // 2),
+        _format_measurement(thickness_px, pix2mm),
+        (min(w - 10, outer_pt[0] + int(10 * scale)), (outer_pt[1] + inner_pt[1]) // 2),
         (0, 255, 255),
     )
 
@@ -457,7 +450,6 @@ def process_file(
     gray = cv2.cvtColor(straightened, cv2.COLOR_BGR2GRAY) if straightened.ndim == 3 else straightened
     mask = largest_foreground_mask(gray)
 
-    outer_points = find_top_border_shoulder_points(mask)
     inner_points = find_notch_wall_points_at_depth(mask, shoulder_offset_pct)
     inner_distance_px = float(np.hypot(
         inner_points[1][0] - inner_points[0][0], inner_points[1][1] - inner_points[0][1],
@@ -468,7 +460,7 @@ def process_file(
     thickness_mm = thickness_px * pix2mm if pix2mm is not None else None
 
     annotated = draw_measurements(
-        straightened, outer_points, inner_points, inner_distance_px,
+        straightened, mask, inner_points, inner_distance_px,
         thickness_px, (outer_thickness_pt, inner_thickness_pt), pix2mm,
     )
     dst.parent.mkdir(parents=True, exist_ok=True)
