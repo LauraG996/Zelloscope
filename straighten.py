@@ -1,15 +1,14 @@
 #!/usr/bin/env python3
 """Auto-straighten tilted microscopy images by rotating them level.
 
-Segments the bright foreground object from a dark background, finds the two
-points where its outer top cap transitions into the legs (see
-find_top_border_shoulder_points), and rotates the image so the line between
-them is horizontal. Then, on that rotated image, measures the distance
-between the two "inner" shoulder points where the V-notch meets the
-material (see find_notch_shoulder_points) -- a different pair of points
-from the ones used for rotation. Works on single files or a whole
-directory of images; for a directory, also writes a measurements.csv
-summary.
+Segments the bright foreground object from a dark background, then finds
+the rotation angle that makes its top boundary as left-right symmetric as
+possible (see estimate_symmetry_tilt) and rotates the image by that angle.
+Then, on that rotated image, measures the distance between the two "inner"
+shoulder points where the V-notch meets the material (see
+find_notch_shoulder_points) -- unrelated to the angle used for rotation.
+Works on single files or a whole directory of images; for a directory,
+also writes a measurements.csv summary.
 """
 import argparse
 import csv
@@ -46,15 +45,18 @@ SLOPE_STEP = 40
 # rounded top cap and entered a leg's side.
 SLOPE_THRESHOLD = 0.6
 
-# straighten(): stop iterating once the residual angle is below this (degrees),
-# or after this many rotation passes, whichever comes first.
-STRAIGHTEN_TOLERANCE_DEG = 0.1
-MAX_STRAIGHTEN_ITERATIONS = 5
-
 # straighten(): images whose detected tilt is below this (degrees) are left
 # untouched entirely, rather than applying a tiny "correction" that would
 # just add padding/interpolation for no real benefit.
 DEFAULT_MIN_ROTATION_DEG = 1.0
+
+# estimate_symmetry_tilt(): the mask is downsampled by this factor before the
+# angle search, since many candidate rotations are tested and only the
+# object's coarse silhouette symmetry matters, not per-pixel precision.
+SYMMETRY_SEARCH_SCALE = 0.2
+SYMMETRY_COARSE_RANGE_DEG = 20.0
+SYMMETRY_COARSE_STEP_DEG = 1.0
+SYMMETRY_FINE_STEP_DEG = 0.1
 
 
 def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
@@ -103,10 +105,73 @@ def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], 
     return left_point, right_point
 
 
-def shoulder_line_angle(mask: np.ndarray) -> float:
-    """Angle (degrees) of the line through the top-border shoulder points, from horizontal."""
-    (x1, y1), (x2, y2) = find_top_border_shoulder_points(mask)
-    return np.degrees(np.arctan2(y2 - y1, x2 - x1))
+def _top_profile_asymmetry(mask: np.ndarray, angle_deg: float) -> float:
+    """Mean squared mismatch between the top boundary and its own mirror image, after rotating by angle_deg.
+
+    Lower is more symmetric. Used to search for the rotation that makes the
+    object's top boundary as left-right symmetric as possible -- a global
+    shape measure using the whole boundary, rather than a single detected
+    corner, so a local texture bump on one side can't dominate the result.
+    """
+    h, w = mask.shape
+    matrix = cv2.getRotationMatrix2D((w / 2, h / 2), angle_deg, 1.0)
+    rotated = cv2.warpAffine(mask, matrix, (w, h), flags=cv2.INTER_NEAREST)
+
+    ys, xs = np.where(rotated > 0)
+    if len(xs) == 0:
+        return float("inf")
+    x_min, x_max = xs.min(), xs.max()
+    region = rotated[:, x_min:x_max + 1]
+    has_fg = region.any(axis=0)
+    if not has_fg.any():
+        return float("inf")
+    top_row_per_col = np.where(has_fg, region.argmax(axis=0), -1)
+
+    center = (x_max - x_min) / 2
+    cols = np.arange(0, int(center) + 1, 4)
+    mirror_cols = np.round(2 * center - cols).astype(int)
+    valid = (mirror_cols >= 0) & (mirror_cols < top_row_per_col.shape[0])
+    cols, mirror_cols = cols[valid], mirror_cols[valid]
+    valid = (top_row_per_col[cols] >= 0) & (top_row_per_col[mirror_cols] >= 0)
+    if not valid.any():
+        return float("inf")
+    diffs = top_row_per_col[cols[valid]].astype(float) - top_row_per_col[mirror_cols[valid]].astype(float)
+    return float(np.mean(diffs ** 2))
+
+
+def estimate_symmetry_tilt(mask: np.ndarray) -> float:
+    """Find the rotation angle (degrees) that makes the object's top boundary most left-right symmetric.
+
+    These objects are inherently bilaterally symmetric (a horseshoe/arch
+    shape), so the true tilt is whatever angle best restores that symmetry.
+    Searches a coarse grid, then refines around the best candidate.
+    """
+    small = cv2.resize(
+        mask, None, fx=SYMMETRY_SEARCH_SCALE, fy=SYMMETRY_SEARCH_SCALE,
+        interpolation=cv2.INTER_NEAREST,
+    )
+
+    best_angle, best_score = 0.0, _top_profile_asymmetry(small, 0.0)
+    coarse_angles = np.arange(
+        -SYMMETRY_COARSE_RANGE_DEG, SYMMETRY_COARSE_RANGE_DEG + SYMMETRY_COARSE_STEP_DEG,
+        SYMMETRY_COARSE_STEP_DEG,
+    )
+    for angle in coarse_angles:
+        score = _top_profile_asymmetry(small, angle)
+        if score < best_score:
+            best_score, best_angle = score, angle
+
+    fine_angles = np.arange(
+        best_angle - SYMMETRY_COARSE_STEP_DEG,
+        best_angle + SYMMETRY_COARSE_STEP_DEG + SYMMETRY_FINE_STEP_DEG,
+        SYMMETRY_FINE_STEP_DEG,
+    )
+    for angle in fine_angles:
+        score = _top_profile_asymmetry(small, angle)
+        if score < best_score:
+            best_score, best_angle = score, angle
+
+    return best_angle
 
 
 def _notch_mask(mask: np.ndarray) -> tuple[np.ndarray, tuple[int, int, int, int]]:
@@ -264,33 +329,20 @@ def rotate_bound(image: np.ndarray, angle_deg: float) -> np.ndarray:
 def straighten(
     image: np.ndarray, min_rotation_deg: float = DEFAULT_MIN_ROTATION_DEG
 ) -> tuple[np.ndarray, float]:
-    # Levels by the OUTER top-border shoulder line (not the inner notch line --
-    # the inner shoulder distance is measured separately, after this rotation,
-    # by process_file). The detector scans by image column, so its result is
-    # itself somewhat orientation-dependent: a single rotation by the measured
-    # angle doesn't always fully zero out the residual tilt. Iterate a few
-    # times, re-measuring on each rotated result, until it converges.
+    # Levels the object by its own bilateral symmetry (estimate_symmetry_tilt),
+    # not by hunting for a single "shoulder corner" -- that approach turned
+    # out to be fragile: a local texture bump right next to the top could
+    # get mistaken for the true corner, producing a badly wrong angle that
+    # even *looked* self-consistent on re-measurement (confirmed by cross-
+    # checking against a simple model-free left/right height comparison).
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY) if image.ndim == 3 else image
     mask = largest_foreground_mask(gray)
-    initial_angle = shoulder_line_angle(mask)
-    if abs(initial_angle) < min_rotation_deg:
+    angle = estimate_symmetry_tilt(mask)
+    if abs(angle) < min_rotation_deg:
         # Already straight enough -- leave the image untouched rather than
         # applying a tiny "correction" that just adds padding/interpolation.
         return image, 0.0
-
-    current = image
-    total_angle = 0.0
-    for _ in range(MAX_STRAIGHTEN_ITERATIONS):
-        gray = cv2.cvtColor(current, cv2.COLOR_BGR2GRAY) if current.ndim == 3 else current
-        mask = largest_foreground_mask(gray)
-        angle = shoulder_line_angle(mask)
-        if abs(angle) < STRAIGHTEN_TOLERANCE_DEG:
-            break
-        # Rotating by the measured angle itself brings the shoulder line to horizontal
-        # (cv2's rotation direction convention already matches atan2's here).
-        current = rotate_bound(current, angle)
-        total_angle += angle
-    return current, total_angle
+    return rotate_bound(image, angle), angle
 
 
 def process_file(
