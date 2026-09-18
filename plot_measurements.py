@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
-"""Plot two measurement-log CSVs (same format as straighten.py's --csv output)
-against each other on a shared time-of-day axis.
+"""Plot one or two measurement-log CSVs (same format as straighten.py's
+--csv output) on a shared time-of-day axis.
 
 Reproduces the look of plots/4june_vs_27aug_plot.svg: solid line + circle
 markers for the first (dense) run, diamond markers for the second (sparse)
 run, plus a dashed centered rolling average for each, optional feed-rate
-bands, and optional spec min/max lines.
+bands, optional spec min/max lines, and optional compression of stretches
+with no measurements at all.
 """
 import argparse
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
-import matplotlib.dates as mdates
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 
 BLUE = "#2a78d6"
@@ -74,6 +75,45 @@ def centered_rolling_avg(df: pd.DataFrame, column: str, window: timedelta) -> pd
     return pd.Series(out, index=df.index)
 
 
+def find_measurement_gaps(all_times: list[datetime], threshold: timedelta) -> list[tuple[datetime, datetime]]:
+    all_times = sorted(set(all_times))
+    return [(a, b) for a, b in zip(all_times, all_times[1:]) if b - a > threshold]
+
+
+class TimeAxis:
+    """Maps real timestamps to a display-seconds axis, optionally compressing
+    stretches with no measurements down to a fixed small width."""
+
+    def __init__(self, xmin: datetime, xmax: datetime, gaps: list[tuple[datetime, datetime]], gap_display: timedelta):
+        real_pts = [xmin]
+        disp_pts = [0.0]
+        cum = 0.0
+        prev = xmin
+        for s, e in gaps:
+            cum += (s - prev).total_seconds()
+            real_pts.append(s)
+            disp_pts.append(cum)
+            cum += gap_display.total_seconds()
+            real_pts.append(e)
+            disp_pts.append(cum)
+            prev = e
+        cum += (xmax - prev).total_seconds()
+        real_pts.append(xmax)
+        disp_pts.append(cum)
+        self._real_secs = np.array([(t - xmin).total_seconds() for t in real_pts])
+        self._disp = np.array(disp_pts)
+        self.xmin = xmin
+        self.gaps = gaps
+        self.xmax_disp = cum
+
+    def __call__(self, times):
+        if isinstance(times, datetime):
+            secs = (times - self.xmin).total_seconds()
+            return float(np.interp(secs, self._real_secs, self._disp))
+        secs = np.array([(t - self.xmin).total_seconds() for t in times])
+        return np.interp(secs, self._real_secs, self._disp)
+
+
 def style_axis(ax):
     ax.set_facecolor(BG)
     ax.grid(True, color=GRID, linewidth=0.8)
@@ -96,12 +136,13 @@ def feed_rate_bounds(xmin: datetime, xmax: datetime) -> list[tuple[datetime, dat
     return bounds
 
 
-def draw_feed_rate_strip(ax, bounds):
+def draw_feed_rate_strip(ax, bounds, taxis: TimeAxis):
     ax.set_facecolor(BG)
     for t0, t1, label, color in bounds:
-        ax.axvspan(t0, t1, color=color, alpha=0.55, lw=0)
+        d0, d1 = taxis(t0), taxis(t1)
+        ax.axvspan(d0, d1, color=color, alpha=0.55, lw=0)
         ax.text(
-            t0 + (t1 - t0) / 2, 0.5, label, ha="center", va="center",
+            (d0 + d1) / 2, 0.5, label, ha="center", va="center",
             fontsize=9.5, color="white" if color in (FEED_DARK, FEED_BLUE) else "#2b2b2b",
         )
     ax.set_ylim(0, 1)
@@ -110,6 +151,27 @@ def draw_feed_rate_strip(ax, bounds):
     for side in ("top", "right", "bottom", "left"):
         ax.spines[side].set_visible(False)
     ax.set_ylabel("feed\nrate", fontsize=9, color=TEXT, rotation=0, ha="right", va="center", labelpad=20)
+
+
+def hourly_ticks(xmin: datetime, xmax: datetime) -> list[datetime]:
+    start = xmin.replace(minute=0, second=0, microsecond=0) + timedelta(hours=1)
+    ticks = []
+    t = start
+    while t < xmax:
+        ticks.append(t)
+        t += timedelta(hours=1)
+    return ticks
+
+
+def mark_gaps(ax, gaps: list[tuple[datetime, datetime]], taxis: TimeAxis, ymin: float, ymax: float):
+    for s, e in gaps:
+        d = taxis((s + (e - s) / 2))
+        ax.axvline(d, color=GRID, linestyle=":", linewidth=1.2, zorder=1)
+        minutes = round((e - s).total_seconds() / 60)
+        ax.text(
+            d, ymin + (ymax - ymin) * 0.03, f"{minutes}min gap removed", rotation=90,
+            fontsize=7.5, color=TEXT, ha="center", va="bottom",
+        )
 
 
 def main() -> None:
@@ -130,6 +192,12 @@ def main() -> None:
     parser.add_argument("--spec-max-a", type=float, default=None, help="Max spec-limit line on the A panel")
     parser.add_argument("--spec-min-b", type=float, default=None, help="Min spec-limit line on the B panel")
     parser.add_argument("--spec-max-b", type=float, default=None, help="Max spec-limit line on the B panel")
+    parser.add_argument(
+        "--compress-gaps", action="store_true",
+        help="Squeeze stretches longer than --gap-threshold-minutes with no measurements down to --gap-display-minutes",
+    )
+    parser.add_argument("--gap-threshold-minutes", type=float, default=20)
+    parser.add_argument("--gap-display-minutes", type=float, default=2)
     parser.add_argument("-o", "--output", type=Path, default=Path("plots/measurements_comparison.svg"))
     args = parser.parse_args()
 
@@ -156,31 +224,45 @@ def main() -> None:
         subtitle += f" · diamonds = {args.label_b} actual (n={len(run_b)})"
     if args.feed_bands:
         subtitle += " · shade = material feed rate (kg/h)"
+    if args.compress_gaps:
+        subtitle += " · gaps with no measurements are compressed"
     fig.text(0.01, 0.945, subtitle, fontsize=9.5, color=TEXT, ha="left")
 
-    xmin = run_a["time"].min() if run_b is None else min(run_a["time"].min(), run_b["time"].min())
-    xmax = run_a["time"].max() if run_b is None else max(run_a["time"].max(), run_b["time"].max())
-    bounds = feed_rate_bounds(xmin, xmax) if args.feed_bands else []
+    all_times = list(run_a["time"]) + (list(run_b["time"]) if run_b is not None else [])
+    xmin, xmax = min(all_times), max(all_times)
+    gaps = (
+        find_measurement_gaps(all_times, timedelta(minutes=args.gap_threshold_minutes))
+        if args.compress_gaps else []
+    )
+    taxis = TimeAxis(xmin, xmax, gaps, timedelta(minutes=args.gap_display_minutes))
 
+    run_a["disp"] = taxis(run_a["time"])
+    if run_b is not None:
+        run_b["disp"] = taxis(run_b["time"])
+
+    bounds = feed_rate_bounds(xmin, xmax) if args.feed_bands else []
     spec_bounds = {
         METRICS[0][0]: (args.spec_min_a, args.spec_max_a),
         METRICS[1][0]: (args.spec_min_b, args.spec_max_b),
     }
+    tick_times = [t for t in hourly_ticks(xmin, xmax) if not any(s < t < e for s, e in gaps)]
+    tick_disp = taxis(tick_times)
+    tick_labels = [t.strftime("%H:%M") for t in tick_times]
 
     for ax, (column, ylabel) in zip(axes, METRICS):
         style_axis(ax)
 
         for t0, t1, _label, color in bounds:
-            ax.axvspan(t0, t1, color=color, alpha=0.2, lw=0, zorder=0)
+            ax.axvspan(taxis(t0), taxis(t1), color=color, alpha=0.2, lw=0, zorder=0)
 
         mean_a, std_a = run_a[column].mean(), run_a[column].std()
 
         ax.plot(
-            run_a["time"], run_a[column], "-o", color=BLUE, markersize=4.5,
+            run_a["disp"], run_a[column], "-o", color=BLUE, markersize=4.5,
             linewidth=1.4, label=f"{args.label_a} — {mean_a:.2f}±{std_a:.2f} mm, n={len(run_a)}",
         )
         ax.plot(
-            run_a["time"], centered_rolling_avg(run_a, column, window),
+            run_a["disp"], centered_rolling_avg(run_a, column, window),
             "--", color=BLUE, linewidth=1.6, alpha=0.85,
             label=f"{args.label_a} — {args.rolling_minutes:g}min rolling avg",
         )
@@ -188,11 +270,11 @@ def main() -> None:
         if run_b is not None:
             mean_b, std_b = run_b[column].mean(), run_b[column].std()
             ax.plot(
-                run_b["time"], run_b[column], "D", color=ORANGE, markersize=7,
+                run_b["disp"], run_b[column], "D", color=ORANGE, markersize=7,
                 linestyle="none", label=f"{args.label_b} — {mean_b:.2f}±{std_b:.2f} mm, n={len(run_b)}",
             )
             ax.plot(
-                run_b["time"], centered_rolling_avg(run_b, column, window),
+                run_b["disp"], centered_rolling_avg(run_b, column, window),
                 "--", color=ORANGE, linewidth=1.6, alpha=0.85,
                 label=f"{args.label_b} — {args.rolling_minutes:g}min rolling avg",
             )
@@ -208,16 +290,19 @@ def main() -> None:
                 fontsize=8.5, color=SPEC_RED,
             )
 
-        ax.set_xlim(xmin, xmax)
+        ax.set_xlim(0, taxis.xmax_disp)
+        if gaps:
+            mark_gaps(ax, gaps, taxis, *ax.get_ylim())
+        ax.set_xticks(tick_disp)
         ax.set_ylabel(ylabel)
         ax.legend(loc="upper left", bbox_to_anchor=(1.01, 1), frameon=False, fontsize=9, labelcolor=TEXT)
 
     if args.feed_bands:
         strip_ax = all_axes[0]
-        strip_ax.set_xlim(xmin, xmax)
-        draw_feed_rate_strip(strip_ax, bounds)
+        strip_ax.set_xlim(0, taxis.xmax_disp)
+        draw_feed_rate_strip(strip_ax, bounds, taxis)
 
-    axes[-1].xaxis.set_major_formatter(mdates.DateFormatter("%H:%M"))
+    axes[-1].set_xticklabels(tick_labels)
     axes[-1].set_xlabel("Time of day")
     for ax in axes[:-1]:
         ax.tick_params(labelbottom=False)
