@@ -115,7 +115,10 @@ def draw_feed_rate_strip(ax, bounds):
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("csv_a", type=Path, help="Dense/reference run CSV (e.g. 4 June)")
-    parser.add_argument("csv_b", type=Path, help="Sparse/comparison run CSV (e.g. 27 August)")
+    parser.add_argument(
+        "csv_b", type=Path, nargs="?", default=None,
+        help="Sparse/comparison run CSV (e.g. 27 August). Omit to plot csv_a only.",
+    )
     parser.add_argument("--label-a", default="4 June")
     parser.add_argument("--label-b", default="27 August")
     parser.add_argument("--rolling-minutes", type=float, default=30)
@@ -139,7 +142,7 @@ def main() -> None:
     args = parser.parse_args()
 
     run_a = load_run(args.csv_a, ANCHOR)
-    run_b = load_run(args.csv_b, ANCHOR)
+    run_b = load_run(args.csv_b, ANCHOR) if args.csv_b else None
     window = timedelta(minutes=args.rolling_minutes / 2)
 
     n_rows = len(METRICS) + (1 if args.feed_bands else 0)
@@ -150,22 +153,21 @@ def main() -> None:
     )
     axes = list(all_axes[1:]) if args.feed_bands else list(all_axes)
 
+    title = args.label_a if run_b is None else f"{args.label_a} vs. {args.label_b}"
     fig.patch.set_facecolor(BG)
     fig.suptitle(
-        f"{args.label_a} vs. {args.label_b} — Inner shoulder distance & Wall thickness",
+        f"{title} — Inner shoulder distance & Wall thickness",
         fontsize=15, color="#2b2b2b", x=0.01, ha="left", y=0.99,
     )
-    fig.text(
-        0.01, 0.945,
-        f"dashed = {args.rolling_minutes:g}min centered rolling average"
-        f" · line+circles = {args.label_a} actual (n={len(run_a)})"
-        f" · diamonds = {args.label_b} actual (n={len(run_b)})"
-        + (" · shade = material feed rate (kg/h)" if args.feed_bands else ""),
-        fontsize=9.5, color=TEXT, ha="left",
-    )
+    subtitle = f"dashed = {args.rolling_minutes:g}min centered rolling average · line+circles = {args.label_a} actual (n={len(run_a)})"
+    if run_b is not None:
+        subtitle += f" · diamonds = {args.label_b} actual (n={len(run_b)})"
+    if args.feed_bands:
+        subtitle += " · shade = material feed rate (kg/h)"
+    fig.text(0.01, 0.945, subtitle, fontsize=9.5, color=TEXT, ha="left")
 
-    xmin = min(run_a["time"].min(), run_b["time"].min())
-    xmax = max(run_a["time"].max(), run_b["time"].max())
+    xmin = run_a["time"].min() if run_b is None else min(run_a["time"].min(), run_b["time"].min())
+    xmax = run_a["time"].max() if run_b is None else max(run_a["time"].max(), run_b["time"].max())
     bounds = feed_rate_bounds(xmin, xmax) if args.feed_bands else []
 
     for ax, (column, ylabel) in zip(axes, METRICS):
@@ -175,26 +177,28 @@ def main() -> None:
             ax.axvspan(t0, t1, color=color, alpha=0.2, lw=0, zorder=0)
 
         mean_a, std_a = run_a[column].mean(), run_a[column].std()
-        mean_b, std_b = run_b[column].mean(), run_b[column].std()
 
         ax.plot(
             run_a["time"], run_a[column], "-o", color=BLUE, markersize=4.5,
             linewidth=1.4, label=f"{args.label_a} — {mean_a:.2f}±{std_a:.2f} mm, n={len(run_a)}",
         )
         ax.plot(
-            run_b["time"], run_b[column], "D", color=ORANGE, markersize=7,
-            linestyle="none", label=f"{args.label_b} — {mean_b:.2f}±{std_b:.2f} mm, n={len(run_b)}",
-        )
-        ax.plot(
             run_a["time"], centered_rolling_avg(run_a, column, window),
             "--", color=BLUE, linewidth=1.6, alpha=0.85,
             label=f"{args.label_a} — {args.rolling_minutes:g}min rolling avg",
         )
-        ax.plot(
-            run_b["time"], centered_rolling_avg(run_b, column, window),
-            "--", color=ORANGE, linewidth=1.6, alpha=0.85,
-            label=f"{args.label_b} — {args.rolling_minutes:g}min rolling avg",
-        )
+
+        if run_b is not None:
+            mean_b, std_b = run_b[column].mean(), run_b[column].std()
+            ax.plot(
+                run_b["time"], run_b[column], "D", color=ORANGE, markersize=7,
+                linestyle="none", label=f"{args.label_b} — {mean_b:.2f}±{std_b:.2f} mm, n={len(run_b)}",
+            )
+            ax.plot(
+                run_b["time"], centered_rolling_avg(run_b, column, window),
+                "--", color=ORANGE, linewidth=1.6, alpha=0.85,
+                label=f"{args.label_b} — {args.rolling_minutes:g}min rolling avg",
+            )
 
         if column == args.spec_metric:
             for value, tag in ((args.spec_min, "min"), (args.spec_max, "max")):
