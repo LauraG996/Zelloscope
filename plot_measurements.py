@@ -126,18 +126,10 @@ def main() -> None:
         "--feed-bands", action="store_true",
         help="Shade feed-rate bands using the schedule back-calculated from the reference plot",
     )
-    parser.add_argument(
-        "--spec-min", type=float, default=None,
-        help="Draw a min spec-limit line at this value on the first metric's panel",
-    )
-    parser.add_argument(
-        "--spec-max", type=float, default=None,
-        help="Draw a max spec-limit line at this value on the first metric's panel",
-    )
-    parser.add_argument(
-        "--spec-metric", default=METRICS[0][0], choices=[m[0] for m in METRICS],
-        help="Which metric panel the spec-limit lines apply to",
-    )
+    parser.add_argument("--spec-min-a", type=float, default=None, help="Min spec-limit line on the A panel")
+    parser.add_argument("--spec-max-a", type=float, default=None, help="Max spec-limit line on the A panel")
+    parser.add_argument("--spec-min-b", type=float, default=None, help="Min spec-limit line on the B panel")
+    parser.add_argument("--spec-max-b", type=float, default=None, help="Max spec-limit line on the B panel")
     parser.add_argument("-o", "--output", type=Path, default=Path("plots/measurements_comparison.svg"))
     args = parser.parse_args()
 
@@ -170,6 +162,11 @@ def main() -> None:
     xmax = run_a["time"].max() if run_b is None else max(run_a["time"].max(), run_b["time"].max())
     bounds = feed_rate_bounds(xmin, xmax) if args.feed_bands else []
 
+    spec_bounds = {
+        METRICS[0][0]: (args.spec_min_a, args.spec_max_a),
+        METRICS[1][0]: (args.spec_min_b, args.spec_max_b),
+    }
+
     for ax, (column, ylabel) in zip(axes, METRICS):
         style_axis(ax)
 
@@ -200,16 +197,16 @@ def main() -> None:
                 label=f"{args.label_b} — {args.rolling_minutes:g}min rolling avg",
             )
 
-        if column == args.spec_metric:
-            for value, tag in ((args.spec_min, "min"), (args.spec_max, "max")):
-                if value is None:
-                    continue
-                ax.axhline(value, color=SPEC_RED, linestyle="--", linewidth=1.4, zorder=3)
-                ax.text(
-                    0.998, value, f"{tag} {value:g}", transform=ax.get_yaxis_transform(),
-                    ha="right", va="bottom" if tag == "min" else "top",
-                    fontsize=8.5, color=SPEC_RED,
-                )
+        spec_min, spec_max = spec_bounds[column]
+        for value, tag in ((spec_min, "min"), (spec_max, "max")):
+            if value is None:
+                continue
+            ax.axhline(value, color=SPEC_RED, linestyle="--", linewidth=1.4, zorder=3)
+            ax.text(
+                0.998, value, f"{tag} {value:g}", transform=ax.get_yaxis_transform(),
+                ha="right", va="bottom" if tag == "min" else "top",
+                fontsize=8.5, color=SPEC_RED,
+            )
 
         ax.set_xlim(xmin, xmax)
         ax.set_ylabel(ylabel)
