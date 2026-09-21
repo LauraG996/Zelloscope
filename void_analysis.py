@@ -3,12 +3,20 @@
 count, size, and spatial distribution.
 
 Voids show up as small patches darker than their immediate surroundings, on
-top of a naturally grainy/speckled material texture. Detection works by
-blurring away that fine grain, estimating a smooth local background with a
-large morphological closing (which bridges over -- erases -- the voids), and
-thresholding how far each pixel falls below that background (see
-detect_void_mask). What survives is cleaned of speckle noise and split into
-individual voids with cv2.connectedComponentsWithStats.
+top of a naturally grainy/speckled material texture. The primary detector
+(detect_void_mask) blurs away that fine grain, estimates a smooth local
+background with a large morphological closing (which bridges over -- erases
+-- the voids), and Otsu-thresholds how far each pixel falls below that
+background. That works well as long as the material's own texture noise is
+mild enough for "darker than the local background" to mean "void" rather
+than "grain". Some material surfaces are grainy enough that it doesn't (see
+detect_void_mask_by_color) -- select_void_mask automatically falls back to a
+color-based detector for those, since real voids there turn out to carry
+visible material coloring (e.g. a tan/brown fill) that the surrounding grain,
+which is neutrally gray, does not. The fallback triggers when the primary
+detector's largest single blob is implausibly large relative to the
+specimen -- a sign that background and voids have merged into one region
+rather than staying as separate spots.
 
 For each image, writes an annotated copy with void outlines, a per-void CSV
 (id/area/diameter/centroid), and a grid-based spatial-distribution CSV
@@ -40,18 +48,71 @@ DEFAULT_MIN_AREA_PX = 6
 # the per-region void count / porosity breakdown.
 DEFAULT_GRID_SIZE = 4
 
+# Pixels darker than this (after a heavy blur) are considered outside the
+# specimen entirely (e.g. a mount/background the specimen was photographed
+# against), not material -- see specimen_mask. Real specimens in this data
+# set never got this dark even inside a void, only the mount around them did.
+DEFAULT_MOUNT_THRESHOLD = 50
+# Blur sigma (px) used to find the specimen's own extent, well beyond
+# DEFAULT_BLUR_SIGMA since this only needs to find the coarse mount/specimen
+# boundary, not preserve individual voids.
+DEFAULT_MOUNT_BLUR_SIGMA = 15.0
+# If detect_void_mask's largest single blob covers more than this fraction of
+# the specimen, brightness-based detection is considered to have failed --
+# background and voids merged into one region because the material's own
+# grain is too noisy for "darker than local background" to mean "void" --
+# and select_void_mask falls back to detect_void_mask_by_color instead.
+DEFAULT_MAX_COMPONENT_FRAC = 0.01
+# Blur sigma (px) applied to the color-channel-spread map used by the
+# fallback color-based detector.
+DEFAULT_CHROMA_BLUR_SIGMA = 2.0
+
+
+def specimen_mask(
+    gray: np.ndarray,
+    mount_threshold: float = DEFAULT_MOUNT_THRESHOLD,
+    blur_sigma: float = DEFAULT_MOUNT_BLUR_SIGMA,
+) -> np.ndarray:
+    """Binary mask (255 = specimen) excluding any dark mount/background the specimen sits against.
+
+    Heavily blurs away texture and voids, keeping only the coarse
+    illumination level, then keeps the single largest region brighter than
+    mount_threshold. Harmless when the specimen fills the whole frame (the
+    common case in this data set) -- the mask then just comes back all-255.
+    """
+    heavy = cv2.GaussianBlur(gray, (0, 0), sigmaX=blur_sigma)
+    _, mask = cv2.threshold(heavy, mount_threshold, 255, cv2.THRESH_BINARY)
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (25, 25))
+    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    if num_labels <= 1:
+        return np.full(gray.shape, 255, np.uint8)
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    return np.where(labels == largest_label, 255, 0).astype(np.uint8)
+
+
+def _otsu_threshold_within(values: np.ndarray, region: np.ndarray) -> float:
+    """Otsu threshold computed only from values[region > 0], as a scalar."""
+    t, _ = cv2.threshold(values[region > 0].reshape(-1, 1), 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    return t
+
 
 def detect_void_mask(
     gray: np.ndarray,
+    region: np.ndarray,
     blur_sigma: float = DEFAULT_BLUR_SIGMA,
     bg_kernel_frac: float = DEFAULT_BG_KERNEL_FRAC,
 ) -> np.ndarray:
-    """Binary mask (255 = void) of pixels darker than their local background.
+    """Binary mask (255 = void) of pixels darker than their local background, within region.
 
     Otsu-thresholds how far each pixel falls below a smoothed local
     background estimate (a large morphological closing, which fills in --
     erases -- anything smaller than the kernel, i.e. the voids themselves),
     then removes single-pixel speckle left over from the material's texture.
+    The threshold is computed only from pixels inside region (see
+    specimen_mask) so a dark mount/background around the specimen can't skew
+    it, and the result is masked to region too.
     """
     h, w = gray.shape
     blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=blur_sigma)
@@ -61,10 +122,74 @@ def detect_void_mask(
     background = cv2.morphologyEx(blurred, cv2.MORPH_CLOSE, close_kernel)
 
     below_background = cv2.subtract(background, blurred)
-    _, mask = cv2.threshold(below_background, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    t = _otsu_threshold_within(below_background, region)
+    mask = ((below_background > t) & (region > 0)).astype(np.uint8) * 255
 
     speckle_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, speckle_kernel)
+
+
+def color_spread(image: np.ndarray) -> np.ndarray:
+    """Per-pixel max(B,G,R) - min(B,G,R): ~0 for neutral gray, higher for visibly colored pixels.
+
+    Self-normalizing against local brightness/illumination (unlike raw
+    grayscale value), which is what makes it a robust void signal on grainy
+    material: the grain's own brightness swings are colorless, but a void's
+    fill tends to show real material coloring.
+    """
+    signed = image.astype(np.int16)
+    b, g, r = signed[:, :, 0], signed[:, :, 1], signed[:, :, 2]
+    spread = np.maximum(np.maximum(r, g), b) - np.minimum(np.minimum(r, g), b)
+    return spread.astype(np.uint8)
+
+
+def detect_void_mask_by_color(
+    image: np.ndarray,
+    region: np.ndarray,
+    blur_sigma: float = DEFAULT_CHROMA_BLUR_SIGMA,
+) -> np.ndarray:
+    """Binary mask (255 = void) of pixels with visibly more color than their surroundings, within region.
+
+    Fallback for material whose own grain is too noisy in brightness terms
+    for detect_void_mask to separate voids from texture (see module
+    docstring). No local background subtraction is needed here -- unlike raw
+    darkness, color_spread already sits near zero across plain gray material
+    regardless of the local illumination level, so a single Otsu threshold
+    over the specimen is enough.
+    """
+    spread = cv2.GaussianBlur(color_spread(image), (0, 0), sigmaX=blur_sigma)
+    t = _otsu_threshold_within(spread, region)
+    mask = ((spread > t) & (region > 0)).astype(np.uint8) * 255
+
+    speckle_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, speckle_kernel)
+
+
+def select_void_mask(
+    image: np.ndarray,
+    gray: np.ndarray,
+    region: np.ndarray,
+    blur_sigma: float = DEFAULT_BLUR_SIGMA,
+    bg_kernel_frac: float = DEFAULT_BG_KERNEL_FRAC,
+    max_component_frac: float = DEFAULT_MAX_COMPONENT_FRAC,
+) -> tuple[np.ndarray, str]:
+    """detect_void_mask, falling back to detect_void_mask_by_color if it looks like it failed.
+
+    "Failed" here means its largest connected blob swallowed more than
+    max_component_frac of the specimen -- i.e. background and voids merged
+    into one connected region instead of staying as separate spots, which
+    signals the material's grain is too noisy for brightness alone. Returns
+    (mask, method) where method is "brightness" or "color".
+    """
+    mask = detect_void_mask(gray, region, blur_sigma, bg_kernel_frac)
+
+    num_labels, _, stats, _ = cv2.connectedComponentsWithStats(mask, connectivity=8)
+    largest_area = stats[1:, cv2.CC_STAT_AREA].max() if num_labels > 1 else 0
+    region_area = np.count_nonzero(region)
+
+    if region_area > 0 and largest_area / region_area > max_component_frac:
+        return detect_void_mask_by_color(image, region), "color"
+    return mask, "brightness"
 
 
 class Void:
@@ -101,16 +226,21 @@ def find_voids(mask: np.ndarray, min_area_px: float = DEFAULT_MIN_AREA_PX) -> tu
     return voids, kept_labels
 
 
-def size_summary(voids: list[Void], image_shape: tuple[int, int], pix2mm: float | None = None) -> dict:
-    """Aggregate count/size/porosity stats for a list of voids."""
-    h, w = image_shape
+def size_summary(voids: list[Void], specimen_area_px: int, pix2mm: float | None = None) -> dict:
+    """Aggregate count/size/porosity stats for a list of voids.
+
+    porosity_pct is relative to specimen_area_px (the specimen itself, per
+    specimen_mask), not the whole image -- images with a mount/background
+    border around the specimen would otherwise read an artificially low
+    porosity.
+    """
     diameters = np.array([v.diameter_px for v in voids]) if voids else np.array([])
     total_area_px = float(sum(v.area_px for v in voids))
 
     summary = {
         "void_count": len(voids),
         "total_void_area_px": total_area_px,
-        "porosity_pct": 100.0 * total_area_px / (h * w),
+        "porosity_pct": 100.0 * total_area_px / specimen_area_px,
         "diameter_px_mean": float(diameters.mean()) if voids else 0.0,
         "diameter_px_median": float(np.median(diameters)) if voids else 0.0,
         "diameter_px_std": float(diameters.std()) if voids else 0.0,
@@ -227,8 +357,17 @@ def process_file(
         raise ValueError(f"Could not read image: {src}")
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
-    mask = detect_void_mask(gray, blur_sigma, bg_kernel_frac)
+    region = specimen_mask(gray)
+    # Pull the region in from its own (possibly ragged) edge a little, so
+    # that edge itself -- e.g. where a mount border was cut away -- can't be
+    # mistaken for a void.
+    border_px = max(5, int(round(min(gray.shape) * 0.003)) | 1)
+    border_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (border_px * 2 + 1,) * 2)
+    region = cv2.erode(region, border_kernel)
+
+    mask, method = select_void_mask(image, gray, region, blur_sigma, bg_kernel_frac)
     voids, labels = find_voids(mask, min_area_px)
+    specimen_area_px = int(np.count_nonzero(region))
 
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = src.stem
@@ -261,12 +400,15 @@ def process_file(
     if make_plots:
         plot_distributions(voids, gray.shape, spatial_rows, out_dir / f"{stem}_distribution.png")
 
-    return size_summary(voids, gray.shape, pix2mm)
+    summary = size_summary(voids, specimen_area_px, pix2mm)
+    summary["detection_method"] = method
+    return summary
 
 
 def _describe(name: str, summary: dict) -> str:
     text = (
-        f"{name}: {summary['void_count']} voids, porosity {summary['porosity_pct']:.2f}%, "
+        f"{name}: {summary['void_count']} voids ({summary['detection_method']} detection), "
+        f"porosity {summary['porosity_pct']:.2f}%, "
         f"diameter mean {summary['diameter_px_mean']:.1f}px "
         f"(median {summary['diameter_px_median']:.1f}, "
         f"range {summary['diameter_px_min']:.1f}-{summary['diameter_px_max']:.1f})"
@@ -277,7 +419,7 @@ def _describe(name: str, summary: dict) -> str:
 
 
 def _summary_csv_header(pix2mm: float | None) -> list[str]:
-    header = ["filename", "void_count", "total_void_area_px", "porosity_pct",
+    header = ["filename", "detection_method", "void_count", "total_void_area_px", "porosity_pct",
               "diameter_px_mean", "diameter_px_median", "diameter_px_std",
               "diameter_px_min", "diameter_px_max"]
     if pix2mm is not None:
@@ -287,7 +429,7 @@ def _summary_csv_header(pix2mm: float | None) -> list[str]:
 
 
 def _summary_csv_row(name: str, summary: dict, pix2mm: float | None) -> list[str]:
-    row = [name, summary["void_count"], f"{summary['total_void_area_px']:.1f}",
+    row = [name, summary["detection_method"], summary["void_count"], f"{summary['total_void_area_px']:.1f}",
            f"{summary['porosity_pct']:.2f}", f"{summary['diameter_px_mean']:.2f}",
            f"{summary['diameter_px_median']:.2f}", f"{summary['diameter_px_std']:.2f}",
            f"{summary['diameter_px_min']:.2f}", f"{summary['diameter_px_max']:.2f}"]
