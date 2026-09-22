@@ -38,6 +38,21 @@ DEFAULT_BLUR_SIGMA = 3.0
 DEFAULT_BG_KERNEL_FRAC = 0.025
 # Voids smaller than this (px^2, after speckle cleanup) are dropped as noise.
 DEFAULT_MIN_AREA_PX = 6
+# Median blur kernel (px, must be odd) used instead of the Gaussian blur when
+# set > 0. Median blur is far more effective than Gaussian at removing dense
+# fine-grained texture (e.g. a CLAHE-enhanced material surface) while it
+# barely touches large solid voids, since a void-sized neighborhood stays
+# void-colored under a median; Gaussian blur just averages the grain into the
+# void's edges instead of removing it. Off by default since it costs some
+# edge sharpness on well-behaved images that don't need it.
+DEFAULT_MEDIAN_BLUR_K = 0
+# Voids with contour solidity (area / convex-hull area) below this are
+# dropped when set > 0 -- real voids are solid, roughly convex blobs, while
+# leftover fine-grain texture that survives thresholding tends to form
+# sprawling, porous clusters with much lower solidity. Off by default: it's
+# a shape check on top of DEFAULT_MIN_AREA_PX, only needed for material
+# whose grain is too dense for the background estimate to fully separate out.
+DEFAULT_MIN_SOLIDITY = 0.0
 # Spatial distribution grid (rows x cols) that the image is split into for
 # the per-region void count / porosity breakdown.
 DEFAULT_GRID_SIZE = 4
@@ -88,6 +103,7 @@ def detect_void_mask(
     region: np.ndarray,
     blur_sigma: float = DEFAULT_BLUR_SIGMA,
     bg_kernel_frac: float = DEFAULT_BG_KERNEL_FRAC,
+    median_blur_k: int = DEFAULT_MEDIAN_BLUR_K,
 ) -> np.ndarray:
     """Binary mask (255 = void) of pixels darker than their local background, within region.
 
@@ -97,10 +113,12 @@ def detect_void_mask(
     then removes single-pixel speckle left over from the material's texture.
     The threshold is computed only from pixels inside region (see
     specimen_mask) so a dark mount/background around the specimen can't skew
-    it, and the result is masked to region too.
+    it, and the result is masked to region too. median_blur_k > 0 replaces
+    the usual Gaussian smoothing with a median blur of that kernel size (see
+    DEFAULT_MEDIAN_BLUR_K for why).
     """
     h, w = gray.shape
-    blurred = cv2.GaussianBlur(gray, (0, 0), sigmaX=blur_sigma)
+    blurred = cv2.medianBlur(gray, median_blur_k) if median_blur_k > 0 else cv2.GaussianBlur(gray, (0, 0), sigmaX=blur_sigma)
 
     k = max(15, int(round(min(h, w) * bg_kernel_frac)) | 1)
     close_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
@@ -125,9 +143,27 @@ class Void:
         self.bbox = bbox
 
 
-def find_voids(mask: np.ndarray, min_area_px: float = DEFAULT_MIN_AREA_PX) -> tuple[list[Void], np.ndarray]:
+def _solidity(labels: np.ndarray, label: int, bbox: tuple[int, int, int, int]) -> float:
+    """Contour area / convex-hull area for component label, cropped to its own bbox for speed."""
+    x, y, w, h = bbox
+    component_mask = np.where(labels[y:y + h, x:x + w] == label, 255, 0).astype(np.uint8)
+    contours, _ = cv2.findContours(component_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not contours:
+        return 0.0
+    contour = max(contours, key=cv2.contourArea)
+    hull_area = cv2.contourArea(cv2.convexHull(contour))
+    return cv2.contourArea(contour) / hull_area if hull_area > 0 else 0.0
+
+
+def find_voids(
+    mask: np.ndarray,
+    min_area_px: float = DEFAULT_MIN_AREA_PX,
+    min_solidity: float = DEFAULT_MIN_SOLIDITY,
+) -> tuple[list[Void], np.ndarray]:
     """Connected components of mask, filtered by min_area_px and sorted largest-first.
 
+    min_solidity > 0 additionally drops components whose contour solidity
+    (area / convex-hull area) falls below it -- see DEFAULT_MIN_SOLIDITY.
     Returns the void list plus a same-shaped label image (0 = background,
     matching each Void's void_id elsewhere) with dropped/filtered components
     zeroed out, for drawing/lookup convenience.
@@ -142,6 +178,8 @@ def find_voids(mask: np.ndarray, min_area_px: float = DEFAULT_MIN_AREA_PX) -> tu
         if area < min_area_px:
             continue
         bbox = tuple(int(v) for v in stats[label, :4])
+        if min_solidity > 0 and _solidity(labels, label, bbox) < min_solidity:
+            continue
         voids.append(Void(next_id, area, tuple(centroids[label]), bbox))
         kept_labels[labels == label] = next_id
         next_id += 1
@@ -269,6 +307,8 @@ def process_file(
     bg_kernel_frac: float = DEFAULT_BG_KERNEL_FRAC,
     grid_size: int = DEFAULT_GRID_SIZE,
     make_plots: bool = False,
+    median_blur_k: int = DEFAULT_MEDIAN_BLUR_K,
+    min_solidity: float = DEFAULT_MIN_SOLIDITY,
 ) -> dict:
     """Detect voids in src, write the annotated image + per-void and spatial CSVs to out_dir.
 
@@ -287,8 +327,8 @@ def process_file(
     border_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (border_px * 2 + 1,) * 2)
     region = cv2.erode(region, border_kernel)
 
-    mask = detect_void_mask(gray, region, blur_sigma, bg_kernel_frac)
-    voids, labels = find_voids(mask, min_area_px)
+    mask = detect_void_mask(gray, region, blur_sigma, bg_kernel_frac, median_blur_k)
+    voids, labels = find_voids(mask, min_area_px, min_solidity)
     specimen_area_px = int(np.count_nonzero(region))
 
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -391,6 +431,18 @@ def main() -> None:
         help="Also save a <name>_distribution.png (size histogram + spatial heatmap) per image; "
              "requires matplotlib",
     )
+    parser.add_argument(
+        "--median-blur-k", type=int, default=DEFAULT_MEDIAN_BLUR_K,
+        help="Use a median blur of this kernel size (odd, px) instead of --blur-sigma's Gaussian "
+             "blur; much better at removing dense fine-grain texture (e.g. a CLAHE-enhanced "
+             f"surface) without eroding real voids (default: {DEFAULT_MEDIAN_BLUR_K}, i.e. off)",
+    )
+    parser.add_argument(
+        "--min-solidity", type=float, default=DEFAULT_MIN_SOLIDITY,
+        help="Drop detected voids whose contour solidity (area / convex-hull area) is below "
+             "this 0-1 value; real voids are solid blobs, leftover grain texture tends to form "
+             f"sprawling low-solidity clusters (default: {DEFAULT_MIN_SOLIDITY}, i.e. off)",
+    )
     args = parser.parse_args()
 
     files = [args.input] if args.input.is_file() else sorted(
@@ -405,6 +457,7 @@ def main() -> None:
         summary = process_file(
             src, args.output, args.pix2mm, args.min_area_px,
             args.blur_sigma, args.bg_kernel_frac, args.grid_size, args.plot,
+            args.median_blur_k, args.min_solidity,
         )
         print(_describe(src.name, summary))
         summary_rows.append((src.name, summary))
