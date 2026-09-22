@@ -9,7 +9,10 @@ copy with each counted hole outlined.
 
 For material whose own texture is grainy enough to be mistaken for holes
 (e.g. a CLAHE-processed image), pass --median-blur-k 25 --bg-kernel-frac 0.10
---min-solidity 0.7 -- see void_analysis.py's help for what each one does.
+--min-solidity 0.65 -- see void_analysis.py's help for what each one does.
+Solidity above ~0.7 starts rejecting real voids with a slightly irregular
+(non-convex) outline, e.g. a curved or gently notched shape -- 0.65 is a
+safer default that still rejects sprawling grain-texture clusters.
 """
 import argparse
 import sys
@@ -70,7 +73,8 @@ def main() -> None:
     )
     parser.add_argument(
         "--min-solidity", type=float, default=0.0,
-        help="For grainy material, reject non-blob-shaped noise: try 0.7",
+        help="For grainy material, reject non-blob-shaped noise: try 0.65 "
+             "(above ~0.7 starts rejecting real but non-convex voids)",
     )
     args = parser.parse_args()
 
