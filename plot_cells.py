@@ -15,8 +15,9 @@ import sys
 from pathlib import Path
 
 # Some rows have tens of thousands of measurements per column; csv's default
-# field size limit (131072 bytes) is too small for that.
-csv.field_size_limit(sys.maxsize)
+# field size limit (131072 bytes) is too small for that. sys.maxsize itself
+# overflows the C long field_size_limit takes on Windows, so cap at INT32_MAX.
+csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
 
 
 def load_latest_row(csv_path: Path) -> dict:
