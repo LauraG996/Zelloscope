@@ -2,10 +2,11 @@
 """Count the big, dark holes (voids) in a material micrograph.
 
 A hole is a patch clearly darker than its immediate surroundings (see
-void_analysis.detect_void_mask for how); --min-diameter-px sets what counts
-as "big" -- smaller dark specks (material grain texture, noise) are ignored.
-Prints one line per image with the count, and optionally saves an annotated
-copy with each counted hole outlined.
+void_analysis.detect_void_mask for how); --min-diameter-px (or
+--min-diameter-mm, given --pix2mm) sets what counts as "big" -- smaller dark
+specks (material grain texture, noise) are ignored. Prints one line per
+image with the count, and optionally saves an annotated copy with each
+counted hole outlined.
 
 For material whose own texture is grainy enough to be mistaken for holes
 (e.g. a CLAHE-processed image), pass --median-blur-k 25 --bg-kernel-frac 0.10
@@ -57,7 +58,17 @@ def main() -> None:
     parser.add_argument("input", type=Path, help="Image file or directory")
     parser.add_argument(
         "--min-diameter-px", type=float, default=DEFAULT_MIN_DIAMETER_PX,
-        help=f"Only count holes at least this wide, in pixels (default: {DEFAULT_MIN_DIAMETER_PX:g})",
+        help=f"Only count holes at least this wide, in pixels (default: {DEFAULT_MIN_DIAMETER_PX:g}); "
+             "overridden by --min-diameter-mm if that's given",
+    )
+    parser.add_argument(
+        "--pix2mm", type=float, default=None,
+        help="Millimeters per pixel, to specify --min-diameter-mm instead of pixels and to print "
+             "each hole's diameter range in mm alongside the count",
+    )
+    parser.add_argument(
+        "--min-diameter-mm", type=float, default=None,
+        help="Only count holes at least this wide, in mm; requires --pix2mm",
     )
     parser.add_argument(
         "--output", type=Path, default=None,
@@ -78,6 +89,13 @@ def main() -> None:
     )
     args = parser.parse_args()
 
+    if args.min_diameter_mm is not None:
+        if args.pix2mm is None:
+            sys.exit("--min-diameter-mm requires --pix2mm")
+        min_diameter_px = args.min_diameter_mm / args.pix2mm
+    else:
+        min_diameter_px = args.min_diameter_px
+
     files = [args.input] if args.input.is_file() else sorted(
         p for p in args.input.iterdir() if p.suffix.lower() in IMAGE_EXTS
     )
@@ -95,9 +113,13 @@ def main() -> None:
             continue
 
         holes, labels = count_holes(
-            image, args.min_diameter_px, args.median_blur_k, args.bg_kernel_frac, args.min_solidity,
+            image, min_diameter_px, args.median_blur_k, args.bg_kernel_frac, args.min_solidity,
         )
-        print(f"{src.name}: {len(holes)} holes")
+        line = f"{src.name}: {len(holes)} holes"
+        if args.pix2mm is not None and holes:
+            diameters_mm = [h.diameter_px * args.pix2mm for h in holes]
+            line += f" (diameter {min(diameters_mm):.2f}-{max(diameters_mm):.2f} mm)"
+        print(line)
         total += len(holes)
 
         if args.output is not None:
