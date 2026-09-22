@@ -79,6 +79,12 @@ def specimen_mask(
     illumination level, then keeps the single largest region brighter than
     mount_threshold. Harmless when the specimen fills the whole frame (the
     common case in this data set) -- the mask then just comes back all-255.
+
+    A large/dark enough void can itself dip below mount_threshold after this
+    much blur, which would otherwise carve a hole out of the specimen right
+    where the most interesting voids are. Any such hole gets filled back in
+    (flood-filling the background from the image border finds the real
+    mount, which is connected to it; a punched-out void interior isn't).
     """
     heavy = cv2.GaussianBlur(gray, (0, 0), sigmaX=blur_sigma)
     _, mask = cv2.threshold(heavy, mount_threshold, 255, cv2.THRESH_BINARY)
@@ -89,7 +95,16 @@ def specimen_mask(
     if num_labels <= 1:
         return np.full(gray.shape, 255, np.uint8)
     largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
-    return np.where(labels == largest_label, 255, 0).astype(np.uint8)
+    specimen = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+
+    h, w = specimen.shape
+    outside = cv2.bitwise_not(specimen)
+    flood_seed_mask = np.zeros((h + 2, w + 2), np.uint8)
+    # Flood from all four corners, not just (0, 0) -- the mount border (if any)
+    # is not guaranteed to touch that exact corner pixel.
+    for corner in ((0, 0), (w - 1, 0), (0, h - 1), (w - 1, h - 1)):
+        cv2.floodFill(outside, flood_seed_mask, corner, 0)  # clears whatever's reachable from the border
+    return cv2.bitwise_or(specimen, outside)  # whatever's left in `outside` was an enclosed hole
 
 
 def _otsu_threshold_within(values: np.ndarray, region: np.ndarray) -> float:
