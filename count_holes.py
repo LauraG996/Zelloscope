@@ -25,7 +25,14 @@ import cv2
 import numpy as np
 
 from straighten import IMAGE_EXTS
-from void_analysis import detect_void_mask, draw_void_contours, find_voids, specimen_mask
+from void_analysis import (
+    detect_void_mask,
+    draw_void_contours,
+    find_voids,
+    size_summary,
+    spatial_distribution,
+    specimen_mask,
+)
 
 # What counts as "big" by default: holes narrower than this (px) are ignored
 # as texture/noise. Tune to your image's scale and what you consider a hole.
@@ -53,11 +60,12 @@ def count_holes(
     bg_kernel_frac: float = 0.025,
     min_solidity: float = 0.0,
     ignore_edges: bool = True,
-) -> tuple[list, np.ndarray]:
+) -> tuple[list, np.ndarray, int]:
     """Detect holes at least min_diameter_px wide in image.
 
     ignore_edges drops any hole touching the image frame (see _drop_edge_holes).
-    Returns (holes, labels) -- see void_analysis.find_voids.
+    Returns (holes, labels, specimen_area_px) -- holes/labels as per
+    void_analysis.find_voids; specimen_area_px for size_summary's porosity.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -73,7 +81,7 @@ def count_holes(
     if ignore_edges:
         height, width = gray.shape
         holes, labels = _drop_edge_holes(holes, labels, width, height)
-    return holes, labels
+    return holes, labels, int(np.count_nonzero(region))
 
 
 def main() -> None:
@@ -115,6 +123,15 @@ def main() -> None:
         help="Count holes touching the image frame too (excluded by default, since "
              "they're cut off and don't reflect the hole's true size)",
     )
+    parser.add_argument(
+        "--stats", action="store_true",
+        help="Also print size stats (mean/median/std/min/max diameter, porosity) for each image",
+    )
+    parser.add_argument(
+        "--distribution", type=int, default=None, metavar="GRID_SIZE",
+        help="Also print a GRID_SIZE x GRID_SIZE spatial breakdown (hole count and porosity "
+             "per region) for each image, e.g. --distribution 4",
+    )
     args = parser.parse_args()
 
     if args.min_diameter_mm is not None:
@@ -140,7 +157,7 @@ def main() -> None:
             print(f"{src.name}: could not read image", file=sys.stderr)
             continue
 
-        holes, labels = count_holes(
+        holes, labels, specimen_area_px = count_holes(
             image, min_diameter_px, args.median_blur_k, args.bg_kernel_frac, args.min_solidity,
             ignore_edges=not args.include_edge_holes,
         )
@@ -150,6 +167,30 @@ def main() -> None:
             line += f" (diameter {min(diameters_mm):.2f}-{max(diameters_mm):.2f} mm)"
         print(line)
         total += len(holes)
+
+        if args.stats:
+            summary = size_summary(holes, specimen_area_px, args.pix2mm)
+            print(
+                f"  size: diameter mean {summary['diameter_px_mean']:.1f}px "
+                f"(median {summary['diameter_px_median']:.1f}, std {summary['diameter_px_std']:.1f}, "
+                f"range {summary['diameter_px_min']:.1f}-{summary['diameter_px_max']:.1f}), "
+                f"porosity {summary['porosity_pct']:.2f}%"
+            )
+            if "diameter_mm_mean" in summary:
+                print(
+                    f"  size (mm): diameter mean {summary['diameter_mm_mean']:.3f}mm "
+                    f"(median {summary['diameter_mm_median']:.3f}, std {summary['diameter_mm_std']:.3f}, "
+                    f"range {summary['diameter_mm_min']:.3f}-{summary['diameter_mm_max']:.3f})"
+                )
+
+        if args.distribution:
+            rows = spatial_distribution(holes, image.shape[:2], args.distribution)
+            print(f"  distribution ({args.distribution}x{args.distribution} grid):")
+            for row in rows:
+                print(
+                    f"    [{row['grid_row']},{row['grid_col']}] "
+                    f"{row['void_count']} holes, {row['porosity_pct']:.2f}% porosity"
+                )
 
         if args.output is not None:
             dst = args.output / src.name if len(files) > 1 else args.output
