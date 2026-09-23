@@ -99,10 +99,6 @@ def count_holes(
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
     region = specimen_mask(gray)
-    border_px = max(5, int(round(min(gray.shape) * 0.003)) | 1)
-    border_kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (border_px * 2 + 1,) * 2)
-    region = cv2.erode(region, border_kernel)
-
     mask = detect_void_mask(gray, region, bg_kernel_frac=bg_kernel_frac, median_blur_k=median_blur_k)
     min_area_px = np.pi * (min_diameter_px / 2) ** 2
     holes, labels = find_voids(mask, min_area_px=min_area_px, min_solidity=min_solidity)
