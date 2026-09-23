@@ -39,6 +39,35 @@ from void_analysis import (
 DEFAULT_MIN_DIAMETER_PX = 15.0
 
 
+def draw_distribution_grid(image: np.ndarray, rows: list[dict], grid_size: int) -> np.ndarray:
+    """Draw the grid_size x grid_size distribution grid on image, each cell labeled with its hole count."""
+    output = image.copy()
+    h, w = output.shape[:2]
+    cell_h, cell_w = h / grid_size, w / grid_size
+    scale = max(h, w) / 1500
+
+    line_thickness = max(1, int(round(2 * scale)))
+    for i in range(1, grid_size):
+        y = int(round(i * cell_h))
+        cv2.line(output, (0, y), (w, y), (0, 255, 255), line_thickness, cv2.LINE_AA)
+    for j in range(1, grid_size):
+        x = int(round(j * cell_w))
+        cv2.line(output, (x, 0), (x, h), (0, 255, 255), line_thickness, cv2.LINE_AA)
+
+    font_scale = max(0.7, 1.3 * scale)
+    font_thickness = max(1, int(round(2 * scale)))
+    for row in rows:
+        text = str(row["void_count"])
+        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+        cx = int(round((row["grid_col"] + 0.5) * cell_w)) - text_w // 2
+        cy = int(round((row["grid_row"] + 0.5) * cell_h)) + text_h // 2
+        cv2.putText(output, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 0, 0),
+                    font_thickness + 2, cv2.LINE_AA)
+        cv2.putText(output, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (0, 255, 255),
+                    font_thickness, cv2.LINE_AA)
+    return output
+
+
 def _drop_edge_holes(holes: list, labels: np.ndarray, width: int, height: int) -> tuple[list, np.ndarray]:
     """Remove holes whose bounding box touches the image frame -- they're cut
     off there, so their true size/shape isn't fully visible in this image."""
@@ -183,10 +212,11 @@ def main() -> None:
                     f"range {summary['diameter_mm_min']:.3f}-{summary['diameter_mm_max']:.3f})"
                 )
 
+        distribution_rows = None
         if args.distribution:
-            rows = spatial_distribution(holes, image.shape[:2], args.distribution)
+            distribution_rows = spatial_distribution(holes, image.shape[:2], args.distribution)
             print(f"  distribution ({args.distribution}x{args.distribution} grid):")
-            for row in rows:
+            for row in distribution_rows:
                 print(
                     f"    [{row['grid_row']},{row['grid_col']}] "
                     f"{row['void_count']} holes, {row['porosity_pct']:.2f}% porosity"
@@ -195,7 +225,10 @@ def main() -> None:
         if args.output is not None:
             dst = args.output / src.name if len(files) > 1 else args.output
             dst.parent.mkdir(parents=True, exist_ok=True)
-            cv2.imwrite(str(dst), draw_void_contours(image, labels, len(holes)))
+            annotated = draw_void_contours(image, labels, len(holes))
+            if distribution_rows is not None:
+                annotated = draw_distribution_grid(annotated, distribution_rows, args.distribution)
+            cv2.imwrite(str(dst), annotated)
 
     if len(files) > 1:
         print(f"total: {total} holes across {len(files)} images")
