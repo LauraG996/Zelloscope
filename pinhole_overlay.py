@@ -19,13 +19,23 @@ The mm-per-pixel scale is inferred from the data (reported diameter / the
 matched region's equivalent circular diameter) unless --pix2mm is given; a
 wide spread in that ratio means the row wasn't measured on this image.
 
+Cutter noise: the machined surface carries circular tracks from the cutter,
+and dark patches of foam along a track get segmented and measured like
+pinholes even where there's no hole. Pass --original (the micrograph the
+segmentation was made from) to find the tracks (see cutter_arcs.py) and drop
+detections that sit on a track but have no solid dark core. Dropped ones are
+drawn in grey with a red outline, the tracks are tinted, and the stats,
+grid counts and distribution use only the rest (--keep-cutter-noise marks
+them without dropping them).
+
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
 <image>_pinholes* for pinhole_data.csv, <image>_cells* for cell_data.csv):
   *.png               full-resolution overlay, with the --grid grid and each
                       grid square's count drawn on it
   *_plot.png          the same overlay with title and diameter colorbar
   *_distribution.png  size histogram + cumulative size curve (log diameter axis)
-  *.csv               one line per region (id, x, y, diameter, area, grid square)
+  *.csv               one line per region (id, x, y, diameter, area, grid square;
+                      with --original also on_track_frac, dark_core_frac, cutter_noise)
 """
 import argparse
 import ast
@@ -36,6 +46,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from cutter_arcs import TRACK_FRAC_MIN, find_cutter_tracks, is_cutter_noise, region_features
 from void_analysis import DEFAULT_GRID_SIZE, Void, size_summary, spatial_distribution
 
 # Some rows hold thousands of measurements per column; csv's default field
@@ -55,19 +66,53 @@ OUTLINE_MAX_REGIONS = 2000
 # Diameter percentile at the top of the color scale (see module docstring).
 COLOR_MAX_PERCENTILE = 99
 
+# Cutter-noise detections: fill and outline (RGB), and the cutter track tint.
+NOISE_FILL = (175, 175, 175)
+NOISE_OUTLINE = (220, 0, 0)
+TRACK_TINT = (255, 150, 150)
 
-def load_row(csv_path: Path, row_index: int | None) -> dict:
-    """The row at row_index (Python-style, so -1 is the last row), or the latest timestamp if None."""
+
+def read_rows(csv_path: Path) -> list[dict]:
     with open(csv_path, newline="") as f:
         rows = list(csv.DictReader(f))
     if not rows:
         sys.exit(f"No rows found in {csv_path}")
-    if row_index is None:
+    return rows
+
+
+def list_rows(csv_path: Path) -> None:
+    """Print each row's index, timestamp, label, count and diameter range, for picking --row."""
+    print(f"{csv_path}: index  timestamp            count  diameter range (mm)  label")
+    for i, row in enumerate(read_rows(csv_path)):
+        diameters, _, _ = parse_pinholes(row)
+        size = f"{diameters.min():.3f} - {diameters.max():.3f}" if len(diameters) else "-"
+        print(f"  {i:5d}  {row['timestamp']:<19}  {len(diameters):5d}  {size:<19}  {row.get('label', '')}")
+
+
+def load_row(csv_path: Path, selector: str | None) -> dict:
+    """The row picked by selector, or the latest timestamp if None.
+
+    selector is either a row index, Python-style (0 = first row, -1 = last), or
+    text matched against the timestamps -- a full timestamp, or any part of one
+    that picks out a single row, e.g. "14:19:36" or "2026-09-23 15:19".
+    """
+    rows = read_rows(csv_path)
+    if selector is None:
         return max(rows, key=lambda r: r["timestamp"])
     try:
-        return rows[row_index]
+        index = int(selector)
+    except ValueError:
+        matches = [(i, r) for i, r in enumerate(rows) if selector.strip() in r["timestamp"]]
+        if len(matches) == 1:
+            return matches[0][1]
+        if not matches:
+            sys.exit(f"--row {selector!r}: no timestamp in {csv_path} contains that (see --list-rows)")
+        sys.exit(f"--row {selector!r} matches {len(matches)} rows, be more specific: "
+                 + ", ".join(f"{i} ({r['timestamp']})" for i, r in matches))
+    try:
+        return rows[index]
     except IndexError:
-        sys.exit(f"--row {row_index} out of range: {csv_path} has {len(rows)} rows")
+        sys.exit(f"--row {index} out of range: {csv_path} has {len(rows)} rows (0 to {len(rows) - 1})")
 
 
 def parse_pinholes(row: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
@@ -99,27 +144,40 @@ def diameter_colors(diameters: np.ndarray):
     return norm, plt.get_cmap("plasma")
 
 
-def draw_overlay(segmented: np.ndarray, labels: np.ndarray, region_ids: np.ndarray, diameters: np.ndarray) -> np.ndarray:
-    """RGB image: faded segmentation with each matched region filled by its diameter color and outlined."""
-    norm, cmap = diameter_colors(diameters)
+def draw_overlay(
+    segmented: np.ndarray, labels: np.ndarray, region_ids: np.ndarray, diameters: np.ndarray,
+    noise: np.ndarray | None = None, tracks: np.ndarray | None = None,
+) -> np.ndarray:
+    """RGB image: faded segmentation with each matched region filled by its diameter color and outlined.
+
+    Regions flagged in noise (per point, parallel to region_ids) are drawn in
+    NOISE_FILL with a NOISE_OUTLINE outline instead; tracks, if given, is tinted.
+    """
+    if noise is None:
+        noise = np.zeros(len(region_ids), bool)
+    norm, cmap = diameter_colors(diameters[~noise] if (~noise).any() else diameters)
     n_labels = labels.max() + 1
     lut = np.zeros((n_labels, 3), np.uint8)
     is_pinhole = np.zeros(n_labels, bool)
-    for region_id, diameter in zip(region_ids, diameters):
+    is_noise = np.zeros(n_labels, bool)
+    for region_id, diameter, flagged in zip(region_ids, diameters, noise):
         if region_id > 0:
-            lut[region_id] = (np.array(cmap(norm(diameter))[:3]) * 255).astype(np.uint8)
-            is_pinhole[region_id] = True
+            is_noise[region_id] = flagged
+            is_pinhole[region_id] = not flagged
+            lut[region_id] = NOISE_FILL if flagged else (np.array(cmap(norm(diameter))[:3]) * 255).astype(np.uint8)
 
     background = 255 - (255 - segmented.astype(float)) * BACKGROUND_OPACITY
     output = np.repeat(background.astype(np.uint8)[:, :, None], 3, axis=2)
-    mask = is_pinhole[labels]
+    if tracks is not None:
+        output[tracks] = np.minimum(output[tracks], TRACK_TINT)
+    mask = (is_pinhole | is_noise)[labels]
     output[mask] = lut[labels][mask]
-    if is_pinhole.sum() > OUTLINE_MAX_REGIONS:
-        return output
 
     thickness = max(1, int(round(max(segmented.shape) / 1250)))
-    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    cv2.drawContours(output, contours, -1, (0, 0, 0), thickness)
+    for flags, color in ((is_pinhole, (0, 0, 0)), (is_noise, NOISE_OUTLINE)):
+        if 0 < flags.sum() <= OUTLINE_MAX_REGIONS:
+            contours, _ = cv2.findContours(flags[labels].astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cv2.drawContours(output, contours, -1, color, thickness * (2 if color == NOISE_OUTLINE else 1))
     return output
 
 
@@ -208,9 +266,11 @@ def main() -> None:
     parser.add_argument("segmented", type=Path, help="Segmented (black boundary / white region) image")
     parser.add_argument("--csv", type=Path, default=Path("pinhole_data.csv"), help="Measurement CSV, e.g. pinhole_data.csv or cell_data.csv (default: pinhole_data.csv)")
     parser.add_argument(
-        "--row", type=int, default=None,
-        help="Row index to plot, Python-style (-1 = last row in the file); default: latest timestamp",
+        "--row", default=None,
+        help="Row to plot: an index (0 = first row, -1 = last) or a timestamp or part of one, "
+             "e.g. \"14:19:36\"; default: latest timestamp. See --list-rows",
     )
+    parser.add_argument("--list-rows", action="store_true", help="List the CSV's rows (index, timestamp, count) and exit")
     parser.add_argument(
         "--pix2mm", type=float, default=None,
         help="mm per pixel; default: inferred from the row's diameters vs the matched regions",
@@ -219,8 +279,20 @@ def main() -> None:
         "--grid", type=int, default=DEFAULT_GRID_SIZE,
         help=f"Spatial distribution grid size (default: {DEFAULT_GRID_SIZE})",
     )
+    parser.add_argument(
+        "--original", type=Path, default=None,
+        help="Micrograph the segmentation was made from; enables cutter-noise removal (see module docstring)",
+    )
+    parser.add_argument(
+        "--keep-cutter-noise", action="store_true",
+        help="With --original: mark cutter-noise detections but keep them in the counts and stats",
+    )
     parser.add_argument("--output-dir", type=Path, default=None, help="Where to write outputs (default: next to the segmented image)")
     args = parser.parse_args()
+
+    if args.list_rows:
+        list_rows(args.csv)
+        return
 
     segmented = cv2.imread(str(args.segmented), cv2.IMREAD_GRAYSCALE)
     if segmented is None:
@@ -251,10 +323,31 @@ def main() -> None:
         if spread > 0.05:
             print("  warning: wide scale spread -- this row may not have been measured on this image")
 
+    noise = np.zeros(len(diameters), bool)
+    track_frac = core_frac = tracks = None
+    if args.original is not None:
+        original = cv2.imread(str(args.original), cv2.IMREAD_GRAYSCALE)
+        if original is None:
+            sys.exit(f"Could not read {args.original}")
+        if original.shape != segmented.shape:
+            sys.exit(f"{args.original} is {original.shape[::-1]}, segmented image is {segmented.shape[::-1]}")
+        tracks, centers = find_cutter_tracks(original)
+        label_track, label_core = region_features(original, labels, tracks)
+        track_frac, core_frac = label_track[region_ids], label_core[region_ids]
+        noise = matched & is_cutter_noise(track_frac, core_frac)
+        print(f"  cutter tracks: {len(centers)} pass(es), {(track_frac >= TRACK_FRAC_MIN).sum()} {noun} on a track, "
+              f"{noise.sum()} of them cutter noise (no solid dark core)"
+              + (" -- kept, --keep-cutter-noise" if args.keep_cutter_noise else " -- removed"))
+    counted = ~noise if not args.keep_cutter_noise else np.ones(len(diameters), bool)
+    if not counted.any():
+        sys.exit(f"Every {noun[:-1]} in row {row['timestamp']} was flagged as cutter noise")
+
     # Void objects let the repo's size/spatial helpers work on these regions.
     voids = [Void(i + 1, a, (cx, cy), (0, 0, 0, 0)) for i, (a, cx, cy) in enumerate(zip(area_px, x, y))]
-    summary = size_summary([v for v in voids if v.area_px > 0], segmented.size, pix2mm)
-    spatial_rows = spatial_distribution(voids, segmented.shape, args.grid)
+    counted_voids = [v for v, keep in zip(voids, counted) if keep]
+    summary = size_summary([v for v in counted_voids if v.area_px > 0], segmented.size, pix2mm)
+    spatial_rows = spatial_distribution(counted_voids, segmented.shape, args.grid)
+    all_diameters, diameters = diameters, diameters[counted]
 
     print(f"  diameter (mm): mean {diameters.mean():.3f}  median {np.median(diameters):.3f}  "
           f"std {diameters.std():.3f}  min {diameters.min():.3f}  max {diameters.max():.3f}")
@@ -270,8 +363,15 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     stem = args.segmented.stem.removesuffix("_segmented")
     title = f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}, on {args.segmented.name}"
+    if noise.any():
+        title += f"\n{noise.sum()} cutter-noise detections " + (
+            "marked (grey, red outline), still counted" if args.keep_cutter_noise
+            else "removed (grey, red outline); cutter tracks tinted")
 
-    overlay = draw_grid_counts(draw_overlay(segmented, labels, region_ids, diameters), spatial_rows, args.grid)
+    overlay = draw_grid_counts(
+        draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks),
+        spatial_rows, args.grid,
+    )
     paths = {
         "overlay": out_dir / f"{stem}_{noun}.png",
         "plot": out_dir / f"{stem}_{noun}_plot.png",
@@ -279,17 +379,22 @@ def main() -> None:
         "csv": out_dir / f"{stem}_{noun}.csv",
     }
     cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
-    save_overlay_plot(overlay, diameters, title, paths["plot"])
+    # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
+    save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"])
     save_distribution_plot(diameters, noun, title, paths["distribution"])
 
     cell_h, cell_w = segmented.shape[0] / args.grid, segmented.shape[1] / args.grid
     with open(paths["csv"], "w", newline="") as f:
         writer = csv.writer(f)
-        writer.writerow(["id", "x_px", "y_px", "diameter_mm", "area_px", "grid_row", "grid_col"])
-        for v, d in zip(voids, diameters):
+        header = ["id", "x_px", "y_px", "diameter_mm", "area_px", "grid_row", "grid_col"]
+        writer.writerow(header + (["on_track_frac", "dark_core_frac", "cutter_noise"] if track_frac is not None else []))
+        for i, (v, d) in enumerate(zip(voids, all_diameters)):
             cx, cy = v.centroid
-            writer.writerow([v.void_id, f"{cx:.3f}", f"{cy:.3f}", f"{d:.3f}", int(v.area_px),
-                             min(args.grid - 1, int(cy // cell_h)), min(args.grid - 1, int(cx // cell_w))])
+            line = [v.void_id, f"{cx:.3f}", f"{cy:.3f}", f"{d:.3f}", int(v.area_px),
+                    min(args.grid - 1, int(cy // cell_h)), min(args.grid - 1, int(cx // cell_w))]
+            if track_frac is not None:
+                line += [f"{track_frac[i]:.3f}", f"{core_frac[i]:.3f}", int(noise[i])]
+            writer.writerow(line)
 
     for path in paths.values():
         print(f"  wrote {path}")
