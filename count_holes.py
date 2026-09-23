@@ -4,9 +4,11 @@
 A hole is a patch clearly darker than its immediate surroundings (see
 void_analysis.detect_void_mask for how); --min-diameter-px (or
 --min-diameter-mm, given --pix2mm) sets what counts as "big" -- smaller dark
-specks (material grain texture, noise) are ignored. Prints one line per
-image with the count, and optionally saves an annotated copy with each
-counted hole outlined.
+specks (material grain texture, noise) are ignored. Holes touching the image
+frame are excluded by default, since they're cut off and don't reflect the
+hole's true size -- pass --include-edge-holes to count them anyway. Prints
+one line per image with the count, and optionally saves an annotated copy
+with each counted hole outlined.
 
 For material whose own texture is grainy enough to be mistaken for holes
 (e.g. a CLAHE-processed image), pass --median-blur-k 25 --bg-kernel-frac 0.10
@@ -30,15 +32,31 @@ from void_analysis import detect_void_mask, draw_void_contours, find_voids, spec
 DEFAULT_MIN_DIAMETER_PX = 15.0
 
 
+def _drop_edge_holes(holes: list, labels: np.ndarray, width: int, height: int) -> tuple[list, np.ndarray]:
+    """Remove holes whose bounding box touches the image frame -- they're cut
+    off there, so their true size/shape isn't fully visible in this image."""
+    kept = []
+    kept_labels = labels.copy()
+    for hole in holes:
+        x, y, w, h = hole.bbox
+        if x <= 0 or y <= 0 or x + w >= width or y + h >= height:
+            kept_labels[kept_labels == hole.void_id] = 0
+        else:
+            kept.append(hole)
+    return kept, kept_labels
+
+
 def count_holes(
     image: np.ndarray,
     min_diameter_px: float,
     median_blur_k: int = 0,
     bg_kernel_frac: float = 0.025,
     min_solidity: float = 0.0,
+    ignore_edges: bool = True,
 ) -> tuple[list, np.ndarray]:
     """Detect holes at least min_diameter_px wide in image.
 
+    ignore_edges drops any hole touching the image frame (see _drop_edge_holes).
     Returns (holes, labels) -- see void_analysis.find_voids.
     """
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
@@ -50,7 +68,12 @@ def count_holes(
 
     mask = detect_void_mask(gray, region, bg_kernel_frac=bg_kernel_frac, median_blur_k=median_blur_k)
     min_area_px = np.pi * (min_diameter_px / 2) ** 2
-    return find_voids(mask, min_area_px=min_area_px, min_solidity=min_solidity)
+    holes, labels = find_voids(mask, min_area_px=min_area_px, min_solidity=min_solidity)
+
+    if ignore_edges:
+        height, width = gray.shape
+        holes, labels = _drop_edge_holes(holes, labels, width, height)
+    return holes, labels
 
 
 def main() -> None:
@@ -87,6 +110,11 @@ def main() -> None:
         help="For grainy material, reject non-blob-shaped noise: try 0.65 "
              "(above ~0.7 starts rejecting real but non-convex voids)",
     )
+    parser.add_argument(
+        "--include-edge-holes", action="store_true",
+        help="Count holes touching the image frame too (excluded by default, since "
+             "they're cut off and don't reflect the hole's true size)",
+    )
     args = parser.parse_args()
 
     if args.min_diameter_mm is not None:
@@ -114,6 +142,7 @@ def main() -> None:
 
         holes, labels = count_holes(
             image, min_diameter_px, args.median_blur_k, args.bg_kernel_frac, args.min_solidity,
+            ignore_edges=not args.include_edge_holes,
         )
         line = f"{src.name}: {len(holes)} holes"
         if args.pix2mm is not None and holes:
