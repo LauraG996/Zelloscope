@@ -43,7 +43,9 @@ whole row it reports:
                the regions' second moments summed (area-weighted), i.e. the
                pore space as a whole; 1 = isotropic
 Near-round regions (aspect ratio below ROUND_ASPECT_MAX) are reported but
-their orientation isn't meaningful.
+their orientation isn't meaningful. The same alignment and direction are also
+worked out per grid square (--grid; --grid 2 gives the four quadrants), to
+show whether the orientation changes across the specimen.
 
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
 <image>_pinholes* for pinhole_data.csv, <image>_cells* for cell_data.csv):
@@ -52,6 +54,9 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
   *_plot.png          the same overlay with title and diameter colorbar
   *_distribution.png  size histogram + cumulative size curve (log diameter axis),
                       aspect ratio histogram, orientation rose diagram
+  *_orientation.png   regions colored by orientation, with each grid square's
+                      mean direction drawn as a bar (length = alignment) and
+                      labeled with direction, alignment and count
   *.csv               one line per region (id, x, y, diameter, area, grid square,
                       major/minor axis mm, aspect ratio, orientation deg;
                       with --original also on_track_frac, dark_core_frac, cutter_noise)
@@ -95,6 +100,11 @@ ROUND_ASPECT_MAX = 1.2
 
 # Major-axis line drawn through each colored region on the overlay (RGB).
 AXIS_COLOR = (255, 255, 255)
+
+# Cyclic colormap for orientation (0 and 180 deg are the same direction) and
+# the per-square mean-direction bars on the orientation map (RGB).
+ORIENTATION_CMAP = "twilight"
+DIRECTION_BAR_COLOR = (20, 20, 20)
 
 
 def read_rows(csv_path: Path) -> list[dict]:
@@ -207,6 +217,83 @@ def anisotropy_summary(major: np.ndarray, minor: np.ndarray, angle: np.ndarray, 
     }
 
 
+def orientation_by_square(
+    x: np.ndarray, y: np.ndarray, major: np.ndarray, minor: np.ndarray, angle: np.ndarray, area: np.ndarray,
+    image_shape: tuple[int, int], grid_size: int,
+) -> list[dict]:
+    """anisotropy_summary for the regions in each grid square (by (x, y)), row-major; None where empty."""
+    h, w = image_shape
+    rows = np.minimum(grid_size - 1, (y // (h / grid_size)).astype(int))
+    cols = np.minimum(grid_size - 1, (x // (w / grid_size)).astype(int))
+    squares = []
+    for r in range(grid_size):
+        for c in range(grid_size):
+            inside = (rows == r) & (cols == c)
+            summary = anisotropy_summary(major[inside], minor[inside], angle[inside], area[inside]) if inside.any() else None
+            squares.append({"grid_row": r, "grid_col": c, "count": int(inside.sum()), "anisotropy": summary})
+    return squares
+
+
+def orientation_colors(angle: np.ndarray) -> np.ndarray:
+    """RGB uint8 color for each orientation (deg, 0-180) on the cyclic ORIENTATION_CMAP."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    return (plt.get_cmap(ORIENTATION_CMAP)(np.asarray(angle) / 180.0)[:, :3] * 255).astype(np.uint8)
+
+
+def draw_square_directions(image: np.ndarray, squares: list[dict], grid_size: int) -> np.ndarray:
+    """Grid lines, plus in each square a bar along its mean direction (length = alignment) and a label."""
+    output = image.copy()
+    h, w = output.shape[:2]
+    cell_h, cell_w = h / grid_size, w / grid_size
+    scale = max(h, w) / 1500
+
+    line_thickness = max(1, int(round(3 * scale)))
+    for i in range(1, grid_size):
+        cv2.line(output, (0, int(round(i * cell_h))), (w, int(round(i * cell_h))), GRID_COLOR, line_thickness, cv2.LINE_AA)
+        cv2.line(output, (int(round(i * cell_w)), 0), (int(round(i * cell_w)), h), GRID_COLOR, line_thickness, cv2.LINE_AA)
+
+    font_scale = 1.1 * scale * min(1.0, 4 / grid_size) ** 0.5
+    font_thickness = max(1, int(round(2.5 * scale)))
+    bar_thickness = max(2, int(round(7 * scale)))
+    for square in squares:
+        cx, cy = (square["grid_col"] + 0.5) * cell_w, (square["grid_row"] + 0.5) * cell_h
+        summary = square["anisotropy"]
+        if summary is None:
+            text = "none"
+        else:
+            half = 0.4 * min(cell_w, cell_h) * summary["alignment"]
+            theta = np.radians(summary["direction_deg"])
+            dx, dy = half * np.cos(theta), -half * np.sin(theta)
+            p0, p1 = (int(round(cx - dx)), int(round(cy - dy))), (int(round(cx + dx)), int(round(cy + dy)))
+            cv2.line(output, p0, p1, (255, 255, 255), bar_thickness * 3, cv2.LINE_AA)
+            cv2.line(output, p0, p1, DIRECTION_BAR_COLOR, bar_thickness, cv2.LINE_AA)
+            text = f"{summary['direction_deg']:.0f} deg  {summary['alignment']:.2f}  n={square['count']}"
+        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+        org = (int(round(cx - text_w / 2)), int(round(cy + 0.42 * cell_h)))
+        cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness * 4, cv2.LINE_AA)
+        cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, GRID_COLOR, font_thickness, cv2.LINE_AA)
+    return output
+
+
+def save_orientation_plot(image: np.ndarray, title: str, dst: Path) -> None:
+    import matplotlib.pyplot as plt
+    from matplotlib.colors import Normalize
+
+    fig, ax = plt.subplots(figsize=(10, 10.6), dpi=150)
+    ax.imshow(image)
+    ax.set_axis_off()
+    ax.set_title(title, fontsize=11)
+    colorbar = fig.colorbar(plt.cm.ScalarMappable(norm=Normalize(0, 180), cmap=ORIENTATION_CMAP),
+                            ax=ax, fraction=0.04, pad=0.02, ticks=[0, 45, 90, 135, 180])
+    colorbar.set_label("Orientation (deg from horizontal; 90 = vertical)")
+    fig.tight_layout()
+    fig.savefig(dst)
+    plt.close(fig)
+
+
 def draw_major_axes(image: np.ndarray, cx: np.ndarray, cy: np.ndarray, major: np.ndarray, angle: np.ndarray) -> np.ndarray:
     """Draw each region's major axis (a line through its centroid along its orientation)."""
     output = image.copy()
@@ -231,12 +318,13 @@ def diameter_colors(diameters: np.ndarray):
 
 def draw_overlay(
     segmented: np.ndarray, labels: np.ndarray, region_ids: np.ndarray, diameters: np.ndarray,
-    noise: np.ndarray | None = None, tracks: np.ndarray | None = None,
+    noise: np.ndarray | None = None, tracks: np.ndarray | None = None, colors: np.ndarray | None = None,
 ) -> np.ndarray:
     """RGB image: faded segmentation with each matched region filled by its diameter color and outlined.
 
     Regions flagged in noise (per point, parallel to region_ids) are drawn in
-    NOISE_FILL with a NOISE_OUTLINE outline instead; tracks, if given, is tinted.
+    NOISE_FILL with a NOISE_OUTLINE outline instead; tracks, if given, is
+    tinted. colors (per point RGB) replaces the diameter coloring.
     """
     if noise is None:
         noise = np.zeros(len(region_ids), bool)
@@ -245,11 +333,16 @@ def draw_overlay(
     lut = np.zeros((n_labels, 3), np.uint8)
     is_pinhole = np.zeros(n_labels, bool)
     is_noise = np.zeros(n_labels, bool)
-    for region_id, diameter, flagged in zip(region_ids, diameters, noise):
+    for i, (region_id, diameter, flagged) in enumerate(zip(region_ids, diameters, noise)):
         if region_id > 0:
             is_noise[region_id] = flagged
             is_pinhole[region_id] = not flagged
-            lut[region_id] = NOISE_FILL if flagged else (np.array(cmap(norm(diameter))[:3]) * 255).astype(np.uint8)
+            if flagged:
+                lut[region_id] = NOISE_FILL
+            elif colors is not None:
+                lut[region_id] = colors[i]
+            else:
+                lut[region_id] = (np.array(cmap(norm(diameter))[:3]) * 255).astype(np.uint8)
 
     background = 255 - (255 - segmented.astype(float)) * BACKGROUND_OPACITY
     output = np.repeat(background.astype(np.uint8)[:, :, None], 3, axis=2)
@@ -466,6 +559,8 @@ def main() -> None:
     aspect = major_px / np.maximum(minor_px, 1e-9)
     shaped = counted & matched
     anisotropy = anisotropy_summary(major_px[shaped], minor_px[shaped], angle[shaped], area_px[shaped])
+    squares = orientation_by_square(x[shaped], y[shaped], major_px[shaped], minor_px[shaped], angle[shaped],
+                                    area_px[shaped], segmented.shape, args.grid)
 
     print(f"  diameter (mm): mean {diameters.mean():.3f}  median {np.median(diameters):.3f}  "
           f"std {diameters.std():.3f}  min {diameters.min():.3f}  max {diameters.max():.3f}")
@@ -480,6 +575,13 @@ def main() -> None:
           f"p90 {anisotropy['aspect_p90']:.2f}  ({anisotropy['round_count']} near-round, < {ROUND_ASPECT_MAX})")
     print(f"              alignment {anisotropy['alignment']:.2f} (0 random - 1 parallel), direction "
           f"{anisotropy['direction_deg']:.1f} deg (90 = vertical), DA {anisotropy['degree_of_anisotropy']:.2f}")
+    print(f"  orientation per grid square (direction deg / alignment / count, top row first):")
+    for r in range(args.grid):
+        cells = []
+        for square in squares[r * args.grid:(r + 1) * args.grid]:
+            a = square["anisotropy"]
+            cells.append(f"{a['direction_deg']:5.1f} / {a['alignment']:.2f} / {square['count']:<4d}" if a else f"{'-':^20}")
+        print("    " + "   ".join(cells))
 
     out_dir = args.output_dir or args.segmented.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -494,16 +596,24 @@ def main() -> None:
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
         ids = region_ids[shaped]
         overlay = draw_major_axes(overlay, label_cx[ids], label_cy[ids], label_major[ids], label_angle[ids])
+    orientation_map = draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks,
+                                   colors=orientation_colors(angle))
+    if shaped.sum() <= OUTLINE_MAX_REGIONS:
+        orientation_map = draw_major_axes(orientation_map, label_cx[ids], label_cy[ids], label_major[ids], label_angle[ids])
+    orientation_map = draw_square_directions(orientation_map, squares, args.grid)
     overlay = draw_grid_counts(overlay, spatial_rows, args.grid)
     paths = {
         "overlay": out_dir / f"{stem}_{noun}.png",
         "plot": out_dir / f"{stem}_{noun}_plot.png",
         "distribution": out_dir / f"{stem}_{noun}_distribution.png",
+        "orientation": out_dir / f"{stem}_{noun}_orientation.png",
         "csv": out_dir / f"{stem}_{noun}.csv",
     }
     cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
     save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"])
+    save_orientation_plot(orientation_map, title + f"\nOrientation per grid square: bar = mean direction, "
+                          f"length = alignment (0-1)", paths["orientation"])
     save_distribution_plot(diameters, aspect[shaped], angle[shaped], anisotropy, noun, title, paths["distribution"])
 
     cell_h, cell_w = segmented.shape[0] / args.grid, segmented.shape[1] / args.grid
