@@ -28,7 +28,7 @@ drawn in grey with a red outline, the tracks are tinted, and the stats,
 grid counts and distribution use only the rest (--keep-cutter-noise marks
 them without dropping them).
 
-Anisotropy: each region's shape is summarized by its equivalent ellipse (same
+Anisotropy: each pinhole's shape is summarized by its equivalent ellipse (same
 second moments): major and minor axis lengths, aspect ratio = major / minor
 (1 = round), and orientation = the major axis's angle from horizontal,
 counter-clockwise as seen on screen, 0-180 deg (90 = vertical). Over the
@@ -42,6 +42,17 @@ whole row it reports:
   DA           degree of anisotropy: major / minor of the ellipse of all
                the regions' second moments summed (area-weighted), i.e. the
                pore space as a whole; 1 = isotropic
+What shape is measured: the segmented outline runs around the outside of each
+hole's bright rim, so it's wider than the hole itself -- on the calibration
+image the dark hole filled only ~55% of its outline -- which flattens narrow
+slits' aspect ratios (a 6.5:1 slit measured 4.9:1) and can merge a hole with
+its neighbor. With --original the shape is instead measured on the hole
+itself: the pixels inside the outline darker than HOLE_DARK_REL x the local
+foam background, opened to drop texture specks, keeping every piece at least
+HOLE_MIN_PIECE_FRAC of the largest (debris can split a void's dark floor),
+with enclosed bright spots (debris lying in a void) filled in. Without
+--original it falls back to the outline. Diameters always stay as the CSV
+reports them; the hole's own equivalent diameter goes in hole_diameter_mm.
 Near-round regions (aspect ratio below ROUND_ASPECT_MAX) are reported but
 their orientation isn't meaningful. The same measures (alignment, direction,
 median aspect ratio, DA) are also worked out per grid square (--grid; --grid 2 gives the four quadrants), to
@@ -59,7 +70,8 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
                       labeled with direction, alignment, count, median aspect
                       ratio (AR) and degree of anisotropy (DA)
   *.csv               one line per region (id, x, y, diameter, area, grid square,
-                      major/minor axis mm, aspect ratio, orientation deg;
+                      major/minor axis mm, aspect ratio, orientation deg,
+                      shape_source (hole or outline), hole_diameter_mm;
                       with --original also on_track_frac, dark_core_frac, cutter_noise)
 """
 import argparse
@@ -71,7 +83,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from cutter_arcs import TRACK_FRAC_MIN, find_cutter_tracks, is_cutter_noise, region_features
+from cutter_arcs import TRACK_FRAC_MIN, dark_mask, find_cutter_tracks, is_cutter_noise, region_features
 from void_analysis import DEFAULT_GRID_SIZE, Void, size_summary, spatial_distribution
 
 # Some rows hold thousands of measurements per column; csv's default field
@@ -95,6 +107,16 @@ COLOR_MAX_PERCENTILE = 99
 NOISE_FILL = (175, 175, 175)
 NOISE_OUTLINE = (220, 0, 0)
 TRACK_TINT = (255, 150, 150)
+
+# A pinhole's own dark hole (see module docstring): darker than this x local
+# background -- traces the visible hole edge (0.35, used for the cutter-noise
+# core test, cuts into it) -- then opened with this radius to drop specks.
+HOLE_DARK_REL = 0.6
+HOLE_OPEN_RADIUS_PX = 3
+# Dark pieces at least this fraction of the largest one count as part of the
+# hole: grey debris lying in a big void can split its dark floor in two, and
+# keeping only the largest piece would cut the void short.
+HOLE_MIN_PIECE_FRAC = 0.1
 
 # Below this aspect ratio a region is effectively round and its orientation is noise.
 ROUND_ASPECT_MAX = 1.2
@@ -192,6 +214,49 @@ def region_shapes(labels: np.ndarray) -> tuple[np.ndarray, ...]:
     minor = 4 * np.sqrt(np.maximum((mu20 + mu02) / 2 - spread, 0))
     angle = (-np.degrees(0.5 * np.arctan2(2 * mu11, mu20 - mu02))) % 180
     return mx, my, major, minor, angle
+
+
+def hole_shapes(
+    original: np.ndarray, labels: np.ndarray, stats: np.ndarray, region_ids: np.ndarray,
+) -> tuple[np.ndarray, ...]:
+    """Equivalent ellipse of the dark hole inside each point's region (see module docstring).
+
+    Returns per-point (centroid x, centroid y, major px, minor px, orientation deg, area px),
+    NaN where the region has no dark hole (or the point matched no region).
+    """
+    dark = dark_mask(original, HOLE_DARK_REL)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * HOLE_OPEN_RADIUS_PX + 1,) * 2)
+    out = np.full((len(region_ids), 6), np.nan)
+    cache = {}
+    for i, label in enumerate(region_ids):
+        if label <= 0:
+            continue
+        if label not in cache:
+            x0, y0, w, h, _ = stats[label]
+            hole = cv2.morphologyEx(((labels[y0:y0 + h, x0:x0 + w] == label) & (dark[y0:y0 + h, x0:x0 + w] > 0))
+                                    .astype(np.uint8), cv2.MORPH_OPEN, kernel)
+            n, pieces, piece_stats, _ = cv2.connectedComponentsWithStats(hole, connectivity=8)
+            if n < 2:
+                cache[label] = None
+                continue
+            areas = piece_stats[1:, cv2.CC_STAT_AREA]
+            keep = np.flatnonzero(areas >= HOLE_MIN_PIECE_FRAC * areas.max()) + 1
+            hole = np.isin(pieces, keep).astype(np.uint8)
+            # Fill enclosed bright spots: flood the outside from a padded border, keep what it can't reach.
+            padded = np.pad(hole, 1)
+            outside = padded.copy()
+            cv2.floodFill(outside, None, (0, 0), 1)
+            hole = (padded | (1 - outside))[1:-1, 1:-1]
+            m = cv2.moments(hole, True)
+            mu20, mu02, mu11 = m["mu20"] / m["m00"], m["mu02"] / m["m00"], m["mu11"] / m["m00"]
+            spread = np.sqrt(((mu20 - mu02) / 2) ** 2 + mu11 ** 2)
+            cache[label] = (x0 + m["m10"] / m["m00"], y0 + m["m01"] / m["m00"],
+                            4 * np.sqrt(max((mu20 + mu02) / 2 + spread, 0)),
+                            4 * np.sqrt(max((mu20 + mu02) / 2 - spread, 0)),
+                            (-np.degrees(0.5 * np.arctan2(2 * mu11, mu20 - mu02))) % 180, m["m00"])
+        if cache[label] is not None:
+            out[i] = cache[label]
+    return tuple(out.T)
 
 
 def anisotropy_summary(major: np.ndarray, minor: np.ndarray, angle: np.ndarray, area: np.ndarray) -> dict:
@@ -563,11 +628,21 @@ def main() -> None:
 
     label_cx, label_cy, label_major, label_minor, label_angle = region_shapes(labels)
     major_px, minor_px, angle = label_major[region_ids], label_minor[region_ids], label_angle[region_ids]
+    axis_cx, axis_cy = label_cx[region_ids], label_cy[region_ids]
+    shape_area, from_hole, hole_area = area_px.copy(), np.zeros(len(diameters), bool), np.full(len(diameters), np.nan)
+    if args.original is not None:
+        h_cx, h_cy, h_major, h_minor, h_angle, hole_area = hole_shapes(original, labels, stats, region_ids)
+        from_hole = ~np.isnan(h_major) & (h_minor > 0)
+        major_px[from_hole], minor_px[from_hole], angle[from_hole] = h_major[from_hole], h_minor[from_hole], h_angle[from_hole]
+        axis_cx[from_hole], axis_cy[from_hole], shape_area[from_hole] = h_cx[from_hole], h_cy[from_hole], hole_area[from_hole]
+        print(f"  shape measured on the dark hole for {(from_hole & counted).sum()} of {counted.sum()} {noun} "
+              f"(the rest on the segmented outline); holes fill {np.nanmedian(hole_area / np.maximum(area_px, 1)):.0%} "
+              f"of their outline (median)")
     aspect = major_px / np.maximum(minor_px, 1e-9)
     shaped = counted & matched
-    anisotropy = anisotropy_summary(major_px[shaped], minor_px[shaped], angle[shaped], area_px[shaped])
+    anisotropy = anisotropy_summary(major_px[shaped], minor_px[shaped], angle[shaped], shape_area[shaped])
     squares = orientation_by_square(x[shaped], y[shaped], major_px[shaped], minor_px[shaped], angle[shaped],
-                                    area_px[shaped], segmented.shape, args.grid)
+                                    shape_area[shaped], segmented.shape, args.grid)
 
     print(f"  diameter (mm): mean {diameters.mean():.3f}  median {np.median(diameters):.3f}  "
           f"std {diameters.std():.3f}  min {diameters.min():.3f}  max {diameters.max():.3f}")
@@ -602,12 +677,11 @@ def main() -> None:
 
     overlay = draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks)
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
-        ids = region_ids[shaped]
-        overlay = draw_major_axes(overlay, label_cx[ids], label_cy[ids], label_major[ids], label_angle[ids])
+        overlay = draw_major_axes(overlay, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
     orientation_map = draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks,
                                    colors=orientation_colors(angle))
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
-        orientation_map = draw_major_axes(orientation_map, label_cx[ids], label_cy[ids], label_major[ids], label_angle[ids])
+        orientation_map = draw_major_axes(orientation_map, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
     orientation_map = draw_square_directions(orientation_map, squares, args.grid)
     overlay = draw_grid_counts(overlay, spatial_rows, args.grid)
     paths = {
@@ -629,13 +703,15 @@ def main() -> None:
     with open(paths["csv"], "w", newline="") as f:
         writer = csv.writer(f)
         header = ["id", "x_px", "y_px", "diameter_mm", "area_px", "grid_row", "grid_col",
-                  "major_mm", "minor_mm", "aspect_ratio", "orientation_deg"]
+                  "major_mm", "minor_mm", "aspect_ratio", "orientation_deg", "shape_source", "hole_diameter_mm"]
         writer.writerow(header + (["on_track_frac", "dark_core_frac", "cutter_noise"] if track_frac is not None else []))
         for i, (v, d) in enumerate(zip(voids, all_diameters)):
             cx, cy = v.centroid
             line = [v.void_id, f"{cx:.3f}", f"{cy:.3f}", f"{d:.3f}", int(v.area_px),
                     min(args.grid - 1, int(cy // cell_h)), min(args.grid - 1, int(cx // cell_w)),
-                    f"{major_px[i] * pix2mm:.3f}", f"{minor_px[i] * pix2mm:.3f}", f"{aspect[i]:.3f}", f"{angle[i]:.1f}"]
+                    f"{major_px[i] * pix2mm:.3f}", f"{minor_px[i] * pix2mm:.3f}", f"{aspect[i]:.3f}", f"{angle[i]:.1f}",
+                    "hole" if from_hole[i] else "outline",
+                    f"{2 * np.sqrt(hole_area[i] / np.pi) * pix2mm:.3f}" if from_hole[i] else ""]
             if track_frac is not None:
                 line += [f"{track_frac[i]:.3f}", f"{core_frac[i]:.3f}", int(noise[i])]
             writer.writerow(line)

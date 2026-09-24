@@ -180,16 +180,21 @@ def find_cutter_tracks(
     return mask, centers
 
 
+def dark_mask(gray: np.ndarray, rel: float) -> np.ndarray:
+    """uint8 mask of pixels darker than rel x the local foam background (lightly smoothed)."""
+    image = gray.astype(np.float32)
+    # Local background from foam pixels only, so a big hole doesn't darken its own reference.
+    foam = (image > 50).astype(np.float32)
+    background = cv2.GaussianBlur(image * foam, (0, 0), 40) / np.maximum(cv2.GaussianBlur(foam, (0, 0), 40), 1e-3)
+    return (cv2.GaussianBlur(image, (0, 0), 1.5) < rel * background).astype(np.uint8)
+
+
 def region_features(gray: np.ndarray, labels: np.ndarray, tracks: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Per-label (fraction within TRACK_BAND_PX of a track, fraction that is solid dark core).
 
     Indexed by label value, so feats[labels[y, x]] gives the region at (x, y).
     """
-    image = gray.astype(np.float32)
-    # Local background from foam pixels only, so a big hole doesn't darken its own reference.
-    foam = (image > 50).astype(np.float32)
-    background = cv2.GaussianBlur(image * foam, (0, 0), 40) / np.maximum(cv2.GaussianBlur(foam, (0, 0), 40), 1e-3)
-    dark = (cv2.GaussianBlur(image, (0, 0), 1.5) < DARK_REL * background).astype(np.uint8)
+    dark = dark_mask(gray, DARK_REL)
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * CORE_OPEN_RADIUS_PX + 1,) * 2)
     core = cv2.morphologyEx(dark, cv2.MORPH_OPEN, kernel)
     band = cv2.dilate(tracks.astype(np.uint8), cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (TRACK_BAND_PX,) * 2))
