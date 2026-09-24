@@ -1,3 +1,3 @@
 opencv-python-headless>=4.8
 numpy>=1.24
-matplotlib>=3.7  # optional: only needed for void_analysis.py's --plot
+matplotlib>=3.7  # needed by pinhole_overlay.py; for void_analysis.py only with --plot

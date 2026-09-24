@@ -91,21 +91,24 @@ def _profile_score(hp: np.ndarray, weight: np.ndarray, center: tuple[float, floa
 
 
 def _search_center(hp: np.ndarray, weight: np.ndarray) -> tuple[tuple[float, float], float]:
-    """Best track center (in hp's pixel coords) by coarse grid then Nelder-Mead refinement."""
-    from scipy.optimize import minimize
-
+    """Best track center (in hp's pixel coords): coarse grid, then a shrinking-step local search."""
     h, w = hp.shape
     # Cutter centers sit outside the frame, up to a few frame widths away.
     xs = np.linspace(-2.5 * w, 3.5 * w, 25)
     ys = np.linspace(-2.5 * h, 3.5 * h, 25)
-    best = max((_profile_score(hp, weight, (x, y)), x, y) for x in xs for y in ys)
+    score, x, y = max((_profile_score(hp, weight, (x, y)), x, y) for x in xs for y in ys)
+
+    # Pattern search (numpy only, no scipy): try the 8 neighbors at the current
+    # step, move to the best if it improves, otherwise halve the step, down to 1 px.
     step = xs[1] - xs[0]
-    result = minimize(
-        lambda v: -_profile_score(hp, weight, v), best[1:], method="Nelder-Mead",
-        options={"xatol": 1.0, "fatol": 1e-4,
-                 "initial_simplex": [best[1:], [best[1] + step, best[2]], [best[1], best[2] + step]]},
-    )
-    return (float(result.x[0]), float(result.x[1])), float(-result.fun)
+    while step >= 1.0:
+        neighbors = [(x + dx * step, y + dy * step) for dx in (-1, 0, 1) for dy in (-1, 0, 1) if dx or dy]
+        best = max((_profile_score(hp, weight, v), *v) for v in neighbors)
+        if best[0] > score:
+            score, x, y = best
+        else:
+            step /= 2
+    return (float(x), float(y)), float(score)
 
 
 def _track_mask(hp: np.ndarray, valid: np.ndarray, center: tuple[float, float], threshold: float) -> np.ndarray:
