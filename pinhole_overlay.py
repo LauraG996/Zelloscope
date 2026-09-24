@@ -28,13 +28,32 @@ drawn in grey with a red outline, the tracks are tinted, and the stats,
 grid counts and distribution use only the rest (--keep-cutter-noise marks
 them without dropping them).
 
+Anisotropy: each region's shape is summarized by its equivalent ellipse (same
+second moments): major and minor axis lengths, aspect ratio = major / minor
+(1 = round), and orientation = the major axis's angle from horizontal,
+counter-clockwise as seen on screen, 0-180 deg (90 = vertical). Over the
+whole row it reports:
+  alignment    0-1: how parallel the regions are (0 = random directions,
+               1 = all parallel), the length of the mean of each region's
+               doubled-angle direction vector, weighted by area x (1 - minor/
+               major) so big elongated regions count most and near-round
+               ones, whose direction is noise, count least
+  direction    that weighted mean direction, deg
+  DA           degree of anisotropy: major / minor of the ellipse of all
+               the regions' second moments summed (area-weighted), i.e. the
+               pore space as a whole; 1 = isotropic
+Near-round regions (aspect ratio below ROUND_ASPECT_MAX) are reported but
+their orientation isn't meaningful.
+
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
 <image>_pinholes* for pinhole_data.csv, <image>_cells* for cell_data.csv):
   *.png               full-resolution overlay, with the --grid grid and each
                       grid square's count drawn on it
   *_plot.png          the same overlay with title and diameter colorbar
-  *_distribution.png  size histogram + cumulative size curve (log diameter axis)
-  *.csv               one line per region (id, x, y, diameter, area, grid square;
+  *_distribution.png  size histogram + cumulative size curve (log diameter axis),
+                      aspect ratio histogram, orientation rose diagram
+  *.csv               one line per region (id, x, y, diameter, area, grid square,
+                      major/minor axis mm, aspect ratio, orientation deg;
                       with --original also on_track_frac, dark_core_frac, cutter_noise)
 """
 import argparse
@@ -70,6 +89,12 @@ COLOR_MAX_PERCENTILE = 99
 NOISE_FILL = (175, 175, 175)
 NOISE_OUTLINE = (220, 0, 0)
 TRACK_TINT = (255, 150, 150)
+
+# Below this aspect ratio a region is effectively round and its orientation is noise.
+ROUND_ASPECT_MAX = 1.2
+
+# Major-axis line drawn through each colored region on the overlay (RGB).
+AXIS_COLOR = (255, 255, 255)
 
 
 def read_rows(csv_path: Path) -> list[dict]:
@@ -132,6 +157,66 @@ def match_regions(segmented: np.ndarray, x: np.ndarray, y: np.ndarray) -> tuple[
     cols = np.clip(np.round(x).astype(int), 0, w - 1)
     rows = np.clip(np.round(y).astype(int), 0, h - 1)
     return labels, stats, labels[rows, cols]
+
+
+def region_shapes(labels: np.ndarray) -> tuple[np.ndarray, ...]:
+    """Per-label equivalent ellipse: (centroid x, centroid y, major px, minor px, orientation deg).
+
+    Indexed by label value. Axis lengths are full lengths of the ellipse with
+    the region's second moments; orientation is from horizontal, counter-
+    clockwise on screen (image y points down, hence the sign flip), in [0, 180).
+    """
+    flat = labels.ravel()
+    n = int(flat.max()) + 1
+    h, w = labels.shape
+    xs = np.tile(np.arange(w, dtype=np.float64), h)
+    ys = np.repeat(np.arange(h, dtype=np.float64), w)
+    area = np.maximum(np.bincount(flat, minlength=n), 1).astype(float)
+    mx, my = np.bincount(flat, xs, n) / area, np.bincount(flat, ys, n) / area
+    mu20 = np.bincount(flat, xs * xs, n) / area - mx ** 2
+    mu02 = np.bincount(flat, ys * ys, n) / area - my ** 2
+    mu11 = np.bincount(flat, xs * ys, n) / area - mx * my
+    spread = np.sqrt(((mu20 - mu02) / 2) ** 2 + mu11 ** 2)
+    major = 4 * np.sqrt(np.maximum((mu20 + mu02) / 2 + spread, 0))
+    minor = 4 * np.sqrt(np.maximum((mu20 + mu02) / 2 - spread, 0))
+    angle = (-np.degrees(0.5 * np.arctan2(2 * mu11, mu20 - mu02))) % 180
+    return mx, my, major, minor, angle
+
+
+def anisotropy_summary(major: np.ndarray, minor: np.ndarray, angle: np.ndarray, area: np.ndarray) -> dict:
+    """Row-level anisotropy: aspect ratio stats, alignment (0-1), mean direction, DA (see module docstring)."""
+    aspect = major / np.maximum(minor, 1e-9)
+    weight = area * (1 - minor / np.maximum(major, 1e-9))
+    mean_vector = np.sum(weight * np.exp(2j * np.radians(angle))) / max(weight.sum(), 1e-9)
+
+    # Sum each region's second-moment tensor (area x covariance) and take its ellipse's axis ratio.
+    theta = np.radians(angle)
+    var_major, var_minor = (major / 4) ** 2, (minor / 4) ** 2
+    cxx = np.sum(area * (var_major * np.cos(theta) ** 2 + var_minor * np.sin(theta) ** 2))
+    cyy = np.sum(area * (var_major * np.sin(theta) ** 2 + var_minor * np.cos(theta) ** 2))
+    cxy = np.sum(area * (var_major - var_minor) * np.cos(theta) * np.sin(theta))
+    eig = np.linalg.eigvalsh(np.array([[cxx, cxy], [cxy, cyy]]))
+    return {
+        "aspect_mean": float(aspect.mean()),
+        "aspect_median": float(np.median(aspect)),
+        "aspect_p90": float(np.percentile(aspect, 90)),
+        "round_count": int((aspect < ROUND_ASPECT_MAX).sum()),
+        "alignment": float(abs(mean_vector)),
+        "direction_deg": float(np.degrees(np.angle(mean_vector)) / 2 % 180),
+        "degree_of_anisotropy": float(np.sqrt(eig[1] / max(eig[0], 1e-9))),
+    }
+
+
+def draw_major_axes(image: np.ndarray, cx: np.ndarray, cy: np.ndarray, major: np.ndarray, angle: np.ndarray) -> np.ndarray:
+    """Draw each region's major axis (a line through its centroid along its orientation)."""
+    output = image.copy()
+    thickness = max(1, int(round(max(image.shape[:2]) / 1500)))
+    theta = np.radians(angle)
+    dx, dy = major / 2 * np.cos(theta), -major / 2 * np.sin(theta)  # screen angle -> image y down
+    for x0, y0, ux, uy in zip(cx, cy, dx, dy):
+        cv2.line(output, (int(round(x0 - ux)), int(round(y0 - uy))), (int(round(x0 + ux)), int(round(y0 + uy))),
+                 AXIS_COLOR, thickness, cv2.LINE_AA)
+    return output
 
 
 def diameter_colors(diameters: np.ndarray):
@@ -227,11 +312,15 @@ def draw_grid_counts(image: np.ndarray, spatial_rows: list[dict], grid_size: int
     return output
 
 
-def save_distribution_plot(diameters: np.ndarray, noun: str, title: str, dst: Path) -> None:
-    """Size histogram and cumulative size curve (log diameter axis), side by side."""
+def save_distribution_plot(
+    diameters: np.ndarray, aspect: np.ndarray, angle: np.ndarray, anisotropy: dict, noun: str, title: str, dst: Path,
+) -> None:
+    """2x2: size histogram, cumulative size curve (log diameter axis), aspect ratio histogram, orientation rose."""
     import matplotlib.pyplot as plt
 
-    fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.8))
+    fig = plt.figure(figsize=(11, 9.6))
+    ax1, ax2, ax3 = fig.add_subplot(2, 2, 1), fig.add_subplot(2, 2, 2), fig.add_subplot(2, 2, 3)
+    ax4 = fig.add_subplot(2, 2, 4, projection="polar")
 
     # Log-spaced bins on a log axis: sizes span ~2 decades (0.05 mm cells to
     # multi-mm voids), which a linear axis squeezes into a couple of bins.
@@ -254,6 +343,29 @@ def save_distribution_plot(diameters: np.ndarray, noun: str, title: str, dst: Pa
     ax2.set_ylabel(f"Cumulative % of {noun}")
     ax2.set_title("Cumulative size distribution")
     ax2.set_ylim(0, 100)
+
+    ax3.hist(aspect, bins=np.linspace(1, max(2.0, np.percentile(aspect, 99)), 30), color="#4477AA", edgecolor="white")
+    ax3.axvline(anisotropy["aspect_median"], color="#CC3311", linestyle="--",
+                label=f"median {anisotropy['aspect_median']:.2f}")
+    ax3.set_xlabel("Aspect ratio (major / minor axis)")
+    ax3.set_ylabel("Count")
+    ax3.set_title("Elongation")
+    ax3.legend()
+
+    # Rose diagram: orientation is axial (0 and 180 deg are the same direction),
+    # so each region is counted (once, unweighted) at angle and angle + 180; round
+    # regions are left out since their orientation is noise.
+    elongated = aspect >= ROUND_ASPECT_MAX
+    edges = np.radians(np.arange(0, 361, 10))
+    theta = np.radians(np.concatenate([angle[elongated], angle[elongated] + 180]))
+    counts, _ = np.histogram(theta, bins=edges)
+    ax4.bar(edges[:-1], counts, width=np.radians(10), align="edge", color="#4477AA", edgecolor="white")
+    direction = np.radians(anisotropy["direction_deg"])
+    ax4.plot([direction, direction + np.pi], [counts.max()] * 2, color="#CC3311", linewidth=2)
+    ax4.set_yticklabels([])
+    ax4.set_title(f"Orientation (0 deg = horizontal, 90 = vertical)\n"
+                  f"alignment {anisotropy['alignment']:.2f}, direction {anisotropy['direction_deg']:.0f} deg, "
+                  f"DA {anisotropy['degree_of_anisotropy']:.2f}", fontsize=10)
 
     fig.suptitle(title, fontsize=11)
     fig.tight_layout()
@@ -349,6 +461,12 @@ def main() -> None:
     spatial_rows = spatial_distribution(counted_voids, segmented.shape, args.grid)
     all_diameters, diameters = diameters, diameters[counted]
 
+    label_cx, label_cy, label_major, label_minor, label_angle = region_shapes(labels)
+    major_px, minor_px, angle = label_major[region_ids], label_minor[region_ids], label_angle[region_ids]
+    aspect = major_px / np.maximum(minor_px, 1e-9)
+    shaped = counted & matched
+    anisotropy = anisotropy_summary(major_px[shaped], minor_px[shaped], angle[shaped], area_px[shaped])
+
     print(f"  diameter (mm): mean {diameters.mean():.3f}  median {np.median(diameters):.3f}  "
           f"std {diameters.std():.3f}  min {diameters.min():.3f}  max {diameters.max():.3f}")
     p10, p25, p75, p90 = np.percentile(diameters, [10, 25, 75, 90])
@@ -358,6 +476,10 @@ def main() -> None:
     for r in range(args.grid):
         cells = [c["void_count"] for c in spatial_rows if c["grid_row"] == r]
         print("    " + "  ".join(f"{n:6d}" for n in cells))
+    print(f"  anisotropy: aspect ratio mean {anisotropy['aspect_mean']:.2f}  median {anisotropy['aspect_median']:.2f}  "
+          f"p90 {anisotropy['aspect_p90']:.2f}  ({anisotropy['round_count']} near-round, < {ROUND_ASPECT_MAX})")
+    print(f"              alignment {anisotropy['alignment']:.2f} (0 random - 1 parallel), direction "
+          f"{anisotropy['direction_deg']:.1f} deg (90 = vertical), DA {anisotropy['degree_of_anisotropy']:.2f}")
 
     out_dir = args.output_dir or args.segmented.parent
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -368,10 +490,11 @@ def main() -> None:
             "marked (grey, red outline), still counted" if args.keep_cutter_noise
             else "removed (grey, red outline); cutter tracks tinted")
 
-    overlay = draw_grid_counts(
-        draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks),
-        spatial_rows, args.grid,
-    )
+    overlay = draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks)
+    if shaped.sum() <= OUTLINE_MAX_REGIONS:
+        ids = region_ids[shaped]
+        overlay = draw_major_axes(overlay, label_cx[ids], label_cy[ids], label_major[ids], label_angle[ids])
+    overlay = draw_grid_counts(overlay, spatial_rows, args.grid)
     paths = {
         "overlay": out_dir / f"{stem}_{noun}.png",
         "plot": out_dir / f"{stem}_{noun}_plot.png",
@@ -381,17 +504,19 @@ def main() -> None:
     cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
     save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"])
-    save_distribution_plot(diameters, noun, title, paths["distribution"])
+    save_distribution_plot(diameters, aspect[shaped], angle[shaped], anisotropy, noun, title, paths["distribution"])
 
     cell_h, cell_w = segmented.shape[0] / args.grid, segmented.shape[1] / args.grid
     with open(paths["csv"], "w", newline="") as f:
         writer = csv.writer(f)
-        header = ["id", "x_px", "y_px", "diameter_mm", "area_px", "grid_row", "grid_col"]
+        header = ["id", "x_px", "y_px", "diameter_mm", "area_px", "grid_row", "grid_col",
+                  "major_mm", "minor_mm", "aspect_ratio", "orientation_deg"]
         writer.writerow(header + (["on_track_frac", "dark_core_frac", "cutter_noise"] if track_frac is not None else []))
         for i, (v, d) in enumerate(zip(voids, all_diameters)):
             cx, cy = v.centroid
             line = [v.void_id, f"{cx:.3f}", f"{cy:.3f}", f"{d:.3f}", int(v.area_px),
-                    min(args.grid - 1, int(cy // cell_h)), min(args.grid - 1, int(cx // cell_w))]
+                    min(args.grid - 1, int(cy // cell_h)), min(args.grid - 1, int(cx // cell_w)),
+                    f"{major_px[i] * pix2mm:.3f}", f"{minor_px[i] * pix2mm:.3f}", f"{aspect[i]:.3f}", f"{angle[i]:.1f}"]
             if track_frac is not None:
                 line += [f"{track_frac[i]:.3f}", f"{core_frac[i]:.3f}", int(noise[i])]
             writer.writerow(line)
