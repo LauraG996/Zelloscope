@@ -43,8 +43,8 @@ whole row it reports:
                the regions' second moments summed (area-weighted), i.e. the
                pore space as a whole; 1 = isotropic
 Near-round regions (aspect ratio below ROUND_ASPECT_MAX) are reported but
-their orientation isn't meaningful. The same alignment and direction are also
-worked out per grid square (--grid; --grid 2 gives the four quadrants), to
+their orientation isn't meaningful. The same measures (alignment, direction,
+median aspect ratio, DA) are also worked out per grid square (--grid; --grid 2 gives the four quadrants), to
 show whether the orientation changes across the specimen.
 
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
@@ -56,7 +56,8 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
                       aspect ratio histogram, orientation rose diagram
   *_orientation.png   regions colored by orientation, with each grid square's
                       mean direction drawn as a bar (length = alignment) and
-                      labeled with direction, alignment and count
+                      labeled with direction, alignment, count, median aspect
+                      ratio (AR) and degree of anisotropy (DA)
   *.csv               one line per region (id, x, y, diameter, area, grid square,
                       major/minor axis mm, aspect ratio, orientation deg;
                       with --original also on_track_frac, dark_core_frac, cutter_noise)
@@ -262,19 +263,25 @@ def draw_square_directions(image: np.ndarray, squares: list[dict], grid_size: in
         cx, cy = (square["grid_col"] + 0.5) * cell_w, (square["grid_row"] + 0.5) * cell_h
         summary = square["anisotropy"]
         if summary is None:
-            text = "none"
+            lines = ["none"]
         else:
-            half = 0.4 * min(cell_w, cell_h) * summary["alignment"]
+            # Short enough (at most 0.3 of the square each way) to stay clear of the label block.
+            half = 0.3 * min(cell_w, cell_h) * summary["alignment"]
             theta = np.radians(summary["direction_deg"])
             dx, dy = half * np.cos(theta), -half * np.sin(theta)
             p0, p1 = (int(round(cx - dx)), int(round(cy - dy))), (int(round(cx + dx)), int(round(cy + dy)))
             cv2.line(output, p0, p1, (255, 255, 255), bar_thickness * 3, cv2.LINE_AA)
             cv2.line(output, p0, p1, DIRECTION_BAR_COLOR, bar_thickness, cv2.LINE_AA)
-            text = f"{summary['direction_deg']:.0f} deg  {summary['alignment']:.2f}  n={square['count']}"
-        (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-        org = (int(round(cx - text_w / 2)), int(round(cy + 0.42 * cell_h)))
-        cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness * 4, cv2.LINE_AA)
-        cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, GRID_COLOR, font_thickness, cv2.LINE_AA)
+            lines = [f"{summary['direction_deg']:.0f} deg  align {summary['alignment']:.2f}  n={square['count']}",
+                     f"AR {summary['aspect_median']:.2f}  DA {summary['degree_of_anisotropy']:.2f}"]
+        # Label block sits at the bottom of the square, last line lowest.
+        line_h = cv2.getTextSize("Ag", cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0][1] * 1.6
+        for k, text in enumerate(lines):
+            (text_w, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+            org = (int(round(cx - text_w / 2)), int(round(cy + 0.44 * cell_h - (len(lines) - 1 - k) * line_h)))
+            cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
+                        font_thickness * 4, cv2.LINE_AA)
+            cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, GRID_COLOR, font_thickness, cv2.LINE_AA)
     return output
 
 
@@ -575,12 +582,13 @@ def main() -> None:
           f"p90 {anisotropy['aspect_p90']:.2f}  ({anisotropy['round_count']} near-round, < {ROUND_ASPECT_MAX})")
     print(f"              alignment {anisotropy['alignment']:.2f} (0 random - 1 parallel), direction "
           f"{anisotropy['direction_deg']:.1f} deg (90 = vertical), DA {anisotropy['degree_of_anisotropy']:.2f}")
-    print(f"  orientation per grid square (direction deg / alignment / count, top row first):")
+    print(f"  anisotropy per grid square (direction deg / alignment / median aspect ratio / DA / count, top row first):")
     for r in range(args.grid):
         cells = []
         for square in squares[r * args.grid:(r + 1) * args.grid]:
             a = square["anisotropy"]
-            cells.append(f"{a['direction_deg']:5.1f} / {a['alignment']:.2f} / {square['count']:<4d}" if a else f"{'-':^20}")
+            cells.append(f"{a['direction_deg']:5.1f} / {a['alignment']:.2f} / {a['aspect_median']:.2f} / "
+                         f"{a['degree_of_anisotropy']:.2f} / {square['count']:<4d}" if a else f"{'-':^34}")
         print("    " + "   ".join(cells))
 
     out_dir = args.output_dir or args.segmented.parent
@@ -613,7 +621,8 @@ def main() -> None:
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
     save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"])
     save_orientation_plot(orientation_map, title + f"\nOrientation per grid square: bar = mean direction, "
-                          f"length = alignment (0-1)", paths["orientation"])
+                          f"length = alignment (0-1)\nAR = median aspect ratio (1 = round), DA = degree of anisotropy (1 = isotropic)",
+                          paths["orientation"])
     save_distribution_plot(diameters, aspect[shaped], angle[shaped], anisotropy, noun, title, paths["distribution"])
 
     cell_h, cell_w = segmented.shape[0] / args.grid, segmented.shape[1] / args.grid
