@@ -28,35 +28,42 @@ drawn in grey with a red outline, the tracks are tinted, and the stats,
 grid counts and distribution use only the rest (--keep-cutter-noise marks
 them without dropping them).
 
-Anisotropy: each pinhole's shape is summarized by its equivalent ellipse (same
-second moments): major and minor axis lengths, aspect ratio = major / minor
-(1 = round), and orientation = the major axis's angle from horizontal,
-counter-clockwise as seen on screen, 0-180 deg (90 = vertical). Over the
-whole row it reports:
-  alignment    0-1: how parallel the regions are (0 = random directions,
-               1 = all parallel), the length of the mean of each region's
-               doubled-angle direction vector, weighted by area x (1 - minor/
-               major) so big elongated regions count most and near-round
+Shape and angle: each pinhole is measured with an ellipse fitted to its edge
+(least-squares fit of an ellipse curve to the edge pixels, OpenCV
+fitEllipse) -- the oval that best traces the outline, which follows a slit's
+or a rounded void's straight sides the way a hand measurement does. It gives
+the pinhole's length and width (the ellipse's major and minor axes), aspect
+ratio = length / width (1 = round), and angle = the major axis's angle from
+horizontal, counter-clockwise as seen on screen, 0-180 deg (90 = vertical).
+
+Which edge: the segmented outline runs around the outside of each hole's
+bright rim, so it's wider than the hole itself -- on the calibration image the
+dark hole filled only ~55% of its outline -- which flattens narrow slits'
+aspect ratios and can merge a hole with its neighbor. With --original the
+ellipse is fitted to the edge of the hole itself: the pixels inside the
+outline darker than HOLE_DARK_REL x the local foam background, opened to drop
+texture specks, keeping every piece at least HOLE_MIN_PIECE_FRAC of the
+largest (debris can split a void's dark floor), with enclosed bright spots
+(debris lying in a void) filled in. Without --original it's fitted to the
+segmented outline. Diameters always stay as the CSV reports them; the hole's
+own equivalent diameter goes in hole_diameter_mm.
+
+Over the whole row it reports:
+  alignment    0-1: how parallel the pinholes are (0 = random directions,
+               1 = all parallel), the length of the mean of each pinhole's
+               doubled-angle direction vector, weighted by area x (1 - width/
+               length) so big elongated pinholes count most and near-round
                ones, whose direction is noise, count least
   direction    that weighted mean direction, deg
-  DA           degree of anisotropy: major / minor of the ellipse of all
-               the regions' second moments summed (area-weighted), i.e. the
-               pore space as a whole; 1 = isotropic
-What shape is measured: the segmented outline runs around the outside of each
-hole's bright rim, so it's wider than the hole itself -- on the calibration
-image the dark hole filled only ~55% of its outline -- which flattens narrow
-slits' aspect ratios (a 6.5:1 slit measured 4.9:1) and can merge a hole with
-its neighbor. With --original the shape is instead measured on the hole
-itself: the pixels inside the outline darker than HOLE_DARK_REL x the local
-foam background, opened to drop texture specks, keeping every piece at least
-HOLE_MIN_PIECE_FRAC of the largest (debris can split a void's dark floor),
-with enclosed bright spots (debris lying in a void) filled in. Without
---original it falls back to the outline. Diameters always stay as the CSV
-reports them; the hole's own equivalent diameter goes in hole_diameter_mm.
+  DA           degree of anisotropy: length / width of the combined ellipse
+               of all the pinholes' ellipses (each weighted by its area),
+               i.e. the pore space as a whole; 1 = isotropic
 Near-round regions (aspect ratio below ROUND_ASPECT_MAX) are reported but
-their orientation isn't meaningful. The same measures (alignment, direction,
-median aspect ratio, DA) are also worked out per grid square (--grid; --grid 2 gives the four quadrants), to
-show whether the orientation changes across the specimen.
+their angle isn't meaningful. The same measures (alignment, direction,
+median aspect ratio, DA) are also worked out per grid square (--grid;
+--grid 2 gives the four quadrants), to show whether the orientation changes
+across the specimen. The orientation map writes each pinhole's angle next to
+it (when there are at most ANGLE_LABEL_MAX of them).
 
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
 <image>_pinholes* for pinhole_data.csv, <image>_cells* for cell_data.csv):
@@ -65,12 +72,12 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
   *_plot.png          the same overlay with title and diameter colorbar
   *_distribution.png  size histogram + cumulative size curve (log diameter axis),
                       aspect ratio histogram, orientation rose diagram
-  *_orientation.png   regions colored by orientation, with each grid square's
+  *_orientation.png   regions colored by angle, each labeled with its angle, and each grid square's
                       mean direction drawn as a bar (length = alignment) and
                       labeled with direction, alignment, count, median aspect
                       ratio (AR) and degree of anisotropy (DA)
   *.csv               one line per region (id, x, y, diameter, area, grid square,
-                      major/minor axis mm, aspect ratio, orientation deg,
+                      length/width mm (edge-fitted ellipse axes), aspect ratio, angle deg,
                       shape_source (hole or outline), hole_diameter_mm;
                       with --original also on_track_frac, dark_core_frac, cutter_noise)
 """
@@ -117,6 +124,10 @@ HOLE_OPEN_RADIUS_PX = 3
 # hole: grey debris lying in a big void can split its dark floor in two, and
 # keeping only the largest piece would cut the void short.
 HOLE_MIN_PIECE_FRAC = 0.1
+
+# Per-pinhole angle labels on the orientation map, up to this many pinholes (RGB).
+ANGLE_LABEL_MAX = 400
+ANGLE_LABEL_COLOR = (0, 0, 0)
 
 # Below this aspect ratio a region is effectively round and its orientation is noise.
 ROUND_ASPECT_MAX = 1.2
@@ -192,71 +203,63 @@ def match_regions(segmented: np.ndarray, x: np.ndarray, y: np.ndarray) -> tuple[
     return labels, stats, labels[rows, cols]
 
 
-def region_shapes(labels: np.ndarray) -> tuple[np.ndarray, ...]:
-    """Per-label equivalent ellipse: (centroid x, centroid y, major px, minor px, orientation deg).
+def fit_edge_ellipse(mask: np.ndarray) -> tuple[float, ...] | None:
+    """Ellipse fitted to the edge of mask (all its outer contours): (cx, cy, length, width, angle deg).
 
-    Indexed by label value. Axis lengths are full lengths of the ellipse with
-    the region's second moments; orientation is from horizontal, counter-
-    clockwise on screen (image y points down, hence the sign flip), in [0, 180).
+    cx, cy are in mask coords; angle is the long axis from horizontal,
+    counter-clockwise on screen, in [0, 180). None if the edge has fewer than
+    the 5 points an ellipse fit needs.
     """
-    flat = labels.ravel()
-    n = int(flat.max()) + 1
-    h, w = labels.shape
-    xs = np.tile(np.arange(w, dtype=np.float64), h)
-    ys = np.repeat(np.arange(h, dtype=np.float64), w)
-    area = np.maximum(np.bincount(flat, minlength=n), 1).astype(float)
-    mx, my = np.bincount(flat, xs, n) / area, np.bincount(flat, ys, n) / area
-    mu20 = np.bincount(flat, xs * xs, n) / area - mx ** 2
-    mu02 = np.bincount(flat, ys * ys, n) / area - my ** 2
-    mu11 = np.bincount(flat, xs * ys, n) / area - mx * my
-    spread = np.sqrt(((mu20 - mu02) / 2) ** 2 + mu11 ** 2)
-    major = 4 * np.sqrt(np.maximum((mu20 + mu02) / 2 + spread, 0))
-    minor = 4 * np.sqrt(np.maximum((mu20 + mu02) / 2 - spread, 0))
-    angle = (-np.degrees(0.5 * np.arctan2(2 * mu11, mu20 - mu02))) % 180
-    return mx, my, major, minor, angle
+    contours, _ = cv2.findContours(mask.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not contours:
+        return None
+    edge = np.vstack([c[:, 0] for c in contours]).astype(np.float32)
+    if len(edge) < 5:
+        return None
+    (cx, cy), (axis_1, axis_2), rotation = cv2.fitEllipse(edge)
+    # OpenCV's rotation is axis_1's direction, clockwise in image coords (y
+    # down); turn it into the long axis's counter-clockwise screen angle.
+    long_axis_rotation = rotation if axis_1 >= axis_2 else rotation + 90
+    return cx, cy, max(axis_1, axis_2), min(axis_1, axis_2), (-long_axis_rotation) % 180
 
 
-def hole_shapes(
-    original: np.ndarray, labels: np.ndarray, stats: np.ndarray, region_ids: np.ndarray,
+def pinhole_ellipses(
+    labels: np.ndarray, stats: np.ndarray, region_ids: np.ndarray, original: np.ndarray | None = None,
 ) -> tuple[np.ndarray, ...]:
-    """Equivalent ellipse of the dark hole inside each point's region (see module docstring).
+    """Edge-fitted ellipse for each point's pinhole (see module docstring for which edge).
 
-    Returns per-point (centroid x, centroid y, major px, minor px, orientation deg, area px),
-    NaN where the region has no dark hole (or the point matched no region).
+    Returns per-point arrays (cx, cy, length px, width px, angle deg, area px,
+    from_hole bool); NaN where there's no region or no fittable edge. area is
+    the measured shape's pixel area (the hole's with original, else the outline's).
     """
-    dark = dark_mask(original, HOLE_DARK_REL)
+    dark = dark_mask(original, HOLE_DARK_REL) if original is not None else None
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * HOLE_OPEN_RADIUS_PX + 1,) * 2)
-    out = np.full((len(region_ids), 6), np.nan)
+    out = np.full((len(region_ids), 7), np.nan)
     cache = {}
     for i, label in enumerate(region_ids):
         if label <= 0:
             continue
         if label not in cache:
             x0, y0, w, h, _ = stats[label]
-            hole = cv2.morphologyEx(((labels[y0:y0 + h, x0:x0 + w] == label) & (dark[y0:y0 + h, x0:x0 + w] > 0))
-                                    .astype(np.uint8), cv2.MORPH_OPEN, kernel)
-            n, pieces, piece_stats, _ = cv2.connectedComponentsWithStats(hole, connectivity=8)
-            if n < 2:
-                cache[label] = None
-                continue
-            areas = piece_stats[1:, cv2.CC_STAT_AREA]
-            keep = np.flatnonzero(areas >= HOLE_MIN_PIECE_FRAC * areas.max()) + 1
-            hole = np.isin(pieces, keep).astype(np.uint8)
-            # Fill enclosed bright spots: flood the outside from a padded border, keep what it can't reach.
-            padded = np.pad(hole, 1)
-            outside = padded.copy()
-            cv2.floodFill(outside, None, (0, 0), 1)
-            hole = (padded | (1 - outside))[1:-1, 1:-1]
-            m = cv2.moments(hole, True)
-            mu20, mu02, mu11 = m["mu20"] / m["m00"], m["mu02"] / m["m00"], m["mu11"] / m["m00"]
-            spread = np.sqrt(((mu20 - mu02) / 2) ** 2 + mu11 ** 2)
-            cache[label] = (x0 + m["m10"] / m["m00"], y0 + m["m01"] / m["m00"],
-                            4 * np.sqrt(max((mu20 + mu02) / 2 + spread, 0)),
-                            4 * np.sqrt(max((mu20 + mu02) / 2 - spread, 0)),
-                            (-np.degrees(0.5 * np.arctan2(2 * mu11, mu20 - mu02))) % 180, m["m00"])
+            region = (labels[y0:y0 + h, x0:x0 + w] == label).astype(np.uint8)
+            shape, from_hole = region, False
+            if dark is not None:
+                hole = cv2.morphologyEx(region & dark[y0:y0 + h, x0:x0 + w], cv2.MORPH_OPEN, kernel)
+                n, pieces, piece_stats, _ = cv2.connectedComponentsWithStats(hole, connectivity=8)
+                if n > 1:
+                    areas = piece_stats[1:, cv2.CC_STAT_AREA]
+                    hole = np.isin(pieces, np.flatnonzero(areas >= HOLE_MIN_PIECE_FRAC * areas.max()) + 1).astype(np.uint8)
+                    # Fill enclosed bright spots: flood the outside from a padded border, keep what it can't reach.
+                    padded = np.pad(hole, 1)
+                    outside = padded.copy()
+                    cv2.floodFill(outside, None, (0, 0), 1)
+                    shape, from_hole = (padded | (1 - outside))[1:-1, 1:-1], True
+            fit = fit_edge_ellipse(shape)
+            cache[label] = None if fit is None else (x0 + fit[0], y0 + fit[1], *fit[2:], shape.sum(), from_hole)
         if cache[label] is not None:
             out[i] = cache[label]
-    return tuple(out.T)
+    cx, cy, length, width, angle, area, from_hole = out.T
+    return cx, cy, length, width, angle, area, from_hole == 1
 
 
 def anisotropy_summary(major: np.ndarray, minor: np.ndarray, angle: np.ndarray, area: np.ndarray) -> dict:
@@ -364,6 +367,22 @@ def save_orientation_plot(image: np.ndarray, title: str, dst: Path) -> None:
     fig.tight_layout()
     fig.savefig(dst)
     plt.close(fig)
+
+
+def draw_angle_labels(
+    image: np.ndarray, cx: np.ndarray, cy: np.ndarray, width: np.ndarray, angle: np.ndarray,
+) -> np.ndarray:
+    """Write each pinhole's angle (deg) just to the right of it."""
+    output = image.copy()
+    scale = max(image.shape[:2]) / 1500
+    font_scale, font_thickness = 0.9 * scale, max(1, int(round(2 * scale)))
+    for x0, y0, w, a in zip(cx, cy, width, angle):
+        text = f"{a:.0f}"
+        (_, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
+        org = (int(round(x0 + w / 2 + 8 * scale)), int(round(y0 + text_h / 2)))
+        cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255), font_thickness * 4, cv2.LINE_AA)
+        cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, ANGLE_LABEL_COLOR, font_thickness, cv2.LINE_AA)
+    return output
 
 
 def draw_major_axes(image: np.ndarray, cx: np.ndarray, cy: np.ndarray, major: np.ndarray, angle: np.ndarray) -> np.ndarray:
@@ -626,20 +645,16 @@ def main() -> None:
     spatial_rows = spatial_distribution(counted_voids, segmented.shape, args.grid)
     all_diameters, diameters = diameters, diameters[counted]
 
-    label_cx, label_cy, label_major, label_minor, label_angle = region_shapes(labels)
-    major_px, minor_px, angle = label_major[region_ids], label_minor[region_ids], label_angle[region_ids]
-    axis_cx, axis_cy = label_cx[region_ids], label_cy[region_ids]
-    shape_area, from_hole, hole_area = area_px.copy(), np.zeros(len(diameters), bool), np.full(len(diameters), np.nan)
+    axis_cx, axis_cy, major_px, minor_px, angle, shape_area, from_hole = pinhole_ellipses(
+        labels, stats, region_ids, original if args.original is not None else None)
+    fitted = ~np.isnan(major_px) & (minor_px > 0)
+    hole_area = np.where(from_hole, shape_area, np.nan)
     if args.original is not None:
-        h_cx, h_cy, h_major, h_minor, h_angle, hole_area = hole_shapes(original, labels, stats, region_ids)
-        from_hole = ~np.isnan(h_major) & (h_minor > 0)
-        major_px[from_hole], minor_px[from_hole], angle[from_hole] = h_major[from_hole], h_minor[from_hole], h_angle[from_hole]
-        axis_cx[from_hole], axis_cy[from_hole], shape_area[from_hole] = h_cx[from_hole], h_cy[from_hole], hole_area[from_hole]
-        print(f"  shape measured on the dark hole for {(from_hole & counted).sum()} of {counted.sum()} {noun} "
-              f"(the rest on the segmented outline); holes fill {np.nanmedian(hole_area / np.maximum(area_px, 1)):.0%} "
-              f"of their outline (median)")
+        print(f"  edge-fitted ellipse on the dark hole for {(from_hole & counted).sum()} of {counted.sum()} {noun} "
+              f"(the rest on the segmented outline); holes fill "
+              f"{np.nanmedian(hole_area[counted] / np.maximum(area_px[counted], 1)):.0%} of their outline (median)")
     aspect = major_px / np.maximum(minor_px, 1e-9)
-    shaped = counted & matched
+    shaped = counted & matched & fitted
     anisotropy = anisotropy_summary(major_px[shaped], minor_px[shaped], angle[shaped], shape_area[shaped])
     squares = orientation_by_square(x[shaped], y[shaped], major_px[shaped], minor_px[shaped], angle[shaped],
                                     shape_area[shaped], segmented.shape, args.grid)
@@ -682,6 +697,8 @@ def main() -> None:
                                    colors=orientation_colors(angle))
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
         orientation_map = draw_major_axes(orientation_map, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
+    if shaped.sum() <= ANGLE_LABEL_MAX:
+        orientation_map = draw_angle_labels(orientation_map, axis_cx[shaped], axis_cy[shaped], minor_px[shaped], angle[shaped])
     orientation_map = draw_square_directions(orientation_map, squares, args.grid)
     overlay = draw_grid_counts(overlay, spatial_rows, args.grid)
     paths = {
@@ -695,7 +712,7 @@ def main() -> None:
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
     save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"])
     save_orientation_plot(orientation_map, title + f"\nOrientation per grid square: bar = mean direction, "
-                          f"length = alignment (0-1)\nAR = median aspect ratio (1 = round), DA = degree of anisotropy (1 = isotropic)",
+                          f"length = alignment (0-1)\nnumber by each pinhole = its angle (deg)\nAR = median aspect ratio (1 = round), DA = degree of anisotropy (1 = isotropic)",
                           paths["orientation"])
     save_distribution_plot(diameters, aspect[shaped], angle[shaped], anisotropy, noun, title, paths["distribution"])
 
@@ -703,7 +720,7 @@ def main() -> None:
     with open(paths["csv"], "w", newline="") as f:
         writer = csv.writer(f)
         header = ["id", "x_px", "y_px", "diameter_mm", "area_px", "grid_row", "grid_col",
-                  "major_mm", "minor_mm", "aspect_ratio", "orientation_deg", "shape_source", "hole_diameter_mm"]
+                  "length_mm", "width_mm", "aspect_ratio", "angle_deg", "shape_source", "hole_diameter_mm"]
         writer.writerow(header + (["on_track_frac", "dark_core_frac", "cutter_noise"] if track_frac is not None else []))
         for i, (v, d) in enumerate(zip(voids, all_diameters)):
             cx, cy = v.centroid
