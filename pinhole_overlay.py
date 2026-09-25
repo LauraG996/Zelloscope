@@ -23,10 +23,10 @@ Cutter noise: the machined surface carries circular tracks from the cutter,
 and dark patches of foam along a track get segmented and measured like
 pinholes even where there's no hole. Pass --original (the micrograph the
 segmentation was made from) to find the tracks (see cutter_arcs.py) and drop
-detections that sit on a track but have no solid dark core. Dropped ones are
-drawn in grey with a red outline, the tracks are tinted, and the stats,
-grid counts and distribution use only the rest (--keep-cutter-noise marks
-them without dropping them).
+detections that sit on a track but have no solid dark core. The stats, grid
+counts and distribution use only the rest (--keep-cutter-noise marks them
+without dropping them); DRAW_CUTTER_TRACKS / DRAW_IGNORED_CELLS choose
+whether the tracks and the dropped cells are drawn.
 
 Shape and angle: each pinhole is measured with an ellipse fitted to its edge
 (least-squares fit of an ellipse curve to the edge pixels, OpenCV
@@ -119,6 +119,12 @@ ORIGINAL_DIR = "phenolic"
 # Remove detections along the cutter tracks that have no real hole
 # [--keep-cutter-noise keeps them, only marked]. Needs the original image.
 REMOVE_CUTTER_NOISE = True
+
+# What to draw of that: the cutter tracks themselves (pink tint), and the
+# cells ignored as cutter noise (grey, red outline). False = leave them out
+# of the pictures entirely; they're still ignored in the counts either way.
+DRAW_CUTTER_TRACKS = False
+DRAW_IGNORED_CELLS = False
 
 # Grid for the per-square counts and orientation [--grid]; 2 = quadrants.
 GRID_SIZE = 4
@@ -767,14 +773,22 @@ def main() -> None:
     title = (f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}"
              + (f" {noun} {size_filter}" if size_filter else "") + f", on {args.segmented.name}")
     if noise.any():
-        title += f"\n{noise.sum()} cutter-noise detections " + (
-            "marked (grey, red outline), still counted" if args.keep_cutter_noise
-            else "removed (grey, red outline); cutter tracks tinted")
+        if args.keep_cutter_noise:
+            title += f"\n{noise.sum()} cutter-noise detections marked (grey, red outline), still counted"
+        else:
+            title += f"\n{noise.sum()} {noun} on cutter tracks ignored" + (
+                " (grey, red outline)" if DRAW_IGNORED_CELLS else " (not drawn)")
 
-    overlay = draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks)
+    # Ignored cutter-noise cells are drawn grey only if asked (or when they're
+    # kept in the counts); otherwise their region id is blanked so they're skipped.
+    show_noise = noise.any() and (args.keep_cutter_noise or DRAW_IGNORED_CELLS)
+    draw_ids = region_ids if show_noise or not noise.any() else np.where(noise, 0, region_ids)
+    draw_noise = noise if show_noise else None
+    draw_tracks = tracks if DRAW_CUTTER_TRACKS else None
+    overlay = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks)
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
         overlay = draw_major_axes(overlay, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
-    orientation_map = draw_overlay(segmented, labels, region_ids, all_diameters, noise if noise.any() else None, tracks,
+    orientation_map = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks,
                                    colors=orientation_colors(angle))
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
         orientation_map = draw_major_axes(orientation_map, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
