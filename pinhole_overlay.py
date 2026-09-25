@@ -91,7 +91,51 @@ import cv2
 import numpy as np
 
 from cutter_arcs import TRACK_FRAC_MIN, dark_mask, find_cutter_tracks, is_cutter_noise, region_features
-from void_analysis import DEFAULT_GRID_SIZE, Void, size_summary, spatial_distribution
+from void_analysis import Void, size_summary, spatial_distribution
+
+# =============================================================================
+# SETTINGS -- edit these to change what's counted and how. For a single run,
+# the command-line option shown in [brackets] overrides the value here.
+# =============================================================================
+
+# Measurement file [--csv]. cell_data.csv lists every segmented cell;
+# pinhole_data.csv only the ones already picked out as pinholes.
+CSV_FILE = "cell_data.csv"
+
+# Size filter [--min-mm / --max-mm]: only cells whose diameter (as the CSV
+# reports it) is within these limits are counted and drawn. None = no limit.
+# 0.9 mm is where cells stop fitting the normal foam size distribution
+# (about 3.5x the median cell) on the 2026-09-23 sample; 1.3 mm keeps only
+# the clearly abnormal voids.
+MIN_DIAMETER_MM = 0.9
+MAX_DIAMETER_MM = None
+
+# Folder holding the original micrographs [--original to give one directly].
+# The one named like the segmented image (e.g. 2026-09-23_13-29-36.png for
+# 2026-09-23_13-29-36_segmented.png) is used automatically, for cutter-noise
+# removal and for measuring shapes on the dark hole. None = don't look.
+ORIGINAL_DIR = "phenolic"
+
+# Remove detections along the cutter tracks that have no real hole
+# [--keep-cutter-noise keeps them, only marked]. Needs the original image.
+REMOVE_CUTTER_NOISE = True
+
+# Grid for the per-square counts and orientation [--grid]; 2 = quadrants.
+GRID_SIZE = 4
+
+# The dark hole inside a cell: pixels darker than this fraction of the local
+# foam brightness. Lower = stricter, a smaller hole (0.35 cuts into the edge,
+# 0.6 follows the visible edge).
+HOLE_DARK_REL = 0.6
+
+# Holes with an aspect ratio below this count as round: their angle is
+# reported but not used for the direction/alignment.
+ROUND_ASPECT_MAX = 1.2
+
+# (Cutter-noise thresholds -- how much of a cell must lie on a track, and how
+# much solid dark core a real hole needs -- are TRACK_FRAC_MIN and
+# CORE_FRAC_MIN in cutter_arcs.py.)
+# =============================================================================
 
 # Some rows hold thousands of measurements per column; csv's default field
 # size limit is too small for that (same cap as plot_cells.py).
@@ -115,10 +159,7 @@ NOISE_FILL = (175, 175, 175)
 NOISE_OUTLINE = (220, 0, 0)
 TRACK_TINT = (255, 150, 150)
 
-# A pinhole's own dark hole (see module docstring): darker than this x local
-# background -- traces the visible hole edge (0.35, used for the cutter-noise
-# core test, cuts into it) -- then opened with this radius to drop specks.
-HOLE_DARK_REL = 0.6
+# The dark hole (HOLE_DARK_REL above) is opened with this radius to drop texture specks.
 HOLE_OPEN_RADIUS_PX = 3
 # Dark pieces at least this fraction of the largest one count as part of the
 # hole: grey debris lying in a big void can split its dark floor in two, and
@@ -129,8 +170,6 @@ HOLE_MIN_PIECE_FRAC = 0.1
 ANGLE_LABEL_MAX = 400
 ANGLE_LABEL_COLOR = (0, 0, 0)
 
-# Below this aspect ratio a region is effectively round and its orientation is noise.
-ROUND_ASPECT_MAX = 1.2
 
 # Major-axis line drawn through each colored region on the overlay (RGB).
 AXIS_COLOR = (255, 255, 255)
@@ -158,8 +197,8 @@ def list_rows(csv_path: Path) -> None:
         print(f"  {i:5d}  {row['timestamp']:<19}  {len(diameters):5d}  {size:<19}  {row.get('label', '')}")
 
 
-def load_row(csv_path: Path, selector: str | None) -> dict:
-    """The row picked by selector, or the latest timestamp if None.
+def load_row(csv_path: Path, selector: str | None, image_timestamp: str | None = None) -> dict:
+    """The row picked by selector; if None, the row timestamped image_timestamp, else the latest.
 
     selector is either a row index, Python-style (0 = first row, -1 = last), or
     text matched against the timestamps -- a full timestamp, or any part of one
@@ -167,6 +206,9 @@ def load_row(csv_path: Path, selector: str | None) -> dict:
     """
     rows = read_rows(csv_path)
     if selector is None:
+        same_capture = [r for r in rows if image_timestamp and r["timestamp"].strip() == image_timestamp]
+        if same_capture:
+            return same_capture[-1]
         return max(rows, key=lambda r: r["timestamp"])
     try:
         index = int(selector)
@@ -560,11 +602,17 @@ def save_distribution_plot(
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("segmented", type=Path, help="Segmented (black boundary / white region) image")
-    parser.add_argument("--csv", type=Path, default=Path("pinhole_data.csv"), help="Measurement CSV, e.g. pinhole_data.csv or cell_data.csv (default: pinhole_data.csv)")
+    parser.add_argument("--csv", type=Path, default=Path(CSV_FILE),
+                        help=f"Measurement CSV, e.g. cell_data.csv or pinhole_data.csv (default: {CSV_FILE})")
+    parser.add_argument("--min-mm", type=float, default=MIN_DIAMETER_MM,
+                        help=f"Only count cells at least this wide, mm (default: {MIN_DIAMETER_MM}); 0 = no limit")
+    parser.add_argument("--max-mm", type=float, default=MAX_DIAMETER_MM,
+                        help=f"Only count cells at most this wide, mm (default: {MAX_DIAMETER_MM})")
     parser.add_argument(
         "--row", default=None,
         help="Row to plot: an index (0 = first row, -1 = last) or a timestamp or part of one, "
-             "e.g. \"14:19:36\"; default: latest timestamp. See --list-rows",
+             "e.g. \"14:19:36\"; default: the row with the segmented image's timestamp "
+             "(from its filename), else the latest. See --list-rows",
     )
     parser.add_argument("--list-rows", action="store_true", help="List the CSV's rows (index, timestamp, count) and exit")
     parser.add_argument(
@@ -572,17 +620,19 @@ def main() -> None:
         help="mm per pixel; default: inferred from the row's diameters vs the matched regions",
     )
     parser.add_argument(
-        "--grid", type=int, default=DEFAULT_GRID_SIZE,
-        help=f"Spatial distribution grid size (default: {DEFAULT_GRID_SIZE})",
+        "--grid", type=int, default=GRID_SIZE,
+        help=f"Spatial distribution grid size (default: {GRID_SIZE})",
     )
     parser.add_argument(
         "--original", type=Path, default=None,
-        help="Micrograph the segmentation was made from; enables cutter-noise removal (see module docstring)",
+        help="Micrograph the segmentation was made from; enables cutter-noise removal and hole-edge shapes "
+             "(default: found in ORIGINAL_DIR by the segmented image's name)",
     )
     parser.add_argument(
         "--keep-cutter-noise", action="store_true",
         help="With --original: mark cutter-noise detections but keep them in the counts and stats",
     )
+    parser.add_argument("--no-original", action="store_true", help="Don't use an original image even if one is found")
     parser.add_argument("--output-dir", type=Path, default=None, help="Where to write outputs (default: next to the segmented image)")
     args = parser.parse_args()
 
@@ -594,10 +644,41 @@ def main() -> None:
     if segmented is None:
         sys.exit(f"Could not read {args.segmented}")
 
+    stem = args.segmented.stem.removesuffix("_segmented")
+    if args.no_original:
+        args.original = None
+    elif args.original is None and ORIGINAL_DIR:
+        found = sorted(p for p in Path(ORIGINAL_DIR).glob(f"{stem}.*") if p.suffix.lower() in (".png", ".tif", ".tiff", ".jpg", ".bmp"))
+        args.original = found[0] if found else None
+    if args.original is not None:
+        print(f"original image: {args.original}")
+    if not REMOVE_CUTTER_NOISE:
+        args.keep_cutter_noise = True
+
     # "pinhole_data" -> "pinholes", "cell_data" -> "cells"; names outputs and labels.
     noun = args.csv.stem.removesuffix("_data") + "s"
-    row = load_row(args.csv, args.row)
+    # A filename like 2026-09-23_13-29-36_segmented.png names its capture time.
+    parts = stem.split("_")
+    image_timestamp = f"{parts[0]} {parts[1].replace('-', ':')}" if len(parts) >= 2 else None
+    row = load_row(args.csv, args.row, image_timestamp)
+    if args.row is None and image_timestamp and row["timestamp"].strip() != image_timestamp:
+        print(f"warning: no {args.csv} row timestamped {image_timestamp}; using the latest ({row['timestamp']})")
     diameters, x, y = parse_pinholes(row)
+    n_row = len(diameters)
+    lower = args.min_mm if args.min_mm else -np.inf
+    upper = args.max_mm if args.max_mm is not None else np.inf
+    in_range = (diameters >= lower) & (diameters <= upper)
+    diameters, x, y = diameters[in_range], x[in_range], y[in_range]
+    if args.min_mm and args.max_mm is not None:
+        size_filter = f"{args.min_mm:g}-{args.max_mm:g} mm"
+    elif args.min_mm:
+        size_filter = f">= {args.min_mm:g} mm"
+    elif args.max_mm is not None:
+        size_filter = f"<= {args.max_mm:g} mm"
+    else:
+        size_filter = ""
+    if size_filter:
+        print(f"{args.csv} row {row['timestamp']}: {n_row} {noun}, {len(diameters)} of them {size_filter}")
     if len(diameters) == 0:
         sys.exit(f"Row {row['timestamp']} has no {noun}")
 
@@ -683,8 +764,8 @@ def main() -> None:
 
     out_dir = args.output_dir or args.segmented.parent
     out_dir.mkdir(parents=True, exist_ok=True)
-    stem = args.segmented.stem.removesuffix("_segmented")
-    title = f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}, on {args.segmented.name}"
+    title = (f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}"
+             + (f" {noun} {size_filter}" if size_filter else "") + f", on {args.segmented.name}")
     if noise.any():
         title += f"\n{noise.sum()} cutter-noise detections " + (
             "marked (grey, red outline), still counted" if args.keep_cutter_noise
