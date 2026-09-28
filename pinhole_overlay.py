@@ -68,10 +68,10 @@ it (when there are at most ANGLE_LABEL_MAX of them).
 Void area: how much of the specimen is void and how much is background
 (solid foam). The specimen is the whole image minus any dark mount around it
 (void_analysis.specimen_mask, on the original image; the whole image without
-one). Void area is counted two ways -- the dark holes themselves (the real
-void; needs the original image) and the segmented outlines of the same cells
-(which also take in each hole's bright rim) -- only over the cells that are
-counted (size filter, cutter noise dropped). Background = specimen - void.
+one). Void area = the total area of the counted cells (size filter, cutter
+noise dropped), i.e. of their segmented outlines -- no brightness involved.
+REPORT_DARK_HOLE_AREA also reports the dark holes inside those cells, which
+leave out each hole's bright rim. Background = specimen - void.
 Per grid square, each cell's area goes to the square its (x, y) is in.
 
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
@@ -148,6 +148,13 @@ HOLE_DARK_REL = 0.6
 # Holes with an aspect ratio below this count as round: their angle is
 # reported but not used for the direction/alignment.
 ROUND_ASPECT_MAX = 1.2
+
+# Void area. False = the total area of the counted cells (their segmented
+# outlines, as the CSV sizes them) -- no brightness involved. True = also
+# report the dark-hole area inside those cells (pixels darker than
+# HOLE_DARK_REL x the foam around them; needs the original image), which
+# leaves out each hole's bright rim.
+REPORT_DARK_HOLE_AREA = False
 
 # (Cutter-noise thresholds -- how much of a cell must lie on a track, and how
 # much solid dark core a real hole needs -- are TRACK_FRAC_MIN and
@@ -642,7 +649,7 @@ def void_area_table(
             spec_px = int(specimen[y0:y1, x0:x1].sum())
         entry = {"grid_row": r, "grid_col": c, "cells": int(inside.sum()),
                  "specimen_px": spec_px, "specimen_mm2": spec_px * mm2}
-        for kind, px in (("hole", hole_px), ("outline", outline_px)):
+        for kind, px in (("cell", outline_px), ("hole", hole_px)):
             if px is None:
                 continue
             void = float(px[inside].sum())
@@ -802,18 +809,19 @@ def main() -> None:
     specimen = (specimen_mask(original) > 0) if args.original is not None else np.ones(segmented.shape, bool)
     area_rows = void_area_table(
         specimen, x[counted & matched], y[counted & matched], area_px[counted & matched],
-        np.nan_to_num(hole_area[counted & matched]) if args.original is not None else None, args.grid, pix2mm)
+        np.nan_to_num(hole_area[counted & matched]) if REPORT_DARK_HOLE_AREA and args.original is not None else None,
+        args.grid, pix2mm)
     total = area_rows[-1]
     print(f"  area: specimen {total['specimen_px']} px = {total['specimen_mm2']:.1f} mm2"
           + ("" if args.original is not None else " (whole image; no original to find a mount border)"))
-    for kind, label in (("hole", "dark holes (real void)"), ("outline", "segmented outlines")):
+    for kind, label in (("cell", "cell area"), ("hole", "dark holes in them")):
         if f"void_{kind}_px" in total:
             ratio = total[f"background_{kind}_px"] / max(total[f"void_{kind}_px"], 1)
             print(f"    void, {label:<24} {total[f'void_{kind}_px']:>9} px = {total[f'void_{kind}_mm2']:7.2f} mm2 "
                   f"= {total[f'void_{kind}_pct']:5.2f}% of specimen;  background "
                   f"{total[f'background_{kind}_mm2']:.1f} mm2;  void : background = 1 : {ratio:.0f}")
-    main_kind = "hole" if args.original is not None else "outline"
-    print(f"  void % of specimen per grid square ({'dark holes' if main_kind == 'hole' else 'outlines'}, top row first):")
+    main_kind = "cell"
+    print(f"  void % of specimen per grid square (cell area, top row first):")
     for r in range(args.grid):
         print("    " + "  ".join(f"{a[f'void_{main_kind}_pct']:6.2f}" for a in area_rows[r * args.grid:(r + 1) * args.grid]))
     print(f"  spatial distribution ({args.grid}x{args.grid} grid, {noun} per grid square, top row first):")
@@ -838,7 +846,8 @@ def main() -> None:
     title = (f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}"
              + (f" {noun} {size_filter}" if size_filter else "") + f", on {args.segmented.name}")
     title += "\nvoid area " + ", ".join(
-        f"{total[f'void_{kind}_pct']:.2f}% ({label})" for kind, label in (("hole", "dark holes"), ("outline", "outlines"))
+        f"{total[f'void_{kind}_pct']:.2f}%" + (f" ({label})" if f"void_hole_pct" in total else "")
+        for kind, label in (("cell", "cell area"), ("hole", "dark holes"))
         if f"void_{kind}_pct" in total) + " of specimen"
     if noise.any():
         if args.keep_cutter_noise:
