@@ -81,10 +81,11 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
   *_plot.png          the same overlay with title and diameter colorbar
   *_distribution.png  size histogram + cumulative size curve (log diameter axis),
                       aspect ratio histogram, orientation rose diagram
-  *_orientation.png   regions colored by angle, each labeled with its angle, and each grid square's
-                      mean direction drawn as a bar (length = alignment) and
-                      labeled with direction, alignment, count, median aspect
-                      ratio (AR) and degree of anisotropy (DA)
+  *_orientation.png   map of the holes colored by lean from vertical (blue = left,
+                      red = right, grey = vertical) with each grid square's average
+                      direction as a bar, beside a plain-language summary and a
+                      table of direction / lean / alignment / AR / DA / count per
+                      square laid out like the grid
   *_area.csv          void vs background area: one line per grid square plus a
                       total line (see Void area below)
   *.csv               one line per region (id, x, y, diameter, area, grid square,
@@ -149,6 +150,9 @@ HOLE_DARK_REL = 0.6
 # reported but not used for the direction/alignment.
 ROUND_ASPECT_MAX = 1.2
 
+# Write each hole's angle (deg) next to it on the orientation map.
+SHOW_HOLE_ANGLES = True
+
 # Void area. False = the total area of the counted cells (their segmented
 # outlines, as the CSV sizes them) -- no brightness involved. True = also
 # report the dark-hole area inside those cells (pixels darker than
@@ -192,7 +196,7 @@ HOLE_MIN_PIECE_FRAC = 0.1
 
 # Per-pinhole angle labels on the orientation map, up to this many pinholes (RGB).
 ANGLE_LABEL_MAX = 400
-ANGLE_LABEL_COLOR = (0, 0, 0)
+ANGLE_LABEL_COLOR = (70, 70, 70)
 
 
 # Major-axis line drawn through each colored region on the overlay (RGB).
@@ -200,8 +204,16 @@ AXIS_COLOR = (255, 255, 255)
 
 # Cyclic colormap for orientation (0 and 180 deg are the same direction) and
 # the per-square mean-direction bars on the orientation map (RGB).
-ORIENTATION_CMAP = "twilight"
-DIRECTION_BAR_COLOR = (20, 20, 20)
+# Orientation map colors: how far each hole leans from vertical, blue = to the
+# left, red = to the right, grey = vertical; LEAN_MAX_DEG or more is full color.
+# (Diverging blue <-> red around a neutral grey; the grey is darker than a
+# page-grey so vertical holes still stand out from the faded background.)
+LEAN_MAX_DEG = 30
+LEAN_COLORS = ["#1c5cab", "#6da7ec", "#a9a7a0", "#ec8a89", "#c4302f"]
+DIRECTION_BAR_COLOR = (30, 30, 30)
+MAP_GRID_COLOR = (150, 150, 150)
+INK = "#222222"
+MUTED_INK = "#666666"
 
 
 def read_rows(csv_path: Path) -> list[dict]:
@@ -369,69 +381,140 @@ def orientation_by_square(
     return squares
 
 
-def orientation_colors(angle: np.ndarray) -> np.ndarray:
-    """RGB uint8 color for each orientation (deg, 0-180) on the cyclic ORIENTATION_CMAP."""
+def lean_deg(angle: np.ndarray | float) -> np.ndarray | float:
+    """Lean from vertical, deg: > 0 = the top of the hole leans right, < 0 = left."""
+    return 90.0 - np.asarray(angle)
+
+
+def lean_text(angle: float) -> str:
+    lean = float(lean_deg(angle))
+    return "vertical" if abs(lean) < 2 else f"{abs(lean):.0f}\u00b0 {'right' if lean > 0 else 'left'} of vertical"
+
+
+def lean_colormap():
     import matplotlib
     matplotlib.use("Agg")
-    import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
 
-    return (plt.get_cmap(ORIENTATION_CMAP)(np.asarray(angle) / 180.0)[:, :3] * 255).astype(np.uint8)
+    return LinearSegmentedColormap.from_list("lean", LEAN_COLORS), Normalize(-LEAN_MAX_DEG, LEAN_MAX_DEG)
+
+
+def orientation_colors(angle: np.ndarray) -> np.ndarray:
+    """RGB uint8 color for each orientation (deg, 0-180): its lean from vertical (see LEAN_COLORS)."""
+    cmap, norm = lean_colormap()
+    lean = np.nan_to_num(lean_deg(angle))
+    return (cmap(norm(np.clip(lean, -LEAN_MAX_DEG, LEAN_MAX_DEG)))[:, :3] * 255).astype(np.uint8)
 
 
 def draw_square_directions(image: np.ndarray, squares: list[dict], grid_size: int) -> np.ndarray:
-    """Grid lines, plus in each square a bar along its mean direction (length = alignment) and a label."""
+    """Light grid lines, plus in each square a bar along its mean direction (length = alignment).
+
+    The numbers for each square go in the table beside the map, not on it.
+    """
     output = image.copy()
     h, w = output.shape[:2]
     cell_h, cell_w = h / grid_size, w / grid_size
     scale = max(h, w) / 1500
 
-    line_thickness = max(1, int(round(3 * scale)))
+    line_thickness = max(1, int(round(2 * scale)))
     for i in range(1, grid_size):
-        cv2.line(output, (0, int(round(i * cell_h))), (w, int(round(i * cell_h))), GRID_COLOR, line_thickness, cv2.LINE_AA)
-        cv2.line(output, (int(round(i * cell_w)), 0), (int(round(i * cell_w)), h), GRID_COLOR, line_thickness, cv2.LINE_AA)
+        cv2.line(output, (0, int(round(i * cell_h))), (w, int(round(i * cell_h))), MAP_GRID_COLOR, line_thickness, cv2.LINE_AA)
+        cv2.line(output, (int(round(i * cell_w)), 0), (int(round(i * cell_w)), h), MAP_GRID_COLOR, line_thickness, cv2.LINE_AA)
 
-    font_scale = 1.1 * scale * min(1.0, 4 / grid_size) ** 0.5
-    font_thickness = max(1, int(round(2.5 * scale)))
-    bar_thickness = max(2, int(round(7 * scale)))
+    bar_thickness = max(2, int(round(5 * scale)))
     for square in squares:
-        cx, cy = (square["grid_col"] + 0.5) * cell_w, (square["grid_row"] + 0.5) * cell_h
         summary = square["anisotropy"]
         if summary is None:
-            lines = ["none"]
-        else:
-            # Short enough (at most 0.3 of the square each way) to stay clear of the label block.
-            half = 0.3 * min(cell_w, cell_h) * summary["alignment"]
-            theta = np.radians(summary["direction_deg"])
-            dx, dy = half * np.cos(theta), -half * np.sin(theta)
-            p0, p1 = (int(round(cx - dx)), int(round(cy - dy))), (int(round(cx + dx)), int(round(cy + dy)))
-            cv2.line(output, p0, p1, (255, 255, 255), bar_thickness * 3, cv2.LINE_AA)
-            cv2.line(output, p0, p1, DIRECTION_BAR_COLOR, bar_thickness, cv2.LINE_AA)
-            lines = [f"{summary['direction_deg']:.0f} deg  align {summary['alignment']:.2f}  n={square['count']}",
-                     f"AR {summary['aspect_median']:.2f}  DA {summary['degree_of_anisotropy']:.2f}"]
-        # Label block sits at the bottom of the square, last line lowest.
-        line_h = cv2.getTextSize("Ag", cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)[0][1] * 1.6
-        for k, text in enumerate(lines):
-            (text_w, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
-            org = (int(round(cx - text_w / 2)), int(round(cy + 0.44 * cell_h - (len(lines) - 1 - k) * line_h)))
-            cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
-                        font_thickness * 4, cv2.LINE_AA)
-            cv2.putText(output, text, org, cv2.FONT_HERSHEY_SIMPLEX, font_scale, GRID_COLOR, font_thickness, cv2.LINE_AA)
+            continue
+        cx, cy = (square["grid_col"] + 0.5) * cell_w, (square["grid_row"] + 0.5) * cell_h
+        half = 0.4 * min(cell_w, cell_h) * summary["alignment"]
+        theta = np.radians(summary["direction_deg"])
+        dx, dy = half * np.cos(theta), -half * np.sin(theta)
+        p0, p1 = (int(round(cx - dx)), int(round(cy - dy))), (int(round(cx + dx)), int(round(cy + dy)))
+        cv2.line(output, p0, p1, (255, 255, 255), bar_thickness * 3, cv2.LINE_AA)
+        cv2.line(output, p0, p1, DIRECTION_BAR_COLOR, bar_thickness, cv2.LINE_AA)
     return output
 
 
-def save_orientation_plot(image: np.ndarray, title: str, dst: Path) -> None:
+def save_orientation_plot(
+    image: np.ndarray, squares: list[dict], anisotropy: dict, grid_size: int, noun: str, title: str, dst: Path,
+) -> None:
+    """Orientation map beside a plain-language summary and a per-square table laid out like the grid."""
     import matplotlib.pyplot as plt
-    from matplotlib.colors import Normalize
+    from matplotlib.patches import Rectangle
 
-    fig, ax = plt.subplots(figsize=(10, 10.6), dpi=150)
-    ax.imshow(image)
-    ax.set_axis_off()
-    ax.set_title(title, fontsize=11)
-    colorbar = fig.colorbar(plt.cm.ScalarMappable(norm=Normalize(0, 180), cmap=ORIENTATION_CMAP),
-                            ax=ax, fraction=0.04, pad=0.02, ticks=[0, 45, 90, 135, 180])
-    colorbar.set_label("Orientation (deg from horizontal; 90 = vertical)")
-    fig.tight_layout()
-    fig.savefig(dst)
+    cmap, norm = lean_colormap()
+    fig = plt.figure(figsize=(17, 9.6), dpi=150)
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 0.95], wspace=0.05)
+    right = outer[1].subgridspec(3, 1, height_ratios=[0.27, 0.66, 0.07], hspace=0.14)
+
+    ax_map = fig.add_subplot(outer[0])
+    ax_map.imshow(image)
+    ax_map.set_axis_off()
+    ax_map.set_title("Where the holes point", fontsize=13, color=INK, loc="left")
+
+    # Plain-language summary for the whole specimen.
+    ax_text = fig.add_subplot(right[0])
+    ax_text.set_axis_off()
+    a = anisotropy
+    lines = [
+        ("Shape", f"Holes are typically {a['aspect_median']:.1f}x longer than wide (median aspect ratio, AR)."),
+        ("Direction", f"On average they point {a['direction_deg']:.0f}\u00b0 -- {lean_text(a['direction_deg'])}."),
+        ("Alignment", f"{100 * a['alignment']:.0f}% aligned (0% = random directions, 100% = all parallel)."),
+        ("Pore space", f"As a whole {a['degree_of_anisotropy']:.1f}x longer along that direction than across it "
+                       f"(DA; 1 = no direction)."),
+    ]
+    ax_text.text(0, 1.0, "Whole specimen", fontsize=13, color=INK, weight="bold", va="top", transform=ax_text.transAxes)
+    for k, (label, text) in enumerate(lines):
+        y = 0.78 - 0.2 * k
+        ax_text.text(0, y, label, fontsize=10.5, color=MUTED_INK, va="top", transform=ax_text.transAxes)
+        ax_text.text(0.17, y, text, fontsize=10.5, color=INK, va="top", transform=ax_text.transAxes, wrap=True)
+
+    # Per-square table, same layout as the map's grid.
+    ax_tab = fig.add_subplot(right[1])
+    ax_tab.set_xlim(0, grid_size)
+    ax_tab.set_ylim(grid_size, 0)
+    ax_tab.set_aspect("equal")
+    ax_tab.set_axis_off()
+    ax_tab.set_title("Each grid square (same layout as the map)", fontsize=12, color=INK, loc="left")
+    big = 15 if grid_size <= 2 else 11 if grid_size <= 4 else 8
+    small = big * 0.72
+    for square in squares:
+        r, c = square["grid_row"], square["grid_col"]
+        ax_tab.add_patch(Rectangle((c + 0.03, r + 0.03), 0.94, 0.94, facecolor="#fcfcfb", edgecolor="#cccccc", lw=1))
+        summary = square["anisotropy"]
+        if summary is None:
+            ax_tab.text(c + 0.5, r + 0.5, "no holes", ha="center", va="center", fontsize=small, color=MUTED_INK)
+            continue
+        direction = summary["direction_deg"]
+        # A mini direction bar, colored by lean like the map, length = alignment.
+        theta = np.radians(direction)
+        half = 0.13 * summary["alignment"]
+        x0, y0 = c + 0.2, r + 0.3
+        ax_tab.plot([x0 - half * np.cos(theta), x0 + half * np.cos(theta)],
+                    [y0 + half * np.sin(theta), y0 - half * np.sin(theta)],
+                    color=cmap(norm(np.clip(lean_deg(direction), -LEAN_MAX_DEG, LEAN_MAX_DEG))),
+                    lw=4, solid_capstyle="round")
+        ax_tab.text(c + 0.36, r + 0.3, f"{direction:.0f}\u00b0", fontsize=big, color=INK, weight="bold", va="center")
+        ax_tab.text(c + 0.1, r + 0.52, lean_text(direction).replace(" of vertical", ""), fontsize=small, color=MUTED_INK,
+                    va="center")
+        ax_tab.text(c + 0.1, r + 0.68, f"align {summary['alignment']:.2f}   n = {square['count']}", fontsize=small,
+                    color=INK, va="center")
+        ax_tab.text(c + 0.1, r + 0.84, f"AR {summary['aspect_median']:.1f}   DA {summary['degree_of_anisotropy']:.1f}",
+                    fontsize=small, color=INK, va="center")
+
+    # Lean color key.
+    ax_key = fig.add_subplot(right[2])
+    key = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=ax_key, orientation="horizontal",
+                       ticks=[-LEAN_MAX_DEG, -LEAN_MAX_DEG / 2, 0, LEAN_MAX_DEG / 2, LEAN_MAX_DEG])
+    key.ax.set_xticklabels([f"{LEAN_MAX_DEG}\u00b0+ left", f"{LEAN_MAX_DEG // 2}\u00b0 left", "vertical",
+                            f"{LEAN_MAX_DEG // 2}\u00b0 right", f"{LEAN_MAX_DEG}\u00b0+ right"], fontsize=9, color=INK)
+    key.set_label(f"Hole color = lean from vertical.  Black bar on the map = a square's average direction "
+                  f"(longer = more aligned).", fontsize=9, color=MUTED_INK)
+    key.outline.set_edgecolor("#cccccc")
+
+    fig.suptitle(title, fontsize=10, color=MUTED_INK, x=0.01, ha="left")
+    fig.savefig(dst, bbox_inches="tight")
     plt.close(fig)
 
 
@@ -441,7 +524,7 @@ def draw_angle_labels(
     """Write each pinhole's angle (deg) just to the right of it."""
     output = image.copy()
     scale = max(image.shape[:2]) / 1500
-    font_scale, font_thickness = 0.9 * scale, max(1, int(round(2 * scale)))
+    font_scale, font_thickness = 0.75 * scale, max(1, int(round(1.6 * scale)))
     for x0, y0, w, a in zip(cx, cy, width, angle):
         text = f"{a:.0f}"
         (_, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
@@ -889,7 +972,7 @@ def main() -> None:
                                    colors=orientation_colors(angle))
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
         orientation_map = draw_major_axes(orientation_map, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
-    if shaped.sum() <= ANGLE_LABEL_MAX:
+    if SHOW_HOLE_ANGLES and shaped.sum() <= ANGLE_LABEL_MAX:
         orientation_map = draw_angle_labels(orientation_map, axis_cx[shaped], axis_cy[shaped], minor_px[shaped], angle[shaped])
     orientation_map = draw_square_directions(orientation_map, squares, args.grid)
     overlay = draw_grid_counts(overlay, spatial_rows, args.grid,
@@ -934,9 +1017,7 @@ def main() -> None:
     for line in info[:info.index("")]:
         print(f"    {line}")
     save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"], info)
-    save_orientation_plot(orientation_map, title + f"\nOrientation per grid square: bar = mean direction, "
-                          f"length = alignment (0-1)\nnumber by each pinhole = its angle (deg)\nAR = median aspect ratio (1 = round), DA = degree of anisotropy (1 = isotropic)",
-                          paths["orientation"])
+    save_orientation_plot(orientation_map, squares, anisotropy, args.grid, noun, title, paths["orientation"])
     save_distribution_plot(diameters, aspect[shaped], angle[shaped], anisotropy, noun, title, paths["distribution"])
 
     cell_h, cell_w = segmented.shape[0] / args.grid, segmented.shape[1] / args.grid
