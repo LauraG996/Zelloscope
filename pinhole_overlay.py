@@ -65,6 +65,15 @@ median aspect ratio, DA) are also worked out per grid square (--grid;
 across the specimen. The orientation map writes each pinhole's angle next to
 it (when there are at most ANGLE_LABEL_MAX of them).
 
+Void area: how much of the specimen is void and how much is background
+(solid foam). The specimen is the whole image minus any dark mount around it
+(void_analysis.specimen_mask, on the original image; the whole image without
+one). Void area is counted two ways -- the dark holes themselves (the real
+void; needs the original image) and the segmented outlines of the same cells
+(which also take in each hole's bright rim) -- only over the cells that are
+counted (size filter, cutter noise dropped). Background = specimen - void.
+Per grid square, each cell's area goes to the square its (x, y) is in.
+
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
 <image>_pinholes* for pinhole_data.csv, <image>_cells* for cell_data.csv):
   *.png               full-resolution overlay, with the --grid grid and each
@@ -76,6 +85,8 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
                       mean direction drawn as a bar (length = alignment) and
                       labeled with direction, alignment, count, median aspect
                       ratio (AR) and degree of anisotropy (DA)
+  *_area.csv          void vs background area: one line per grid square plus a
+                      total line (see Void area below)
   *.csv               one line per region (id, x, y, diameter, area, grid square,
                       length/width mm (edge-fitted ellipse axes), aspect ratio, angle deg,
                       shape_source (hole or outline), hole_diameter_mm;
@@ -91,7 +102,7 @@ import cv2
 import numpy as np
 
 from cutter_arcs import TRACK_FRAC_MIN, dark_mask, find_cutter_tracks, is_cutter_noise, region_features
-from void_analysis import Void, size_summary, spatial_distribution
+from void_analysis import Void, size_summary, spatial_distribution, specimen_mask
 
 # =============================================================================
 # SETTINGS -- edit these to change what's counted and how. For a single run,
@@ -605,6 +616,44 @@ def save_distribution_plot(
     plt.close(fig)
 
 
+def void_area_table(
+    specimen: np.ndarray, x: np.ndarray, y: np.ndarray, outline_px: np.ndarray, hole_px: np.ndarray | None,
+    grid_size: int, pix2mm: float,
+) -> list[dict]:
+    """Specimen / void / background area per grid square plus a "total" row (see module docstring).
+
+    x, y, outline_px (and hole_px, NaN-free, or None) describe the counted
+    cells; specimen is the bool specimen mask.
+    """
+    h, w = specimen.shape
+    cell_h, cell_w = h / grid_size, w / grid_size
+    rows_of = np.minimum(grid_size - 1, (y // cell_h).astype(int))
+    cols_of = np.minimum(grid_size - 1, (x // cell_w).astype(int))
+    mm2 = pix2mm ** 2
+    table = []
+    squares = [(r, c) for r in range(grid_size) for c in range(grid_size)] + [("total", "total")]
+    for r, c in squares:
+        if r == "total":
+            inside, spec_px = np.ones(len(x), bool), int(specimen.sum())
+        else:
+            inside = (rows_of == r) & (cols_of == c)
+            y0, y1 = int(round(r * cell_h)), int(round((r + 1) * cell_h))
+            x0, x1 = int(round(c * cell_w)), int(round((c + 1) * cell_w))
+            spec_px = int(specimen[y0:y1, x0:x1].sum())
+        entry = {"grid_row": r, "grid_col": c, "cells": int(inside.sum()),
+                 "specimen_px": spec_px, "specimen_mm2": spec_px * mm2}
+        for kind, px in (("hole", hole_px), ("outline", outline_px)):
+            if px is None:
+                continue
+            void = float(px[inside].sum())
+            entry.update({f"void_{kind}_px": int(void), f"void_{kind}_mm2": void * mm2,
+                          f"void_{kind}_pct": 100 * void / max(spec_px, 1),
+                          f"background_{kind}_px": int(spec_px - void),
+                          f"background_{kind}_mm2": (spec_px - void) * mm2})
+        table.append(entry)
+    return table
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("segmented", type=Path, help="Segmented (black boundary / white region) image")
@@ -750,7 +799,23 @@ def main() -> None:
           f"std {diameters.std():.3f}  min {diameters.min():.3f}  max {diameters.max():.3f}")
     p10, p25, p75, p90 = np.percentile(diameters, [10, 25, 75, 90])
     print(f"  percentiles (mm): p10 {p10:.3f}  p25 {p25:.3f}  p75 {p75:.3f}  p90 {p90:.3f}")
-    print(f"  {noun} cover {summary['porosity_pct']:.2f}% of the image")
+    specimen = (specimen_mask(original) > 0) if args.original is not None else np.ones(segmented.shape, bool)
+    area_rows = void_area_table(
+        specimen, x[counted & matched], y[counted & matched], area_px[counted & matched],
+        np.nan_to_num(hole_area[counted & matched]) if args.original is not None else None, args.grid, pix2mm)
+    total = area_rows[-1]
+    print(f"  area: specimen {total['specimen_px']} px = {total['specimen_mm2']:.1f} mm2"
+          + ("" if args.original is not None else " (whole image; no original to find a mount border)"))
+    for kind, label in (("hole", "dark holes (real void)"), ("outline", "segmented outlines")):
+        if f"void_{kind}_px" in total:
+            ratio = total[f"background_{kind}_px"] / max(total[f"void_{kind}_px"], 1)
+            print(f"    void, {label:<24} {total[f'void_{kind}_px']:>9} px = {total[f'void_{kind}_mm2']:7.2f} mm2 "
+                  f"= {total[f'void_{kind}_pct']:5.2f}% of specimen;  background "
+                  f"{total[f'background_{kind}_mm2']:.1f} mm2;  void : background = 1 : {ratio:.0f}")
+    main_kind = "hole" if args.original is not None else "outline"
+    print(f"  void % of specimen per grid square ({'dark holes' if main_kind == 'hole' else 'outlines'}, top row first):")
+    for r in range(args.grid):
+        print("    " + "  ".join(f"{a[f'void_{main_kind}_pct']:6.2f}" for a in area_rows[r * args.grid:(r + 1) * args.grid]))
     print(f"  spatial distribution ({args.grid}x{args.grid} grid, {noun} per grid square, top row first):")
     for r in range(args.grid):
         cells = [c["void_count"] for c in spatial_rows if c["grid_row"] == r]
@@ -772,6 +837,9 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     title = (f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}"
              + (f" {noun} {size_filter}" if size_filter else "") + f", on {args.segmented.name}")
+    title += "\nvoid area " + ", ".join(
+        f"{total[f'void_{kind}_pct']:.2f}% ({label})" for kind, label in (("hole", "dark holes"), ("outline", "outlines"))
+        if f"void_{kind}_pct" in total) + " of specimen"
     if noise.any():
         if args.keep_cutter_noise:
             title += f"\n{noise.sum()} cutter-noise detections marked (grey, red outline), still counted"
@@ -802,6 +870,7 @@ def main() -> None:
         "distribution": out_dir / f"{stem}_{noun}_distribution.png",
         "orientation": out_dir / f"{stem}_{noun}_orientation.png",
         "csv": out_dir / f"{stem}_{noun}.csv",
+        "area": out_dir / f"{stem}_{noun}_area.csv",
     }
     cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
@@ -827,6 +896,12 @@ def main() -> None:
             if track_frac is not None:
                 line += [f"{track_frac[i]:.3f}", f"{core_frac[i]:.3f}", int(noise[i])]
             writer.writerow(line)
+
+    with open(paths["area"], "w", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=list(area_rows[-1].keys()))
+        writer.writeheader()
+        for entry in area_rows:
+            writer.writerow({k: (f"{v:.4f}" if isinstance(v, float) else v) for k, v in entry.items()})
 
     for path in paths.values():
         print(f"  wrote {path}")
