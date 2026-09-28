@@ -150,6 +150,15 @@ HOLE_DARK_REL = 0.6
 # reported but not used for the direction/alignment.
 ROUND_ASPECT_MAX = 1.2
 
+# Draw the pictures on the original micrograph with the segmentation's cell
+# borders laid over it (needs the original image; False = on the faded
+# segmentation alone). Border color (RGB) and how strongly the borders and
+# the void fills cover the original (0 = invisible, 1 = opaque).
+SUPERIMPOSE_ORIGINAL = True
+SEGMENTATION_LINE_COLOR = (255, 200, 0)
+SEGMENTATION_LINE_OPACITY = 0.25
+VOID_FILL_OPACITY = 0.7
+
 # Write each hole's angle (deg) next to it on the orientation map.
 SHOW_HOLE_ANGLES = True
 
@@ -559,12 +568,17 @@ def diameter_colors(diameters: np.ndarray):
 def draw_overlay(
     segmented: np.ndarray, labels: np.ndarray, region_ids: np.ndarray, diameters: np.ndarray,
     noise: np.ndarray | None = None, tracks: np.ndarray | None = None, colors: np.ndarray | None = None,
+    original: np.ndarray | None = None,
 ) -> np.ndarray:
-    """RGB image: faded segmentation with each matched region filled by its diameter color and outlined.
+    """RGB image: each matched region filled by its diameter color and outlined, over a background.
 
-    Regions flagged in noise (per point, parallel to region_ids) are drawn in
-    NOISE_FILL with a NOISE_OUTLINE outline instead; tracks, if given, is
-    tinted. colors (per point RGB) replaces the diameter coloring.
+    The background is the faded segmentation, or -- given original (the
+    grayscale micrograph) -- the micrograph with the segmentation's cell
+    borders laid over it in SEGMENTATION_LINE_COLOR, and the fills then only
+    VOID_FILL_OPACITY opaque so the holes show through. Regions flagged in
+    noise (per point, parallel to region_ids) are drawn in NOISE_FILL with a
+    NOISE_OUTLINE outline instead; tracks, if given, is tinted. colors (per
+    point RGB) replaces the diameter coloring.
     """
     if noise is None:
         noise = np.zeros(len(region_ids), bool)
@@ -584,12 +598,21 @@ def draw_overlay(
             else:
                 lut[region_id] = (np.array(cmap(norm(diameter))[:3]) * 255).astype(np.uint8)
 
-    background = 255 - (255 - segmented.astype(float)) * BACKGROUND_OPACITY
-    output = np.repeat(background.astype(np.uint8)[:, :, None], 3, axis=2)
+    mask = (is_pinhole | is_noise)[labels]
+    if original is None:
+        background = 255 - (255 - segmented.astype(float)) * BACKGROUND_OPACITY
+        output = np.repeat(background.astype(np.uint8)[:, :, None], 3, axis=2)
+        fill_opacity = 1.0
+    else:
+        output = np.repeat(original[:, :, None], 3, axis=2).astype(np.float32)
+        borders = segmented < 128
+        output[borders] = ((1 - SEGMENTATION_LINE_OPACITY) * output[borders]
+                           + SEGMENTATION_LINE_OPACITY * np.array(SEGMENTATION_LINE_COLOR, np.float32))
+        output = output.astype(np.uint8)
+        fill_opacity = VOID_FILL_OPACITY
     if tracks is not None:
         output[tracks] = np.minimum(output[tracks], TRACK_TINT)
-    mask = (is_pinhole | is_noise)[labels]
-    output[mask] = lut[labels][mask]
+    output[mask] = ((1 - fill_opacity) * output[mask] + fill_opacity * lut[labels][mask]).astype(np.uint8)
 
     thickness = max(1, int(round(max(segmented.shape) / 1250)))
     for flags, color in ((is_pinhole, (0, 0, 0)), (is_noise, NOISE_OUTLINE)):
@@ -650,6 +673,17 @@ def draw_grid_counts(
         (text_w, text_h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, font_scale, font_thickness)
         cx = int(round((row["grid_col"] + 0.5) * cell_w)) - text_w // 2
         cy = int(round((row["grid_row"] + 0.5) * cell_h)) + text_h // 2
+        # A light box behind the label keeps it readable over the micrograph.
+        box_w, box_bottom = text_w, cy
+        if void_pct is not None:
+            label = f"{void_pct[row['grid_row'] * grid_size + row['grid_col']]:.2f}% void"
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.45 * font_scale, font_thickness)
+            box_w, box_bottom = max(text_w, label_w), cy + int(1.8 * label_h) + label_h // 2
+        pad = int(10 * scale)
+        mid = int(round((row["grid_col"] + 0.5) * cell_w))
+        x0, x1 = max(0, mid - box_w // 2 - pad), min(w, mid + box_w // 2 + pad)
+        y0, y1 = max(0, cy - text_h - pad), min(h, box_bottom + pad)
+        output[y0:y1, x0:x1] = (0.45 * output[y0:y1, x0:x1] + 0.55 * 255).astype(np.uint8)
         cv2.putText(output, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, (255, 255, 255),
                     font_thickness * 4, cv2.LINE_AA)
         cv2.putText(output, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, GRID_COLOR,
@@ -965,10 +999,11 @@ def main() -> None:
     draw_ids = region_ids if show_noise or not noise.any() else np.where(noise, 0, region_ids)
     draw_noise = noise if show_noise else None
     draw_tracks = tracks if DRAW_CUTTER_TRACKS else None
-    overlay = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks)
+    backdrop = original if (SUPERIMPOSE_ORIGINAL and args.original is not None) else None
+    overlay = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks, original=backdrop)
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
         overlay = draw_major_axes(overlay, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
-    orientation_map = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks,
+    orientation_map = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks, original=backdrop,
                                    colors=orientation_colors(angle))
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
         orientation_map = draw_major_axes(orientation_map, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
