@@ -138,6 +138,11 @@ REMOVE_CUTTER_NOISE = True
 DRAW_CUTTER_TRACKS = False
 DRAW_IGNORED_CELLS = False
 
+# Finding the cutter tracks is the slow part of a run (~50 s). The result is
+# saved in this folder the first time and reused while the original image is
+# unchanged. None = always recompute.
+CACHE_DIR = ".zelloscope_cache"
+
 # Grid for the per-square counts and orientation [--grid]; 2 = quadrants.
 GRID_SIZE = 4
 
@@ -798,6 +803,27 @@ def void_area_table(
     return table
 
 
+def cached_cutter_tracks(original: np.ndarray, original_path: Path) -> tuple[np.ndarray, list]:
+    """find_cutter_tracks, saved to CACHE_DIR and reused while original_path is unchanged."""
+    if not CACHE_DIR:
+        return find_cutter_tracks(original)
+    stat = original_path.stat()
+    # The file's size and modification time identify this version of the image;
+    # the cutter_arcs settings are included so changing them recomputes.
+    from cutter_arcs import DEFAULT_RIDGE_THRESHOLD, MAX_PASSES
+    key = f"{original_path.stem}_{stat.st_size}_{int(stat.st_mtime)}_{DEFAULT_RIDGE_THRESHOLD}_{MAX_PASSES}"
+    cache = Path(CACHE_DIR) / f"{key}_cutter_tracks.npz"
+    if cache.exists():
+        data = np.load(cache)
+        print(f"  cutter tracks: reused from {cache}")
+        return np.unpackbits(data["tracks"])[: original.size].reshape(original.shape).astype(bool), \
+            [tuple(c) for c in data["centers"]]
+    tracks, centers = find_cutter_tracks(original)
+    cache.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(cache, tracks=np.packbits(tracks.ravel()), centers=np.array(centers).reshape(-1, 2))
+    return tracks, centers
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("segmented", type=Path, help="Segmented (black boundary / white region) image")
@@ -907,7 +933,7 @@ def main() -> None:
             sys.exit(f"Could not read {args.original}")
         if original.shape != segmented.shape:
             sys.exit(f"{args.original} is {original.shape[::-1]}, segmented image is {segmented.shape[::-1]}")
-        tracks, centers = find_cutter_tracks(original)
+        tracks, centers = cached_cutter_tracks(original, args.original)
         label_track, label_core = region_features(original, labels, tracks)
         track_frac, core_frac = label_track[region_ids], label_core[region_ids]
         noise = matched & is_cutter_noise(track_frac, core_frac)

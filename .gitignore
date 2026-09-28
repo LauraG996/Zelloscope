@@ -1,3 +1,4 @@
 __pycache__/
 *.pyc
 cell_plot.png
+.zelloscope_cache/
