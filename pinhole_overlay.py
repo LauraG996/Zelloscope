@@ -516,7 +516,10 @@ def draw_overlay(
     return output
 
 
-def save_overlay_plot(overlay: np.ndarray, diameters: np.ndarray, title: str, dst: Path) -> None:
+def save_overlay_plot(
+    overlay: np.ndarray, diameters: np.ndarray, title: str, dst: Path, info: list[str] | None = None,
+) -> None:
+    """Overlay with title and diameter colorbar; info lines, if given, go in a box under the image."""
     import matplotlib.pyplot as plt
 
     norm, cmap = diameter_colors(diameters)
@@ -527,13 +530,22 @@ def save_overlay_plot(overlay: np.ndarray, diameters: np.ndarray, title: str, ds
     colorbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, fraction=0.04, pad=0.02,
                             extend="max" if norm.vmax < diameters.max() else "neither")
     colorbar.set_label("Diameter (mm)")
+    if info:
+        ax.text(0.5, -0.02, "\n".join(info), transform=ax.transAxes, ha="center", va="top",
+                fontsize=10.5, family="monospace", linespacing=1.5, multialignment="left",
+                bbox=dict(boxstyle="round,pad=0.6", facecolor="#F4F4F4", edgecolor="#999999"))
     fig.tight_layout()
-    fig.savefig(dst)
+    fig.savefig(dst, bbox_inches="tight")
     plt.close(fig)
 
 
-def draw_grid_counts(image: np.ndarray, spatial_rows: list[dict], grid_size: int) -> np.ndarray:
-    """Draw the grid_size x grid_size grid on image, each square labeled with its count."""
+def draw_grid_counts(
+    image: np.ndarray, spatial_rows: list[dict], grid_size: int, void_pct: list[float] | None = None,
+) -> np.ndarray:
+    """Draw the grid_size x grid_size grid on image, each square labeled with its count.
+
+    void_pct (row-major, one per square), if given, is written under each count.
+    """
     output = image.copy()
     h, w = output.shape[:2]
     cell_h, cell_w = h / grid_size, w / grid_size
@@ -559,6 +571,14 @@ def draw_grid_counts(image: np.ndarray, spatial_rows: list[dict], grid_size: int
                     font_thickness * 4, cv2.LINE_AA)
         cv2.putText(output, text, (cx, cy), cv2.FONT_HERSHEY_SIMPLEX, font_scale, GRID_COLOR,
                     font_thickness, cv2.LINE_AA)
+        if void_pct is not None:
+            small = 0.45 * font_scale
+            label = f"{void_pct[row['grid_row'] * grid_size + row['grid_col']]:.2f}% void"
+            (label_w, label_h), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, small, font_thickness)
+            org = (int(round((row["grid_col"] + 0.5) * cell_w)) - label_w // 2, cy + int(1.8 * label_h))
+            cv2.putText(output, label, org, cv2.FONT_HERSHEY_SIMPLEX, small, (255, 255, 255),
+                        font_thickness * 4, cv2.LINE_AA)
+            cv2.putText(output, label, org, cv2.FONT_HERSHEY_SIMPLEX, small, GRID_COLOR, font_thickness, cv2.LINE_AA)
     return output
 
 
@@ -872,7 +892,8 @@ def main() -> None:
     if shaped.sum() <= ANGLE_LABEL_MAX:
         orientation_map = draw_angle_labels(orientation_map, axis_cx[shaped], axis_cy[shaped], minor_px[shaped], angle[shaped])
     orientation_map = draw_square_directions(orientation_map, squares, args.grid)
-    overlay = draw_grid_counts(overlay, spatial_rows, args.grid)
+    overlay = draw_grid_counts(overlay, spatial_rows, args.grid,
+                               [a["void_cell_pct"] for a in area_rows[:-1]])
     paths = {
         "overlay": out_dir / f"{stem}_{noun}.png",
         "plot": out_dir / f"{stem}_{noun}_plot.png",
@@ -883,7 +904,16 @@ def main() -> None:
     }
     cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
-    save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"])
+    info = [f"Void vs background  (specimen {total['specimen_mm2']:.1f} mm2 = {total['specimen_px']:,} px)",
+            f"{'Void (' + str(len(diameters)) + ' ' + noun + (' ' + size_filter if size_filter else '') + '):':<28}"
+            f"{total['void_cell_mm2']:9.2f} mm2 = {total['void_cell_pct']:6.2f} %",
+            f"{'Background (foam):':<28}{total['background_cell_mm2']:9.2f} mm2 = {100 - total['void_cell_pct']:6.2f} %",
+            f"Void : background = 1 : {total['background_cell_px'] / max(total['void_cell_px'], 1):.0f}"
+            f"   (% under each grid count = void % of that square)"]
+    if "void_hole_pct" in total:
+        info.append(f"Dark holes only: {total['void_hole_mm2']:.2f} mm2 = {total['void_hole_pct']:.2f} %, "
+                    f"void : background = 1 : {total['background_hole_px'] / max(total['void_hole_px'], 1):.0f}")
+    save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"], info)
     save_orientation_plot(orientation_map, title + f"\nOrientation per grid square: bar = mean direction, "
                           f"length = alignment (0-1)\nnumber by each pinhole = its angle (deg)\nAR = median aspect ratio (1 = round), DA = degree of anisotropy (1 = isotropic)",
                           paths["orientation"])
