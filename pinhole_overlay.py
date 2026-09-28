@@ -904,7 +904,24 @@ def main() -> None:
     }
     cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
-    info = [f"Void vs background  (specimen {total['specimen_mm2']:.1f} mm2 = {total['specimen_px']:,} px)",
+    # Plain-language summary first, then the numbers.
+    squares_only = area_rows[:-1]
+    worst = max(squares_only, key=lambda a: a["void_cell_pct"])
+    empty = sum(a["cells"] == 0 for a in squares_only)
+    counted_area = area_px[counted & matched]
+    biggest_share = 100 * counted_area.max() / max(counted_area.sum(), 1) if len(counted_area) else 0.0
+    where = ("top" if worst["grid_row"] == 0 else "bottom" if worst["grid_row"] == args.grid - 1 else
+             f"row {worst['grid_row'] + 1}") + ", " + (
+             "left" if worst["grid_col"] == 0 else "right" if worst["grid_col"] == args.grid - 1 else
+             f"column {worst['grid_col'] + 1}")
+    info = [f"{total['void_cell_pct']:.2f}% of the specimen is void; {100 - total['void_cell_pct']:.2f}% is solid foam.",
+            f"That is {total['void_cell_mm2']:.1f} mm2 of void in {total['specimen_mm2']:.0f} mm2 of specimen: "
+            f"1 mm2 of void for every {total['background_cell_px'] / max(total['void_cell_px'], 1):.0f} mm2 of foam.",
+            f"The largest single void ({diameters.max():.2f} mm) is {biggest_share:.0f}% of all the void area.",
+            f"Most void-rich grid square: {where}, {worst['void_cell_pct']:.1f}% void"
+            + (f"; {empty} square{'s' if empty != 1 else ''} with no voids." if empty else "."),
+            "",
+            f"Void vs background  (specimen {total['specimen_mm2']:.1f} mm2 = {total['specimen_px']:,} px)",
             f"{'Void (' + str(len(diameters)) + ' ' + noun + (' ' + size_filter if size_filter else '') + '):':<28}"
             f"{total['void_cell_mm2']:9.2f} mm2 = {total['void_cell_pct']:6.2f} %",
             f"{'Background (foam):':<28}{total['background_cell_mm2']:9.2f} mm2 = {100 - total['void_cell_pct']:6.2f} %",
@@ -913,6 +930,9 @@ def main() -> None:
     if "void_hole_pct" in total:
         info.append(f"Dark holes only: {total['void_hole_mm2']:.2f} mm2 = {total['void_hole_pct']:.2f} %, "
                     f"void : background = 1 : {total['background_hole_px'] / max(total['void_hole_px'], 1):.0f}")
+    print("  summary:")
+    for line in info[:info.index("")]:
+        print(f"    {line}")
     save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"], info)
     save_orientation_plot(orientation_map, title + f"\nOrientation per grid square: bar = mean direction, "
                           f"length = alignment (0-1)\nnumber by each pinhole = its angle (deg)\nAR = median aspect ratio (1 = round), DA = degree of anisotropy (1 = isotropic)",
