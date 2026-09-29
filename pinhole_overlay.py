@@ -76,8 +76,8 @@ Per grid square, each cell's area goes to the square its (x, y) is in.
 
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
 <image>_pinholes* for pinhole_data.csv, <image>_cells* for cell_data.csv):
-  *.png               full-resolution overlay: the counted voids on the image,
-                      no grid, counts or labels
+  *.png               full resolution: the original with the segmentation's
+                      borders drawn clearly on it, nothing else
   *_plot.png          the same overlay with title and diameter colorbar
   *_distribution.png  size histogram + cumulative size curve (log diameter axis),
                       aspect ratio histogram, orientation rose diagram
@@ -86,8 +86,6 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
                       direction as a bar, beside a plain-language summary and a
                       table of direction / lean / alignment / AR / DA / count per
                       square laid out like the grid
-  <image>_segmentation_overlay.png  the original with the segmentation's
-                      borders drawn on it, nothing else (needs the original)
   *_area.csv          void vs background area: one line per grid square plus a
                       total line (see Void area below)
   *.csv               one line per region (id, x, y, diameter, area, grid square,
@@ -193,12 +191,13 @@ SUPERIMPOSE_ORIGINAL = True
 SEGMENTATION_LINE_COLOR = (255, 200, 0)
 SEGMENTATION_LINE_OPACITY = 0.25
 
-# Also save <image>_segmentation_overlay.png: just the original with every
-# segmentation border drawn on it (no voids, grid or labels), for checking the
-# segmentation against the real foam. Its own border color (RGB) and opacity.
-SAVE_SEGMENTATION_OVERLAY = True
+# <image>_cells.png: the original with every segmentation border drawn on it
+# and nothing else (no void colors, axis lines, grid or labels), for checking
+# the segmentation against the real foam. Border color (RGB), opacity
+# (1 = solid) and width in px. Without an original it's the segmentation alone.
 CHECK_LINE_COLOR = (255, 0, 0)
-CHECK_LINE_OPACITY = 0.7
+CHECK_LINE_OPACITY = 1.0
+CHECK_LINE_WIDTH_PX = 2
 VOID_FILL_OPACITY = 0.7
 
 # Axis names for the specimen directions: image x (left -> right) and image y
@@ -1210,7 +1209,6 @@ def main() -> None:
     if SHOW_HOLE_ANGLES and shaped.sum() <= ANGLE_LABEL_MAX:
         orientation_map = draw_angle_labels(orientation_map, axis_cx[shaped], axis_cy[shaped], minor_px[shaped], angle[shaped])
     orientation_map = draw_square_directions(orientation_map, squares, args.grid)
-    plain_overlay = overlay  # _cells.png: the voids on the image, no grid or counts
     overlay = draw_grid_counts(overlay, spatial_rows, args.grid,
                                [a["void_cell_pct"] for a in area_rows[:-1]])
     paths = {
@@ -1221,13 +1219,15 @@ def main() -> None:
         "csv": out_dir / f"{stem}_{noun}.csv",
         "area": out_dir / f"{stem}_{noun}_area.csv",
     }
-    cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(draw_axis_key(plain_overlay), cv2.COLOR_RGB2BGR))
-    if SAVE_SEGMENTATION_OVERLAY and args.original is not None:
-        check = np.repeat(original[:, :, None], 3, axis=2).astype(np.float32)
-        borders = segmented < 128
-        check[borders] = (1 - CHECK_LINE_OPACITY) * check[borders] + CHECK_LINE_OPACITY * np.array(CHECK_LINE_COLOR, np.float32)
-        paths["segmentation_overlay"] = out_dir / f"{stem}_segmentation_overlay.png"
-        cv2.imwrite(str(paths["segmentation_overlay"]), cv2.cvtColor(draw_axis_key(check.astype(np.uint8)), cv2.COLOR_RGB2BGR))
+    base = original if args.original is not None else np.full(segmented.shape, 255, np.uint8)
+    check = np.repeat(base[:, :, None], 3, axis=2).astype(np.float32)
+    borders = (segmented < 128).astype(np.uint8)
+    if CHECK_LINE_WIDTH_PX > 1:
+        borders = cv2.dilate(borders, np.ones((CHECK_LINE_WIDTH_PX, CHECK_LINE_WIDTH_PX), np.uint8))
+    borders = borders.astype(bool)
+    line_color = np.array(CHECK_LINE_COLOR if args.original is not None else (0, 0, 0), np.float32)
+    check[borders] = (1 - CHECK_LINE_OPACITY) * check[borders] + CHECK_LINE_OPACITY * line_color
+    cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(draw_axis_key(check.astype(np.uint8)), cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
     # Plain-language summary first, then the numbers.
     squares_only = area_rows[:-1]
