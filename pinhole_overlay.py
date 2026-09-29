@@ -149,6 +149,15 @@ CACHE_DIR = ".zelloscope_cache"
 # left out of the specimen area. (The biggest real void seen so far is ~20 mm2.)
 EMPTY_REGION_MIN_MM2 = 50.0
 
+# A void at the specimen's edge can open straight into that empty area (the
+# segmentation draws no line across its mouth), making it part of the empty
+# region. The specimen's outline is found by closing gaps up to twice this
+# size (mm) in its edge; the part of an empty region inside the outline is a
+# void and is counted (if it passes the size filter), the rest is empty.
+# Bigger = bridges wider void mouths but also turns wide notches in a ragged
+# specimen edge into "voids". 0 = don't look for such voids.
+EDGE_VOID_GAP_MM = 2.0
+
 # Stop if the CSV has no row with the segmented image's timestamp, instead of
 # falling back to the latest row (which then belongs to a different image and
 # gives nonsense). --row still picks a row explicitly.
@@ -943,6 +952,46 @@ def main() -> None:
               f"{(duplicate & ~in_empty).sum()} repeat points in an already-counted region")
     keep = ~in_empty & ~duplicate
     diameters, x, y, region_ids = diameters[keep], x[keep], y[keep], region_ids[keep]
+
+    # The specimen outline: everything that isn't empty, with gaps in its edge
+    # up to 2 x EDGE_VOID_GAP_MM closed (done at 1/4 scale for speed).
+    empty_px = empty_label[labels]
+    outline = ~empty_px
+    if EDGE_VOID_GAP_MM and empty_px.any():
+        f = 4
+        small = cv2.resize((~empty_px).astype(np.uint8), (w_img // f, h_img // f), interpolation=cv2.INTER_AREA)
+        radius = max(1, int(round(EDGE_VOID_GAP_MM / scale_guess / f)))
+        disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
+        # Pad so closing isn't cut short at the frame, then fill enclosed holes.
+        padded = cv2.copyMakeBorder((small > 0).astype(np.uint8), radius, radius, radius, radius, cv2.BORDER_CONSTANT, 0)
+        closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, disk)[radius:-radius, radius:-radius]
+        outside = closed.copy()
+        cv2.floodFill(outside, np.zeros((outside.shape[0] + 2, outside.shape[1] + 2), np.uint8), (0, 0), 2)
+        closed = (outside != 2).astype(np.uint8)
+        outline = cv2.resize(closed, (w_img, h_img), interpolation=cv2.INTER_NEAREST).astype(bool)
+        # Pieces of the empty region inside the outline are voids opening onto the edge.
+        edge_voids = (empty_px & outline).astype(np.uint8)
+        edge_voids = cv2.morphologyEx(edge_voids, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+        n_ev, ev_labels, ev_stats, ev_cent = cv2.connectedComponentsWithStats(edge_voids, connectivity=4)
+        added = []
+        for k in range(1, n_ev):
+            d_mm = 2 * np.sqrt(ev_stats[k, cv2.CC_STAT_AREA] / np.pi) * scale_guess
+            if not (lower <= d_mm <= upper):
+                continue
+            new_label = stats.shape[0]
+            labels[ev_labels == k] = new_label
+            stats = np.vstack([stats, ev_stats[k]])
+            empty_label = np.append(empty_label, False)
+            # A point inside the piece (its centroid may fall outside a curved shape).
+            ys_k, xs_k = np.nonzero(ev_labels == k)
+            j = np.argmin((xs_k - ev_cent[k][0]) ** 2 + (ys_k - ev_cent[k][1]) ** 2)
+            added.append((d_mm, float(xs_k[j]), float(ys_k[j]), new_label))
+        if added:
+            d_add, x_add, y_add, id_add = map(np.array, zip(*added))
+            diameters, x, y = np.concatenate([diameters, d_add]), np.concatenate([x, x_add]), np.concatenate([y, y_add])
+            region_ids = np.concatenate([region_ids, id_add.astype(region_ids.dtype)])
+            print(f"  found {len(added)} void(s) opening onto the specimen edge (split off the empty area): "
+                  + ", ".join(f"{v:.2f} mm" for v in d_add))
     if len(diameters) == 0:
         sys.exit(f"Row {row['timestamp']} has no {noun} inside the specimen")
     matched = region_ids > 0
@@ -1007,7 +1056,7 @@ def main() -> None:
     p10, p25, p75, p90 = np.percentile(diameters, [10, 25, 75, 90])
     print(f"  percentiles (mm): p10 {p10:.3f}  p25 {p25:.3f}  p75 {p75:.3f}  p90 {p90:.3f}")
     specimen = (specimen_mask(original) > 0) if args.original is not None else np.ones(segmented.shape, bool)
-    specimen &= ~empty_label[labels]
+    specimen &= outline
     area_rows = void_area_table(
         specimen, x[counted & matched], y[counted & matched], area_px[counted & matched],
         np.nan_to_num(hole_area[counted & matched]) if REPORT_DARK_HOLE_AREA and args.original is not None else None,
