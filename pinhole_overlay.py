@@ -86,6 +86,8 @@ Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
                       direction as a bar, beside a plain-language summary and a
                       table of direction / lean / alignment / AR / DA / count per
                       square laid out like the grid
+  <image>_segmentation_overlay.png  the original with the segmentation's
+                      borders drawn on it, nothing else (needs the original)
   *_area.csv          void vs background area: one line per grid square plus a
                       total line (see Void area below)
   *.csv               one line per region (id, x, y, diameter, area, grid square,
@@ -190,6 +192,13 @@ ROUND_ASPECT_MAX = 1.2
 SUPERIMPOSE_ORIGINAL = True
 SEGMENTATION_LINE_COLOR = (255, 200, 0)
 SEGMENTATION_LINE_OPACITY = 0.25
+
+# Also save <image>_segmentation_overlay.png: just the original with every
+# segmentation border drawn on it (no voids, grid or labels), for checking the
+# segmentation against the real foam. Its own border color (RGB) and opacity.
+SAVE_SEGMENTATION_OVERLAY = True
+CHECK_LINE_COLOR = (255, 0, 0)
+CHECK_LINE_OPACITY = 0.7
 VOID_FILL_OPACITY = 0.7
 
 # Write each hole's angle (deg) next to it on the orientation map.
@@ -1168,6 +1177,12 @@ def main() -> None:
         "area": out_dir / f"{stem}_{noun}_area.csv",
     }
     cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    if SAVE_SEGMENTATION_OVERLAY and args.original is not None:
+        check = np.repeat(original[:, :, None], 3, axis=2).astype(np.float32)
+        borders = segmented < 128
+        check[borders] = (1 - CHECK_LINE_OPACITY) * check[borders] + CHECK_LINE_OPACITY * np.array(CHECK_LINE_COLOR, np.float32)
+        paths["segmentation_overlay"] = out_dir / f"{stem}_segmentation_overlay.png"
+        cv2.imwrite(str(paths["segmentation_overlay"]), cv2.cvtColor(check.astype(np.uint8), cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
     # Plain-language summary first, then the numbers.
     squares_only = area_rows[:-1]
