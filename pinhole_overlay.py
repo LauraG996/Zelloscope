@@ -201,6 +201,11 @@ CHECK_LINE_COLOR = (255, 0, 0)
 CHECK_LINE_OPACITY = 0.7
 VOID_FILL_OPACITY = 0.7
 
+# Axis names for the specimen directions: image x (left -> right) and image y
+# (bottom -> top). Shown on every picture.
+X_AXIS_LABEL = "MD"
+Y_AXIS_LABEL = "Z"
+
 # Write each hole's angle (deg) next to it on the orientation map.
 SHOW_HOLE_ANGLES = True
 
@@ -501,7 +506,7 @@ def save_orientation_plot(
 
     ax_map = fig.add_subplot(outer[0])
     ax_map.imshow(image)
-    ax_map.set_axis_off()
+    label_axes(ax_map)
     ax_map.set_title("Where the holes point", fontsize=13, color=INK, loc="left")
 
     # Plain-language summary for the whole specimen.
@@ -664,6 +669,34 @@ def draw_overlay(
     return output
 
 
+def label_axes(ax) -> None:
+    """Frame an image axes with the specimen direction labels instead of hiding it."""
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_edgecolor("#999999")
+    ax.set_xlabel(f"{X_AXIS_LABEL} \u2192", fontsize=12, labelpad=6)
+    ax.set_ylabel(f"{Y_AXIS_LABEL} \u2192", fontsize=12, labelpad=6)
+
+
+def draw_axis_key(image: np.ndarray) -> np.ndarray:
+    """Small MD / Z arrows in the image's bottom-left corner (for the full-resolution outputs)."""
+    output = image.copy()
+    h, w = output.shape[:2]
+    scale = max(h, w) / 1500
+    length, thick = int(110 * scale), max(2, int(round(3 * scale)))
+    x0, y0 = int(30 * scale), h - int(30 * scale)
+    font, fs, ft = cv2.FONT_HERSHEY_SIMPLEX, 0.9 * scale, max(1, int(round(2 * scale)))
+    for color, width in (((255, 255, 255), thick * 3), ((0, 0, 0), thick)):
+        cv2.arrowedLine(output, (x0, y0), (x0 + length, y0), color, width, cv2.LINE_AA, tipLength=0.18)
+        cv2.arrowedLine(output, (x0, y0), (x0, y0 - length), color, width, cv2.LINE_AA, tipLength=0.18)
+    for text, org in ((X_AXIS_LABEL, (x0 + length + int(8 * scale), y0 + int(10 * scale))),
+                      (Y_AXIS_LABEL, (x0 - int(10 * scale), y0 - length - int(12 * scale)))):
+        cv2.putText(output, text, org, font, fs, (255, 255, 255), ft * 4, cv2.LINE_AA)
+        cv2.putText(output, text, org, font, fs, (0, 0, 0), ft, cv2.LINE_AA)
+    return output
+
+
 def save_overlay_plot(
     overlay: np.ndarray, diameters: np.ndarray, title: str, dst: Path, info: list[str] | None = None,
 ) -> None:
@@ -673,13 +706,13 @@ def save_overlay_plot(
     norm, cmap = diameter_colors(diameters)
     fig, ax = plt.subplots(figsize=(10, 10.6), dpi=150)
     ax.imshow(overlay)
-    ax.set_axis_off()
+    label_axes(ax)
     ax.set_title(title, fontsize=11)
     colorbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, fraction=0.04, pad=0.02,
                             extend="max" if norm.vmax < diameters.max() else "neither")
     colorbar.set_label("Diameter (mm)")
     if info:
-        ax.text(0.5, -0.02, "\n".join(info), transform=ax.transAxes, ha="center", va="top",
+        ax.text(0.5, -0.07, "\n".join(info), transform=ax.transAxes, ha="center", va="top",
                 fontsize=10.5, family="monospace", linespacing=1.5, multialignment="left",
                 bbox=dict(boxstyle="round,pad=0.6", facecolor="#F4F4F4", edgecolor="#999999"))
     fig.tight_layout()
@@ -792,7 +825,10 @@ def save_distribution_plot(
     direction = np.radians(anisotropy["direction_deg"])
     ax4.plot([direction, direction + np.pi], [counts.max()] * 2, color="#CC3311", linewidth=2)
     ax4.set_yticklabels([])
-    ax4.set_title(f"Orientation (0 deg = horizontal, 90 = vertical)\n"
+    ax4.set_xticks(np.radians([0, 45, 90, 135, 180, 225, 270, 315]))
+    ax4.set_xticklabels([X_AXIS_LABEL, "45\u00b0", Y_AXIS_LABEL, "135\u00b0", X_AXIS_LABEL, "225\u00b0",
+                         Y_AXIS_LABEL, "315\u00b0"])
+    ax4.set_title(f"Orientation (0\u00b0 = along {X_AXIS_LABEL}, 90\u00b0 = along {Y_AXIS_LABEL})\n"
                   f"alignment {anisotropy['alignment']:.2f}, direction {anisotropy['direction_deg']:.0f} deg, "
                   f"DA {anisotropy['degree_of_anisotropy']:.2f}", fontsize=10)
 
@@ -1176,13 +1212,13 @@ def main() -> None:
         "csv": out_dir / f"{stem}_{noun}.csv",
         "area": out_dir / f"{stem}_{noun}_area.csv",
     }
-    cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(draw_axis_key(overlay), cv2.COLOR_RGB2BGR))
     if SAVE_SEGMENTATION_OVERLAY and args.original is not None:
         check = np.repeat(original[:, :, None], 3, axis=2).astype(np.float32)
         borders = segmented < 128
         check[borders] = (1 - CHECK_LINE_OPACITY) * check[borders] + CHECK_LINE_OPACITY * np.array(CHECK_LINE_COLOR, np.float32)
         paths["segmentation_overlay"] = out_dir / f"{stem}_segmentation_overlay.png"
-        cv2.imwrite(str(paths["segmentation_overlay"]), cv2.cvtColor(check.astype(np.uint8), cv2.COLOR_RGB2BGR))
+        cv2.imwrite(str(paths["segmentation_overlay"]), cv2.cvtColor(draw_axis_key(check.astype(np.uint8)), cv2.COLOR_RGB2BGR))
     # Colors (and so the colorbar) cover only the regions drawn in color, never the grey noise.
     # Plain-language summary first, then the numbers.
     squares_only = area_rows[:-1]
