@@ -675,23 +675,31 @@ def label_axes(ax) -> None:
     ax.set_yticks([])
     for spine in ax.spines.values():
         spine.set_edgecolor("#999999")
-    ax.set_xlabel(f"{X_AXIS_LABEL} \u2192", fontsize=12, labelpad=6)
-    ax.set_ylabel(f"{Y_AXIS_LABEL} \u2192", fontsize=12, labelpad=6)
+    ax.set_xlabel(f"\u2190  {X_AXIS_LABEL}  \u2192", fontsize=18, weight="bold", labelpad=8)
+    ax.set_ylabel(f"\u2190  {Y_AXIS_LABEL}  \u2192", fontsize=18, weight="bold", labelpad=8)
 
 
 def draw_axis_key(image: np.ndarray) -> np.ndarray:
-    """Small MD / Z arrows in the image's bottom-left corner (for the full-resolution outputs)."""
+    """Double-headed MD / Z arrows in the image's bottom-left corner (for the full-resolution outputs)."""
     output = image.copy()
     h, w = output.shape[:2]
     scale = max(h, w) / 1500
-    length, thick = int(110 * scale), max(2, int(round(3 * scale)))
-    x0, y0 = int(30 * scale), h - int(30 * scale)
-    font, fs, ft = cv2.FONT_HERSHEY_SIMPLEX, 0.9 * scale, max(1, int(round(2 * scale)))
+    length, thick = int(170 * scale), max(2, int(round(4 * scale)))
+    gap = int(45 * scale)  # space between the two arrows and the corner
+    cx, cy = gap + length // 2 + int(40 * scale), h - gap - int(40 * scale)  # centre of the MD arrow
+    zx, zy = gap, h - gap - int(40 * scale) - length // 2                     # centre of the Z arrow
+    font, fs, ft = cv2.FONT_HERSHEY_SIMPLEX, 1.8 * scale, max(2, int(round(4 * scale)))
+    md = ((cx - length // 2, cy), (cx + length // 2, cy))
+    z = ((zx, zy + length // 2), (zx, zy - length // 2))
     for color, width in (((255, 255, 255), thick * 3), ((0, 0, 0), thick)):
-        cv2.arrowedLine(output, (x0, y0), (x0 + length, y0), color, width, cv2.LINE_AA, tipLength=0.18)
-        cv2.arrowedLine(output, (x0, y0), (x0, y0 - length), color, width, cv2.LINE_AA, tipLength=0.18)
-    for text, org in ((X_AXIS_LABEL, (x0 + length + int(8 * scale), y0 + int(10 * scale))),
-                      (Y_AXIS_LABEL, (x0 - int(10 * scale), y0 - length - int(12 * scale)))):
+        for p0, p1 in (md, z):
+            cv2.arrowedLine(output, p0, p1, color, width, cv2.LINE_AA, tipLength=0.14)
+            cv2.arrowedLine(output, p1, p0, color, width, cv2.LINE_AA, tipLength=0.14)
+    (mw, mh), _ = cv2.getTextSize(X_AXIS_LABEL, font, fs, ft)
+    (zw, zh), _ = cv2.getTextSize(Y_AXIS_LABEL, font, fs, ft)
+    labels = ((X_AXIS_LABEL, (cx - mw // 2, cy - int(18 * scale))),
+              (Y_AXIS_LABEL, (zx + int(18 * scale), zy + zh // 2)))
+    for text, org in labels:
         cv2.putText(output, text, org, font, fs, (255, 255, 255), ft * 4, cv2.LINE_AA)
         cv2.putText(output, text, org, font, fs, (0, 0, 0), ft, cv2.LINE_AA)
     return output
