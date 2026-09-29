@@ -76,8 +76,8 @@ Per grid square, each cell's area goes to the square its (x, y) is in.
 
 Outputs (in --output-dir, named after the segmented image and the CSV, e.g.
 <image>_pinholes* for pinhole_data.csv, <image>_cells* for cell_data.csv):
-  *.png               full-resolution overlay, with the --grid grid and each
-                      grid square's count drawn on it
+  *.png               full-resolution overlay: the counted voids on the image,
+                      no grid, counts or labels
   *_plot.png          the same overlay with title and diameter colorbar
   *_distribution.png  size histogram + cumulative size curve (log diameter axis),
                       aspect ratio histogram, orientation rose diagram
@@ -1210,6 +1210,7 @@ def main() -> None:
     if SHOW_HOLE_ANGLES and shaped.sum() <= ANGLE_LABEL_MAX:
         orientation_map = draw_angle_labels(orientation_map, axis_cx[shaped], axis_cy[shaped], minor_px[shaped], angle[shaped])
     orientation_map = draw_square_directions(orientation_map, squares, args.grid)
+    plain_overlay = overlay  # _cells.png: the voids on the image, no grid or counts
     overlay = draw_grid_counts(overlay, spatial_rows, args.grid,
                                [a["void_cell_pct"] for a in area_rows[:-1]])
     paths = {
@@ -1220,7 +1221,7 @@ def main() -> None:
         "csv": out_dir / f"{stem}_{noun}.csv",
         "area": out_dir / f"{stem}_{noun}_area.csv",
     }
-    cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(draw_axis_key(overlay), cv2.COLOR_RGB2BGR))
+    cv2.imwrite(str(paths["overlay"]), cv2.cvtColor(draw_axis_key(plain_overlay), cv2.COLOR_RGB2BGR))
     if SAVE_SEGMENTATION_OVERLAY and args.original is not None:
         check = np.repeat(original[:, :, None], 3, axis=2).astype(np.float32)
         borders = segmented < 128
