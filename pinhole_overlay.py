@@ -155,8 +155,16 @@ EMPTY_REGION_MIN_MM2 = 50.0
 # size (mm) in its edge; the part of an empty region inside the outline is a
 # void and is counted (if it passes the size filter), the rest is empty.
 # Bigger = bridges wider void mouths but also turns wide notches in a ragged
-# specimen edge into "voids". 0 = don't look for such voids.
-EDGE_VOID_GAP_MM = 2.0
+# specimen edge into "voids" -- on a ragged edge that happens at 2 mm already.
+# 0 = don't look for such voids (the default).
+EDGE_VOID_GAP_MM = 0.0
+
+# The CSV can leave out a cell that's much bigger than the rest -- on
+# 2026-09-29_13-50-13 it skipped the biggest void (5.4 mm) completely. True =
+# any closed segmented region inside the specimen (not touching the image edge)
+# that has no CSV point and passes the size filter is added as a void, sized
+# from its own area.
+INCLUDE_UNLISTED_REGIONS = True
 
 # Stop if the CSV has no row with the segmented image's timestamp, instead of
 # falling back to the latest row (which then belongs to a different image and
@@ -915,6 +923,7 @@ def main() -> None:
         print("warning: " + message + " Using the latest row anyway.")
     diameters, x, y = parse_pinholes(row)
     n_row = len(diameters)
+    all_x, all_y = x.copy(), y.copy()
     lower = args.min_mm if args.min_mm else -np.inf
     upper = args.max_mm if args.max_mm is not None else np.inf
     in_range = (diameters >= lower) & (diameters <= upper)
@@ -951,7 +960,31 @@ def main() -> None:
         print(f"  dropped {in_empty.sum()} {noun} in the empty area around the specimen and "
               f"{(duplicate & ~in_empty).sum()} repeat points in an already-counted region")
     keep = ~in_empty & ~duplicate
+    listed = np.zeros(stats.shape[0], bool)
+    listed[region_ids] = True
     diameters, x, y, region_ids = diameters[keep], x[keep], y[keep], region_ids[keep]
+    if INCLUDE_UNLISTED_REGIONS:
+        # listed covers every CSV point, before the size filter, so a region the
+        # CSV sized below --min-mm isn't re-added from its (bigger) outline area.
+        csv_ids = match_regions(segmented, all_x, all_y)[2]
+        listed[csv_ids] = True
+        eq_mm = 2 * np.sqrt(ra / np.pi) * scale_guess
+        unlisted = np.flatnonzero(~listed & ~on_edge & (eq_mm >= lower) & (eq_mm <= upper))
+        unlisted = unlisted[unlisted > 0]
+        if len(unlisted):
+            pts = []
+            for k in unlisted:
+                # A point inside the region (its centroid may fall outside a curved shape).
+                x0, y0, w0, h0, _ = stats[k]
+                ys_k, xs_k = np.nonzero(labels[y0:y0 + h0, x0:x0 + w0] == k)
+                cx0, cy0 = xs_k.mean(), ys_k.mean()
+                j = np.argmin((xs_k - cx0) ** 2 + (ys_k - cy0) ** 2)
+                pts.append((eq_mm[k], x0 + xs_k[j], y0 + ys_k[j], k))
+            d_add, x_add, y_add, id_add = map(np.array, zip(*pts))
+            diameters, x, y = np.concatenate([diameters, d_add]), np.concatenate([x, x_add]), np.concatenate([y, y_add])
+            region_ids = np.concatenate([region_ids, id_add.astype(region_ids.dtype)])
+            print(f"  added {len(pts)} region(s) the CSV left out (closed, inside the specimen): "
+                  + ", ".join(f"{v:.2f} mm at ({xx:.0f}, {yy:.0f})" for v, xx, yy, _ in pts))
 
     # The specimen outline: everything that isn't empty, with gaps in its edge
     # up to 2 x EDGE_VOID_GAP_MM closed (done at 1/4 scale for speed).
@@ -964,10 +997,10 @@ def main() -> None:
         disk = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
         # Pad so closing isn't cut short at the frame, then fill enclosed holes.
         padded = cv2.copyMakeBorder((small > 0).astype(np.uint8), radius, radius, radius, radius, cv2.BORDER_CONSTANT, 0)
-        closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, disk)[radius:-radius, radius:-radius]
-        outside = closed.copy()
-        cv2.floodFill(outside, np.zeros((outside.shape[0] + 2, outside.shape[1] + 2), np.uint8), (0, 0), 2)
-        closed = (outside != 2).astype(np.uint8)
+        closed = cv2.morphologyEx(padded, cv2.MORPH_CLOSE, disk)
+        # Flood from the padded border: empty area touching any image edge is outside.
+        cv2.floodFill(closed, np.zeros((closed.shape[0] + 2, closed.shape[1] + 2), np.uint8), (0, 0), 2)
+        closed = (closed != 2)[radius:-radius, radius:-radius].astype(np.uint8)
         outline = cv2.resize(closed, (w_img, h_img), interpolation=cv2.INTER_NEAREST).astype(bool)
         # Pieces of the empty region inside the outline are voids opening onto the edge.
         edge_voids = (empty_px & outline).astype(np.uint8)
