@@ -143,6 +143,17 @@ DRAW_IGNORED_CELLS = False
 # unchanged. None = always recompute.
 CACHE_DIR = ".zelloscope_cache"
 
+# Empty area around the specimen: in the segmentation it's one or a few huge
+# white regions touching the image edge. Any region touching the edge that's
+# bigger than this (mm2) is treated as empty -- never counted as a void and
+# left out of the specimen area. (The biggest real void seen so far is ~20 mm2.)
+EMPTY_REGION_MIN_MM2 = 50.0
+
+# Stop if the CSV has no row with the segmented image's timestamp, instead of
+# falling back to the latest row (which then belongs to a different image and
+# gives nonsense). --row still picks a row explicitly.
+REQUIRE_MATCHING_ROW = True
+
 # Grid for the per-square counts and orientation [--grid]; 2 = quadrants.
 GRID_SIZE = 4
 
@@ -887,7 +898,12 @@ def main() -> None:
     image_timestamp = f"{parts[0]} {parts[1].replace('-', ':')}" if len(parts) >= 2 else None
     row = load_row(args.csv, args.row, image_timestamp)
     if args.row is None and image_timestamp and row["timestamp"].strip() != image_timestamp:
-        print(f"warning: no {args.csv} row timestamped {image_timestamp}; using the latest ({row['timestamp']})")
+        message = (f"no {args.csv} row timestamped {image_timestamp} (the segmented image's time); the latest row "
+                   f"is {row['timestamp']}, which is from a different image. Add this image's row to {args.csv}, "
+                   f"or pick one with --row (see --list-rows).")
+        if REQUIRE_MATCHING_ROW:
+            sys.exit("error: " + message)
+        print("warning: " + message + " Using the latest row anyway.")
     diameters, x, y = parse_pinholes(row)
     n_row = len(diameters)
     lower = args.min_mm if args.min_mm else -np.inf
@@ -908,6 +924,27 @@ def main() -> None:
         sys.exit(f"Row {row['timestamp']} has no {noun}")
 
     labels, stats, region_ids = match_regions(segmented, x, y)
+
+    # Empty regions: huge white regions touching the image edge (see EMPTY_REGION_MIN_MM2).
+    # The scale isn't known yet, so size them with --pix2mm or the usual 0.014 mm/px.
+    h_img, w_img = segmented.shape
+    rx, ry, rw, rh, ra = (stats[:, k] for k in range(5))
+    on_edge = (rx <= 0) | (ry <= 0) | (rx + rw >= w_img) | (ry + rh >= h_img)
+    scale_guess = args.pix2mm or 0.01402
+    empty_label = on_edge & (ra * scale_guess ** 2 >= EMPTY_REGION_MIN_MM2)
+    empty_label[0] = False
+    in_empty = empty_label[region_ids]
+    # Each region counts once, however many CSV points fall in it.
+    first = np.zeros(len(region_ids), bool)
+    first[np.unique(region_ids, return_index=True)[1]] = True
+    duplicate = (region_ids > 0) & ~first
+    if in_empty.any() or duplicate.any():
+        print(f"  dropped {in_empty.sum()} {noun} in the empty area around the specimen and "
+              f"{(duplicate & ~in_empty).sum()} repeat points in an already-counted region")
+    keep = ~in_empty & ~duplicate
+    diameters, x, y, region_ids = diameters[keep], x[keep], y[keep], region_ids[keep]
+    if len(diameters) == 0:
+        sys.exit(f"Row {row['timestamp']} has no {noun} inside the specimen")
     matched = region_ids > 0
     area_px = stats[region_ids, cv2.CC_STAT_AREA].astype(float)
     area_px[~matched] = 0.0
@@ -970,13 +1007,15 @@ def main() -> None:
     p10, p25, p75, p90 = np.percentile(diameters, [10, 25, 75, 90])
     print(f"  percentiles (mm): p10 {p10:.3f}  p25 {p25:.3f}  p75 {p75:.3f}  p90 {p90:.3f}")
     specimen = (specimen_mask(original) > 0) if args.original is not None else np.ones(segmented.shape, bool)
+    specimen &= ~empty_label[labels]
     area_rows = void_area_table(
         specimen, x[counted & matched], y[counted & matched], area_px[counted & matched],
         np.nan_to_num(hole_area[counted & matched]) if REPORT_DARK_HOLE_AREA and args.original is not None else None,
         args.grid, pix2mm)
     total = area_rows[-1]
     print(f"  area: specimen {total['specimen_px']} px = {total['specimen_mm2']:.1f} mm2"
-          + ("" if args.original is not None else " (whole image; no original to find a mount border)"))
+          + (f" (empty area around it left out: {100 * (1 - specimen.mean()):.1f}% of the image)"
+             if not specimen.all() else " (the whole image)"))
     for kind, label in (("cell", "cell area"), ("hole", "dark holes in them")):
         if f"void_{kind}_px" in total:
             ratio = total[f"background_{kind}_px"] / max(total[f"void_{kind}_px"], 1)
