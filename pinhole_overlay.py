@@ -720,8 +720,8 @@ def draw_grid_lines(image: np.ndarray, grid_size: int) -> np.ndarray:
     return output
 
 
-# Per-square table shading: void % of the square, light -> dark blue.
-VOID_PCT_COLORS = ["#f4f8fd", "#cde2fb", "#86b6ef", "#3987e5", "#1c5cab"]
+# Per-square table shading: void % of the square, light -> dark red.
+VOID_PCT_COLORS = ["#fdf3f2", "#f8c9c6", "#ee8e8a", "#e34948", "#a8262a"]
 
 
 def save_overlay_plot(
