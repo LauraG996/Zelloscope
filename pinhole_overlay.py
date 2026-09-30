@@ -196,7 +196,7 @@ SEGMENTATION_LINE_OPACITY = 0.25
 # the segmentation against the real foam. Border color (RGB), opacity
 # (1 = solid) and width in px. Without an original it's the segmentation alone.
 CHECK_LINE_COLOR = (255, 0, 0)
-CHECK_LINE_OPACITY = 1.0
+CHECK_LINE_OPACITY = 0.5
 CHECK_LINE_WIDTH_PX = 2
 VOID_FILL_OPACITY = 0.7
 
