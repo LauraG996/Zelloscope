@@ -205,6 +205,10 @@ VOID_FILL_OPACITY = 0.7
 X_AXIS_LABEL = "MD"
 Y_AXIS_LABEL = "Z"
 
+# How much the original is faded toward white behind the voids on the plot
+# (0 = original as is, 1 = white), so the colored voids stand out.
+PLOT_BACKGROUND_FADE = 0.55
+
 # Write each hole's angle (deg) next to it on the orientation map.
 SHOW_HOLE_ANGLES = True
 
@@ -704,25 +708,92 @@ def draw_axis_key(image: np.ndarray) -> np.ndarray:
     return output
 
 
+def draw_grid_lines(image: np.ndarray, grid_size: int) -> np.ndarray:
+    """Thin grey grid lines, no labels."""
+    output = image.copy()
+    h, w = output.shape[:2]
+    thickness = max(1, int(round(2 * max(h, w) / 1500)))
+    for i in range(1, grid_size):
+        y, x = int(round(i * h / grid_size)), int(round(i * w / grid_size))
+        cv2.line(output, (0, y), (w, y), MAP_GRID_COLOR, thickness, cv2.LINE_AA)
+        cv2.line(output, (x, 0), (x, h), MAP_GRID_COLOR, thickness, cv2.LINE_AA)
+    return output
+
+
+# Per-square table shading: void % of the square, light -> dark blue.
+VOID_PCT_COLORS = ["#f4f8fd", "#cde2fb", "#86b6ef", "#3987e5", "#1c5cab"]
+
+
 def save_overlay_plot(
     overlay: np.ndarray, diameters: np.ndarray, title: str, dst: Path, info: list[str] | None = None,
+    area_rows: list[dict] | None = None, grid_size: int = 4, noun: str = "cells",
 ) -> None:
-    """Overlay with title and diameter colorbar; info lines, if given, go in a box under the image."""
+    """Void map (colored by diameter) beside a summary and a per-square table of count and void %.
+
+    info: summary sentences, an empty string, then the detailed number lines.
+    area_rows: void_area_table's rows (per square, then the total).
+    """
     import matplotlib.pyplot as plt
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.patches import Rectangle
+
+    info = info or []
+    split = info.index("") if "" in info else len(info)
+    sentences, details = info[:split], info[split + 1:]
 
     norm, cmap = diameter_colors(diameters)
-    fig, ax = plt.subplots(figsize=(10, 10.6), dpi=150)
-    ax.imshow(overlay)
-    label_axes(ax)
-    ax.set_title(title, fontsize=11)
-    colorbar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), ax=ax, fraction=0.04, pad=0.02,
-                            extend="max" if norm.vmax < diameters.max() else "neither")
-    colorbar.set_label("Diameter (mm)")
-    if info:
-        ax.text(0.5, -0.07, "\n".join(info), transform=ax.transAxes, ha="center", va="top",
-                fontsize=10.5, family="monospace", linespacing=1.5, multialignment="left",
-                bbox=dict(boxstyle="round,pad=0.6", facecolor="#F4F4F4", edgecolor="#999999"))
-    fig.tight_layout()
+    fig = plt.figure(figsize=(17, 9.8), dpi=150)
+    outer = fig.add_gridspec(1, 2, width_ratios=[1.0, 0.95], wspace=0.06)
+    left = outer[0].subgridspec(2, 1, height_ratios=[0.955, 0.045], hspace=0.12)
+    right = outer[1].subgridspec(3, 1, height_ratios=[0.2, 0.58, 0.22], hspace=0.12)
+
+    ax_map = fig.add_subplot(left[0])
+    ax_map.imshow(overlay)
+    label_axes(ax_map)
+    ax_map.set_title("Where the voids are (color = size)", fontsize=13, color=INK, loc="left")
+    ax_bar = fig.add_subplot(left[1])
+    bar = fig.colorbar(plt.cm.ScalarMappable(norm=norm, cmap=cmap), cax=ax_bar, orientation="horizontal",
+                       extend="max" if norm.vmax < diameters.max() else "neither")
+    bar.set_label("Void diameter (mm)", fontsize=10, color=INK)
+    bar.outline.set_edgecolor("#cccccc")
+
+    ax_text = fig.add_subplot(right[0])
+    ax_text.set_axis_off()
+    ax_text.text(0, 1.0, "Whole specimen", fontsize=13, color=INK, weight="bold", va="top", transform=ax_text.transAxes)
+    for k, line in enumerate(sentences):
+        ax_text.text(0, 0.78 - 0.2 * k, line, fontsize=10.5, color=INK, va="top", transform=ax_text.transAxes)
+
+    ax_tab = fig.add_subplot(right[1])
+    ax_tab.set_xlim(0, grid_size)
+    ax_tab.set_ylim(grid_size, 0)
+    ax_tab.set_aspect("equal")
+    ax_tab.set_axis_off()
+    ax_tab.set_title("Each grid square (same layout as the map)", fontsize=12, color=INK, loc="left")
+    if area_rows:
+        squares = area_rows[:-1]
+        top = max(max(a["void_cell_pct"] for a in squares), 1e-9)
+        shade = LinearSegmentedColormap.from_list("void_pct", VOID_PCT_COLORS)
+        shade_norm = Normalize(0, top)
+        big = 20 if grid_size <= 2 else 15 if grid_size <= 4 else 10
+        for a in squares:
+            r, c = a["grid_row"], a["grid_col"]
+            level = shade_norm(a["void_cell_pct"])
+            ax_tab.add_patch(Rectangle((c + 0.03, r + 0.03), 0.94, 0.94, facecolor=shade(level), edgecolor="#cccccc"))
+            ink = "white" if level > 0.6 else INK
+            ax_tab.text(c + 0.5, r + 0.42, f"{a['void_cell_pct']:.1f}%", ha="center", va="center",
+                        fontsize=big, weight="bold", color=ink)
+            ax_tab.text(c + 0.5, r + 0.7, f"{a['cells']} {noun}", ha="center", va="center",
+                        fontsize=big * 0.6, color=ink)
+    ax_tab.text(0, grid_size + 0.12, "Big number = void % of the square; darker = more void.",
+                fontsize=9, color=MUTED_INK, va="top")
+
+    ax_det = fig.add_subplot(right[2])
+    ax_det.set_axis_off()
+    ax_det.text(0, 0.9, "\n".join(line.replace("   (% under each grid count = void % of that square)", "")
+                                   for line in details),
+                fontsize=9.5, family="monospace", color=MUTED_INK, va="top", linespacing=1.5, transform=ax_det.transAxes)
+
+    fig.suptitle(title, fontsize=10, color=MUTED_INK, x=0.01, ha="left")
     fig.savefig(dst, bbox_inches="tight")
     plt.close(fig)
 
@@ -1199,9 +1270,9 @@ def main() -> None:
     draw_noise = noise if show_noise else None
     draw_tracks = tracks if DRAW_CUTTER_TRACKS else None
     backdrop = original if (SUPERIMPOSE_ORIGINAL and args.original is not None) else None
-    overlay = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks, original=backdrop)
-    if shaped.sum() <= OUTLINE_MAX_REGIONS:
-        overlay = draw_major_axes(overlay, axis_cx[shaped], axis_cy[shaped], major_px[shaped], angle[shaped])
+    # Plot map: the original lightened so the colored voids stand out, no axis lines.
+    light = None if backdrop is None else (PLOT_BACKGROUND_FADE * 255 + (1 - PLOT_BACKGROUND_FADE) * backdrop).astype(np.uint8)
+    overlay = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks, original=light)
     orientation_map = draw_overlay(segmented, labels, draw_ids, all_diameters, draw_noise, draw_tracks, original=backdrop,
                                    colors=orientation_colors(angle))
     if shaped.sum() <= OUTLINE_MAX_REGIONS:
@@ -1209,8 +1280,7 @@ def main() -> None:
     if SHOW_HOLE_ANGLES and shaped.sum() <= ANGLE_LABEL_MAX:
         orientation_map = draw_angle_labels(orientation_map, axis_cx[shaped], axis_cy[shaped], minor_px[shaped], angle[shaped])
     orientation_map = draw_square_directions(orientation_map, squares, args.grid)
-    overlay = draw_grid_counts(overlay, spatial_rows, args.grid,
-                               [a["void_cell_pct"] for a in area_rows[:-1]])
+    overlay = draw_grid_lines(overlay, args.grid)
     paths = {
         "overlay": out_dir / f"{stem}_{noun}.png",
         "plot": out_dir / f"{stem}_{noun}_plot.png",
@@ -1258,7 +1328,7 @@ def main() -> None:
     print("  summary:")
     for line in info[:info.index("")]:
         print(f"    {line}")
-    save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"], info)
+    save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"], info, area_rows, args.grid, noun)
     save_orientation_plot(orientation_map, squares, anisotropy, args.grid, noun, title, paths["orientation"])
     save_distribution_plot(diameters, aspect[shaped], angle[shaped], anisotropy, noun, title, paths["distribution"])
 
