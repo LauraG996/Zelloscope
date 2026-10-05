@@ -195,9 +195,9 @@ SEGMENTATION_LINE_OPACITY = 0.25
 # and nothing else (no void colors, axis lines, grid or labels), for checking
 # the segmentation against the real foam. Border color (RGB), opacity
 # (1 = solid) and width in px. Without an original it's the segmentation alone.
-CHECK_LINE_COLOR = (0, 230, 255)  # cyan: clearest over both black pores and white foam; magenta (255, 0, 200) is next
-CHECK_LINE_OPACITY = 0.5
-CHECK_LINE_WIDTH_PX = 2
+CHECK_LINE_COLOR = (255, 0, 0)  # cyan: clearest over both black pores and white foam; magenta (255, 0, 200) is next
+CHECK_LINE_OPACITY = 1
+CHECK_LINE_WIDTH_PX = 0.5
 VOID_FILL_OPACITY = 0.7
 
 # Axis names for the specimen directions: image x (left -> right) and image y
