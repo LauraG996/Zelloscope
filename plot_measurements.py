@@ -35,16 +35,16 @@ TIME_FORMATS = ["%Y-%m-%d_%H-%M-%S", "%Y-%m-%d_%H-%M"]
 
 ANCHOR = date(2000, 1, 1)
 
-# Feed-rate schedule for the 4 June run, back-calculated pixel-accurately
-# from plots/4june_vs_27aug_plot.svg (its band boundaries land on
-# 11:10, 12:57, 13:55 and 14:56, and the gap between the 12:57 and 13:55
-# boundaries brackets that plot's "11:51-12:55 removed" annotation exactly).
+# Process-change schedule, back-calculated pixel-accurately from
+# plots/4june_vs_27aug_plot.svg (its band boundaries land on 11:10, 12:57,
+# 13:55 and 14:56, and the gap between the 12:57 and 13:55 boundaries
+# brackets that plot's "11:51-12:55 removed" annotation exactly).
 FEED_RATE_SCHEDULE = [
-    (None, "11:10", "60 kg/h", FEED_DARK),
-    ("11:10", "12:57", "57 kg/h", FEED_MED),
-    ("12:57", "13:55", "55 kg/h", FEED_PALE),
-    ("13:55", "14:56", "58 kg/h", FEED_BLUE),
-    ("14:56", None, "60 kg/h", FEED_DARK),
+    (None, "11:10", "Process change 1", FEED_DARK),
+    ("11:10", "12:57", "Process change 2", FEED_MED),
+    ("12:57", "13:55", "Process change 3", FEED_PALE),
+    ("13:55", "14:56", "Process change 4", FEED_BLUE),
+    ("14:56", None, "Process change 5", FEED_DARK),
 ]
 
 
@@ -150,7 +150,7 @@ def draw_feed_rate_strip(ax, bounds, taxis: TimeAxis):
     ax.set_xticks([])
     for side in ("top", "right", "bottom", "left"):
         ax.spines[side].set_visible(False)
-    ax.set_ylabel("feed\nrate", fontsize=9, color=TEXT, rotation=0, ha="right", va="center", labelpad=20)
+    ax.set_ylabel("process", fontsize=9, color=TEXT, rotation=0, ha="right", va="center", labelpad=20)
 
 
 def hourly_ticks(xmin: datetime, xmax: datetime) -> list[datetime]:
@@ -223,7 +223,7 @@ def main() -> None:
     if run_b is not None:
         subtitle += f" · diamonds = {args.label_b} actual (n={len(run_b)})"
     if args.feed_bands:
-        subtitle += " · shade = material feed rate (kg/h)"
+        subtitle += " · shade = process change window"
     if args.compress_gaps:
         subtitle += " · gaps with no measurements are compressed"
     fig.text(0.01, 0.945, subtitle, fontsize=9.5, color=TEXT, ha="left")
