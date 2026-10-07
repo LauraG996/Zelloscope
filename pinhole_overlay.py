@@ -174,6 +174,15 @@ REQUIRE_MATCHING_ROW = True
 # Grid for the per-square counts and orientation [--grid]; 2 = quadrants.
 GRID_SIZE = 4
 
+# Or set the grid by square size [--grid-mm]: squares about this many mm on a
+# side (rounded so the image splits evenly), e.g. 2.0 for 2 x 2 mm squares.
+# None = use GRID_SIZE.
+GRID_MM = None
+
+# Grids with more squares per side than this show compact tables (void % or
+# direction only) in the pictures and skip the per-square tables in the terminal.
+DETAILED_GRID_MAX = 6
+
 # The dark hole inside a cell: pixels darker than this fraction of the local
 # foam brightness. Lower = stricter, a smaller hole (0.35 cuts into the edge,
 # 0.6 follows the visible edge).
@@ -538,10 +547,23 @@ def save_orientation_plot(
     ax_tab.set_title("Each grid square (same layout as the map)", fontsize=12, color=INK, loc="left")
     big = 15 if grid_size <= 2 else 11 if grid_size <= 4 else 8
     small = big * 0.72
+    detailed = grid_size <= DETAILED_GRID_MAX
     for square in squares:
         r, c = square["grid_row"], square["grid_col"]
-        ax_tab.add_patch(Rectangle((c + 0.03, r + 0.03), 0.94, 0.94, facecolor="#fcfcfb", edgecolor="#cccccc", lw=1))
+        gap = 0.03 if detailed else 0.0
+        ax_tab.add_patch(Rectangle((c + gap, r + gap), 1 - 2 * gap, 1 - 2 * gap, facecolor="#fcfcfb",
+                                   edgecolor="#cccccc", lw=1 if detailed else 0.3))
         summary = square["anisotropy"]
+        if not detailed:
+            # Compact: just a direction bar per square, colored by lean, length = alignment.
+            if summary is not None:
+                theta = np.radians(summary["direction_deg"])
+                half = 0.42 * summary["alignment"]
+                ax_tab.plot([c + 0.5 - half * np.cos(theta), c + 0.5 + half * np.cos(theta)],
+                            [r + 0.5 + half * np.sin(theta), r + 0.5 - half * np.sin(theta)],
+                            color=cmap(norm(np.clip(lean_deg(summary["direction_deg"]), -LEAN_MAX_DEG, LEAN_MAX_DEG))),
+                            lw=max(1.0, 30 / grid_size), solid_capstyle="round")
+            continue
         if summary is None:
             ax_tab.text(c + 0.5, r + 0.5, "no holes", ha="center", va="center", fontsize=small, color=MUTED_INK)
             continue
@@ -774,17 +796,25 @@ def save_overlay_plot(
         top = max(max(a["void_cell_pct"] for a in squares), 1e-9)
         shade = LinearSegmentedColormap.from_list("void_pct", VOID_PCT_COLORS)
         shade_norm = Normalize(0, top)
-        big = 20 if grid_size <= 2 else 15 if grid_size <= 4 else 10
+        detailed = grid_size <= DETAILED_GRID_MAX
+        big = 20 if grid_size <= 2 else 15 if grid_size <= 4 else 10 if detailed else max(3.5, 75 / grid_size)
+        gap = 0.03 if detailed else 0.0
         for a in squares:
             r, c = a["grid_row"], a["grid_col"]
             level = shade_norm(a["void_cell_pct"])
-            ax_tab.add_patch(Rectangle((c + 0.03, r + 0.03), 0.94, 0.94, facecolor=shade(level), edgecolor="#cccccc"))
+            ax_tab.add_patch(Rectangle((c + gap, r + gap), 1 - 2 * gap, 1 - 2 * gap, facecolor=shade(level),
+                                       edgecolor="#cccccc", lw=1 if detailed else 0.3))
             ink = "white" if level > 0.6 else INK
-            ax_tab.text(c + 0.5, r + 0.42, f"{a['void_cell_pct']:.1f}%", ha="center", va="center",
-                        fontsize=big, weight="bold", color=ink)
-            ax_tab.text(c + 0.5, r + 0.7, f"{a['cells']} {noun}", ha="center", va="center",
-                        fontsize=big * 0.6, color=ink)
-    ax_tab.text(0, grid_size + 0.12, "Big number = void % of the square; darker = more void.",
+            if detailed:
+                ax_tab.text(c + 0.5, r + 0.42, f"{a['void_cell_pct']:.1f}%", ha="center", va="center",
+                            fontsize=big, weight="bold", color=ink)
+                ax_tab.text(c + 0.5, r + 0.7, f"{a['cells']} {noun}", ha="center", va="center",
+                            fontsize=big * 0.6, color=ink)
+            elif a["void_cell_pct"] >= 0.5:
+                ax_tab.text(c + 0.5, r + 0.5, f"{a['void_cell_pct']:.0f}", ha="center", va="center",
+                            fontsize=big, color=ink)
+    ax_tab.text(0, grid_size * 1.03, ("Big number = void % of the square" if grid_size <= DETAILED_GRID_MAX
+                                     else "Number = void % of the square (blank = 0)") + "; darker = more void.",
                 fontsize=9, color=MUTED_INK, va="top")
 
     ax_det = fig.add_subplot(right[2])
@@ -918,12 +948,16 @@ def save_distribution_plot(
 
 def void_area_table(
     specimen: np.ndarray, x: np.ndarray, y: np.ndarray, outline_px: np.ndarray, hole_px: np.ndarray | None,
-    grid_size: int, pix2mm: float,
+    grid_size: int, pix2mm: float, void_mask: np.ndarray | None = None,
 ) -> list[dict]:
     """Specimen / void / background area per grid square plus a "total" row (see module docstring).
 
     x, y, outline_px (and hole_px, NaN-free, or None) describe the counted
-    cells; specimen is the bool specimen mask.
+    cells; specimen is the bool specimen mask. With void_mask (bool, the
+    counted cells' pixels), each square's cell void area is the void pixels
+    actually inside it, so a void bigger than a square is split across the
+    squares it covers; without it, each cell's whole area goes to the square
+    its (x, y) is in. Cell counts always go by (x, y).
     """
     h, w = specimen.shape
     cell_h, cell_w = h / grid_size, w / grid_size
@@ -945,7 +979,11 @@ def void_area_table(
         for kind, px in (("cell", outline_px), ("hole", hole_px)):
             if px is None:
                 continue
-            void = float(px[inside].sum())
+            if kind == "cell" and void_mask is not None:
+                region = void_mask if r == "total" else void_mask[y0:y1, x0:x1]
+                void = float(np.count_nonzero(region & (specimen if r == "total" else specimen[y0:y1, x0:x1])))
+            else:
+                void = float(px[inside].sum())
             entry.update({f"void_{kind}_px": int(void), f"void_{kind}_mm2": void * mm2,
                           f"void_{kind}_pct": 100 * void / max(spec_px, 1),
                           f"background_{kind}_px": int(spec_px - void),
@@ -998,6 +1036,10 @@ def main() -> None:
     parser.add_argument(
         "--grid", type=int, default=GRID_SIZE,
         help=f"Spatial distribution grid size (default: {GRID_SIZE})",
+    )
+    parser.add_argument(
+        "--grid-mm", type=float, default=GRID_MM,
+        help="Grid by square size instead: squares about this many mm on a side, e.g. 2 (overrides --grid)",
     )
     parser.add_argument(
         "--original", type=Path, default=None,
@@ -1166,6 +1208,10 @@ def main() -> None:
         print(f"  inferred scale: {pix2mm:.5f} mm/px (IQR {100 * spread:.1f}% of median)")
         if spread > 0.05:
             print("  warning: wide scale spread -- this row may not have been measured on this image")
+    if args.grid_mm:
+        args.grid = max(1, int(round(segmented.shape[1] * pix2mm / args.grid_mm)))
+    square_mm = segmented.shape[1] * pix2mm / args.grid
+    print(f"  grid: {args.grid} x {args.grid} squares of {square_mm:.2f} x {segmented.shape[0] * pix2mm / args.grid:.2f} mm")
 
     noise = np.zeros(len(diameters), bool)
     track_frac = core_frac = tracks = None
@@ -1216,7 +1262,8 @@ def main() -> None:
     area_rows = void_area_table(
         specimen, x[counted & matched], y[counted & matched], area_px[counted & matched],
         np.nan_to_num(hole_area[counted & matched]) if REPORT_DARK_HOLE_AREA and args.original is not None else None,
-        args.grid, pix2mm)
+        args.grid, pix2mm,
+        void_mask=np.isin(labels, np.unique(region_ids[counted & matched & (region_ids > 0)])))
     total = area_rows[-1]
     print(f"  area: specimen {total['specimen_px']} px = {total['specimen_mm2']:.1f} mm2"
           + (f" (empty area around it left out: {100 * (1 - specimen.mean()):.1f}% of the image)"
@@ -1228,19 +1275,25 @@ def main() -> None:
                   f"= {total[f'void_{kind}_pct']:5.2f}% of specimen;  background "
                   f"{total[f'background_{kind}_mm2']:.1f} mm2;  void : background = 1 : {ratio:.0f}")
     main_kind = "cell"
-    print(f"  void % of specimen per grid square (cell area, top row first):")
-    for r in range(args.grid):
+    detailed = args.grid <= DETAILED_GRID_MAX
+    if not detailed:
+        print(f"  (per-square tables skipped for a {args.grid}x{args.grid} grid -- see {stem}_{noun}_area.csv)")
+    if detailed:
+        print(f"  void % of specimen per grid square (cell area, top row first):")
+    for r in range(args.grid if detailed else 0):
         print("    " + "  ".join(f"{a[f'void_{main_kind}_pct']:6.2f}" for a in area_rows[r * args.grid:(r + 1) * args.grid]))
-    print(f"  spatial distribution ({args.grid}x{args.grid} grid, {noun} per grid square, top row first):")
-    for r in range(args.grid):
+    if detailed:
+        print(f"  spatial distribution ({args.grid}x{args.grid} grid, {noun} per grid square, top row first):")
+    for r in range(args.grid if detailed else 0):
         cells = [c["void_count"] for c in spatial_rows if c["grid_row"] == r]
         print("    " + "  ".join(f"{n:6d}" for n in cells))
     print(f"  anisotropy: aspect ratio mean {anisotropy['aspect_mean']:.2f}  median {anisotropy['aspect_median']:.2f}  "
           f"p90 {anisotropy['aspect_p90']:.2f}  ({anisotropy['round_count']} near-round, < {ROUND_ASPECT_MAX})")
     print(f"              alignment {anisotropy['alignment']:.2f} (0 random - 1 parallel), direction "
           f"{anisotropy['direction_deg']:.1f} deg (90 = vertical), DA {anisotropy['degree_of_anisotropy']:.2f}")
-    print(f"  anisotropy per grid square (direction deg / alignment / median aspect ratio / DA / count, top row first):")
-    for r in range(args.grid):
+    if detailed:
+        print(f"  anisotropy per grid square (direction deg / alignment / median aspect ratio / DA / count, top row first):")
+    for r in range(args.grid if detailed else 0):
         cells = []
         for square in squares[r * args.grid:(r + 1) * args.grid]:
             a = square["anisotropy"]
@@ -1251,7 +1304,8 @@ def main() -> None:
     out_dir = args.output_dir or args.segmented.parent
     out_dir.mkdir(parents=True, exist_ok=True)
     title = (f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}"
-             + (f" {noun} {size_filter}" if size_filter else "") + f", on {args.segmented.name}")
+             + (f" {noun} {size_filter}" if size_filter else "") + f", on {args.segmented.name}"
+             + f", grid {args.grid}x{args.grid} ({square_mm:.2f} mm squares)")
     title += "\nvoid area " + ", ".join(
         f"{total[f'void_{kind}_pct']:.2f}%" + (f" ({label})" if f"void_hole_pct" in total else "")
         for kind, label in (("cell", "cell area"), ("hole", "dark holes"))
