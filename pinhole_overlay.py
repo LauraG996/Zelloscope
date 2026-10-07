@@ -1020,7 +1020,7 @@ def main() -> None:
     if segmented is None:
         sys.exit(f"Could not read {args.segmented}")
 
-    stem = args.segmented.stem.removesuffix("_segmented")
+    stem = args.segmented.stem.removesuffix("_segmented").removesuffix("_segmentation")
     if args.no_original:
         args.original = None
     elif args.original is None and ORIGINAL_DIR:
