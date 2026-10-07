@@ -179,6 +179,11 @@ GRID_SIZE = 4
 # None = use GRID_SIZE.
 GRID_MM = None
 
+# Or by square area [--grid-mm2]: squares of about this many mm2 each (side =
+# its square root), e.g. 2.0 for 2 mm2 squares (1.41 x 1.41 mm). Overrides
+# GRID_MM and GRID_SIZE. None = not used.
+GRID_MM2 = 2.0
+
 # Grids with more squares per side than this show compact tables (void % or
 # direction only) in the pictures and skip the per-square tables in the terminal.
 DETAILED_GRID_MAX = 6
@@ -1038,6 +1043,11 @@ def main() -> None:
         help=f"Spatial distribution grid size (default: {GRID_SIZE})",
     )
     parser.add_argument(
+        "--grid-mm2", type=float, default=GRID_MM2,
+        help=f"Grid by square area: squares of about this many mm2 each (default: {GRID_MM2}; 0 = off, "
+             "use --grid / --grid-mm)",
+    )
+    parser.add_argument(
         "--grid-mm", type=float, default=GRID_MM,
         help="Grid by square size instead: squares about this many mm on a side, e.g. 2 (overrides --grid)",
     )
@@ -1208,10 +1218,14 @@ def main() -> None:
         print(f"  inferred scale: {pix2mm:.5f} mm/px (IQR {100 * spread:.1f}% of median)")
         if spread > 0.05:
             print("  warning: wide scale spread -- this row may not have been measured on this image")
+    if args.grid_mm2:
+        args.grid_mm = float(np.sqrt(args.grid_mm2))
     if args.grid_mm:
         args.grid = max(1, int(round(segmented.shape[1] * pix2mm / args.grid_mm)))
     square_mm = segmented.shape[1] * pix2mm / args.grid
-    print(f"  grid: {args.grid} x {args.grid} squares of {square_mm:.2f} x {segmented.shape[0] * pix2mm / args.grid:.2f} mm")
+    square_mm2 = square_mm * segmented.shape[0] * pix2mm / args.grid
+    print(f"  grid: {args.grid} x {args.grid} squares of {square_mm:.2f} x {segmented.shape[0] * pix2mm / args.grid:.2f} mm"
+          f" = {square_mm2:.2f} mm2")
 
     noise = np.zeros(len(diameters), bool)
     track_frac = core_frac = tracks = None
@@ -1305,7 +1319,7 @@ def main() -> None:
     out_dir.mkdir(parents=True, exist_ok=True)
     title = (f"{args.csv.name} row {row['timestamp']}, n={len(diameters)}"
              + (f" {noun} {size_filter}" if size_filter else "") + f", on {args.segmented.name}"
-             + f", grid {args.grid}x{args.grid} ({square_mm:.2f} mm squares)")
+             + f", grid {args.grid}x{args.grid} ({square_mm2:.2f} mm2 squares)")
     title += "\nvoid area " + ", ".join(
         f"{total[f'void_{kind}_pct']:.2f}%" + (f" ({label})" if f"void_hole_pct" in total else "")
         for kind, label in (("cell", "cell area"), ("hole", "dark holes"))
