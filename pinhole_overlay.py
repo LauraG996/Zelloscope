@@ -233,6 +233,20 @@ SHOW_HOLE_ANGLES = True
 # leaves out each hole's bright rim.
 REPORT_DARK_HOLE_AREA = False
 
+# Counting rules -- both are reported for every run, over the counted voids
+# (size filter and cutter noise applied first, so keep --min-mm at or below
+# ~1.1 mm or rule B can't see every void it would keep).
+#   A, area rule: keep a void whose area is at least RULE_A_MIN_MM2.
+#   B, graph-paper emulation: lay a RULE_B_SQUARE_MM x RULE_B_SQUARE_MM grid
+#      over the image (from the top-left corner) and keep a void that occupies
+#      at least RULE_B_MIN_SQUARES squares; a square counts as occupied when at
+#      least RULE_B_OCCUPY_FRAC of it is void, the way a person counting on
+#      graph paper counts a square that's mostly covered.
+RULE_A_MIN_MM2 = 2.0
+RULE_B_SQUARE_MM = 0.5
+RULE_B_MIN_SQUARES = 8
+RULE_B_OCCUPY_FRAC = 0.5
+
 # (Cutter-noise thresholds -- how much of a cell must lie on a track, and how
 # much solid dark core a real hole needs -- are TRACK_FRAC_MIN and
 # CORE_FRAC_MIN in cutter_arcs.py.)
@@ -997,6 +1011,105 @@ def void_area_table(
     return table
 
 
+def filled_region(labels: np.ndarray, stats: np.ndarray, label: int) -> tuple[np.ndarray, int, int]:
+    """The region's mask in its bounding box with enclosed holes filled (debris segmented as its own
+    cell inside a void is part of the void), plus the box's top-left (x0, y0)."""
+    x0, y0, w, h, _ = stats[label]
+    mask = np.pad((labels[y0:y0 + h, x0:x0 + w] == label).astype(np.uint8), 1)
+    outside = mask.copy()
+    cv2.floodFill(outside, None, (0, 0), 1)
+    return (mask | (1 - outside))[1:-1, 1:-1].astype(bool), x0, y0
+
+
+def counting_rules(labels: np.ndarray, stats: np.ndarray, region_ids: np.ndarray, pix2mm: float) -> dict:
+    """Per point: area (mm2, enclosed holes filled), rule-B squares occupied / touched, and whether
+    rules A and B keep it. Points with no region (id 0) get zeros and are kept by neither rule.
+    """
+    square_px = RULE_B_SQUARE_MM / pix2mm
+    n = len(region_ids)
+    area_mm2, occupied, touched = np.zeros(n), np.zeros(n, int), np.zeros(n, int)
+    seen = {}
+    for i, label in enumerate(region_ids):
+        if label <= 0:
+            continue
+        if label not in seen:
+            mask, x0, y0 = filled_region(labels, stats, label)
+            ys, xs = np.nonzero(mask)
+            area = len(ys)
+            # Graph-paper square each pixel falls in (fixed grid from the image's top-left corner).
+            keys = (((ys + y0) / square_px).astype(np.int64) << 32) + ((xs + x0) / square_px).astype(np.int64)
+            _, per_square = np.unique(keys, return_counts=True)
+            seen[label] = (area * pix2mm ** 2, int((per_square >= RULE_B_OCCUPY_FRAC * square_px ** 2).sum()),
+                           len(per_square))
+        area_mm2[i], occupied[i], touched[i] = seen[label]
+    return {"area_mm2": area_mm2, "squares": occupied, "squares_touched": touched,
+            "rule_a": area_mm2 >= RULE_A_MIN_MM2, "rule_b": occupied >= RULE_B_MIN_SQUARES,
+            "square_px": square_px, "min_px": RULE_A_MIN_MM2 / pix2mm ** 2}
+
+
+def save_counting_image(
+    original: np.ndarray | None, segmented: np.ndarray, labels: np.ndarray, stats: np.ndarray, region_ids: np.ndarray,
+    rules: dict, show: np.ndarray, dst: Path,
+) -> None:
+    """Full-res check image: the 0.5 mm graph-paper grid, each candidate void's occupied squares
+    tinted, and its outline colored by which rules keep it (legend in the corner)."""
+    base = original if original is not None else segmented
+    out = np.repeat((0.45 * 255 + 0.55 * base)[:, :, None], 3, axis=2).astype(np.uint8)
+    h, w = out.shape[:2]
+    sq = rules["square_px"]
+    for k in range(1, int(max(h, w) / sq) + 1):
+        p = int(round(k * sq))
+        if p < h:
+            cv2.line(out, (0, p), (w, p), (190, 190, 190), 1)
+        if p < w:
+            cv2.line(out, (p, 0), (p, h), (190, 190, 190), 1)
+    colors = {(True, True): (0, 150, 0), (True, False): (230, 120, 0), (False, True): (30, 90, 220),
+              (False, False): (120, 120, 120)}
+    scale = max(h, w) / 1500
+    for i in np.flatnonzero(show):
+        label = region_ids[i]
+        box, x0, y0 = filled_region(labels, stats, label)
+        ys, xs = np.nonzero(box)
+        ys, xs = ys + y0, xs + x0
+        mask = np.zeros(labels.shape, np.uint8)
+        mask[ys, xs] = 1
+        rows, cols = (ys / sq).astype(int), (xs / sq).astype(int)
+        keys, counts = np.unique(rows * 100000 + cols, return_counts=True)
+        for key in keys[counts >= RULE_B_OCCUPY_FRAC * sq * sq]:
+            r, c = divmod(int(key), 100000)
+            y0, x0 = int(round(r * sq)), int(round(c * sq))
+            y1, x1 = int(round((r + 1) * sq)), int(round((c + 1) * sq))
+            out[y0:y1, x0:x1] = (0.6 * out[y0:y1, x0:x1] + 0.4 * np.array((255, 220, 120))).astype(np.uint8)
+        color = colors[(bool(rules["rule_a"][i]), bool(rules["rule_b"][i]))]
+        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        cv2.drawContours(out, contours, -1, color, max(2, int(round(3 * scale))))
+        text = f"{rules['area_mm2'][i]:.2f} mm2 / {rules['squares'][i]} sq"
+        (text_w, _), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, int(2 * scale / 1.5))
+        right = int(xs.max()) + int(6 * scale)
+        # Label right of the void, or left of it when that would run off the image.
+        org = (right if right + text_w < w else max(0, int(xs.min()) - int(6 * scale) - text_w), int(ys.mean()))
+        for ink, th in (((255, 255, 255), 5), (color, 2)):
+            cv2.putText(out, text, org, cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, ink, int(th * scale / 1.5), cv2.LINE_AA)
+    legend = [("kept by A and B", colors[(True, True)]), ("A only (area)", colors[(True, False)]),
+              ("B only (squares)", colors[(False, True)]), ("neither", colors[(False, False)])]
+    # Legend in the bottom-right corner (the MD / Z key takes the bottom-left).
+    lx0, lx1 = w - int(560 * scale), w - int(15 * scale)
+    ly1 = h - int(15 * scale)
+    ly0 = ly1 - int(35 * scale) - int(32 * scale) * 5
+    cv2.rectangle(out, (lx0, ly0), (lx1, ly1), (255, 255, 255), -1)
+    y = ly0 + int(30 * scale)
+    cv2.putText(out, f"A: area >= {RULE_A_MIN_MM2:g} mm2   B: >= {RULE_B_MIN_SQUARES} of {RULE_B_SQUARE_MM:g} mm squares",
+                (lx0 + int(10 * scale), y), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, (0, 0, 0), max(1, int(2 * scale)),
+                cv2.LINE_AA)
+    for k, (name, color) in enumerate(legend):
+        yy = y + int(32 * scale) * (k + 1)
+        cv2.line(out, (lx0 + int(10 * scale), yy - int(8 * scale)), (lx0 + int(60 * scale), yy - int(8 * scale)), color,
+                 max(2, int(4 * scale)))
+        cv2.putText(out, name, (lx0 + int(75 * scale), yy), cv2.FONT_HERSHEY_SIMPLEX, 0.6 * scale, (0, 0, 0),
+                    max(1, int(2 * scale)), cv2.LINE_AA)
+    cv2.imwrite(str(dst), cv2.cvtColor(draw_axis_key(out), cv2.COLOR_RGB2BGR))
+
+
 def cached_cutter_tracks(original: np.ndarray, original_path: Path) -> tuple[np.ndarray, list]:
     """find_cutter_tracks, saved to CACHE_DIR and reused while original_path is unchanged."""
     if not CACHE_DIR:
@@ -1264,6 +1377,19 @@ def main() -> None:
     aspect = major_px / np.maximum(minor_px, 1e-9)
     shaped = counted & matched & fitted
     anisotropy = anisotropy_summary(major_px[shaped], minor_px[shaped], angle[shaped], shape_area[shaped])
+
+    # Counting rules A and B (see the settings), over the counted voids.
+    rules = counting_rules(labels, stats, np.where(counted & matched, region_ids, 0), pix2mm)
+    kept_a, kept_b = rules["rule_a"] & counted, rules["rule_b"] & counted
+    print(f"  counting rules (scale {pix2mm * 1000:.2f} um/px):")
+    print(f"    A, area >= {RULE_A_MIN_MM2:g} mm2 (>= {rules['min_px']:,.0f} px): {kept_a.sum()} voids, "
+          f"{rules['area_mm2'][kept_a].sum():.2f} mm2")
+    print(f"    B, >= {RULE_B_MIN_SQUARES} of {RULE_B_SQUARE_MM:g} x {RULE_B_SQUARE_MM:g} mm squares "
+          f"({rules['square_px']:.0f} x {rules['square_px']:.0f} px, square counts when >= "
+          f"{100 * RULE_B_OCCUPY_FRAC:.0f}% void): {kept_b.sum()} voids, {rules['area_mm2'][kept_b].sum():.2f} mm2")
+    print(f"    both: {(kept_a & kept_b).sum()}   A only: {(kept_a & ~kept_b).sum()}   B only: {(kept_b & ~kept_a).sum()}")
+    if args.min_mm and args.min_mm > 2 * np.sqrt(RULE_B_MIN_SQUARES * RULE_B_OCCUPY_FRAC * RULE_B_SQUARE_MM ** 2 / np.pi):
+        print(f"    note: --min-mm {args.min_mm:g} may hide voids rule B would keep; lower it to ~1.1 to be sure")
     squares = orientation_by_square(x[shaped], y[shaped], major_px[shaped], minor_px[shaped], angle[shaped],
                                     shape_area[shaped], segmented.shape, args.grid)
 
@@ -1356,6 +1482,7 @@ def main() -> None:
         "orientation": out_dir / f"{stem}_{noun}_orientation.png",
         "csv": out_dir / f"{stem}_{noun}.csv",
         "area": out_dir / f"{stem}_{noun}_area.csv",
+        "counting": out_dir / f"{stem}_{noun}_counting.png",
     }
     base = original if args.original is not None else np.full(segmented.shape, 255, np.uint8)
     check = np.repeat(base[:, :, None], 3, axis=2).astype(np.float32)
@@ -1390,6 +1517,9 @@ def main() -> None:
             f"{'Background (foam):':<28}{total['background_cell_mm2']:9.2f} mm2 = {100 - total['void_cell_pct']:6.2f} %",
             f"Void : background = 1 : {total['background_cell_px'] / max(total['void_cell_px'], 1):.0f}"
             f"   (% under each grid count = void % of that square)"]
+    info.append(f"Rule A (area >= {RULE_A_MIN_MM2:g} mm2): {kept_a.sum()} voids, {rules['area_mm2'][kept_a].sum():.2f} mm2;  "
+                f"Rule B (>= {RULE_B_MIN_SQUARES} of {RULE_B_SQUARE_MM:g} mm squares): {kept_b.sum()} voids, "
+                f"{rules['area_mm2'][kept_b].sum():.2f} mm2")
     if "void_hole_pct" in total:
         info.append(f"Dark holes only: {total['void_hole_mm2']:.2f} mm2 = {total['void_hole_pct']:.2f} %, "
                     f"void : background = 1 : {total['background_hole_px'] / max(total['void_hole_px'], 1):.0f}")
@@ -1398,13 +1528,18 @@ def main() -> None:
         print(f"    {line}")
     save_overlay_plot(overlay, all_diameters[~noise], title, paths["plot"], info, area_rows, args.grid, noun)
     save_orientation_plot(orientation_map, squares, anisotropy, args.grid, noun, title, paths["orientation"])
+    # Candidates shown on the counting image: anything at least half way to either rule.
+    show = counted & matched & ((rules["area_mm2"] >= RULE_A_MIN_MM2 / 2) | (rules["squares"] >= RULE_B_MIN_SQUARES / 2))
+    save_counting_image(original if args.original is not None else None, segmented, labels, stats, region_ids, rules, show,
+                        paths["counting"])
     save_distribution_plot(diameters, aspect[shaped], angle[shaped], anisotropy, noun, title, paths["distribution"])
 
     cell_h, cell_w = segmented.shape[0] / args.grid, segmented.shape[1] / args.grid
     with open(paths["csv"], "w", newline="") as f:
         writer = csv.writer(f)
         header = ["id", "x_px", "y_px", "diameter_mm", "area_px", "grid_row", "grid_col",
-                  "length_mm", "width_mm", "aspect_ratio", "angle_deg", "shape_source", "hole_diameter_mm"]
+                  "length_mm", "width_mm", "aspect_ratio", "angle_deg", "shape_source", "hole_diameter_mm",
+                  "area_mm2", "grid_squares", "grid_squares_touched", "rule_a", "rule_b"]
         writer.writerow(header + (["on_track_frac", "dark_core_frac", "cutter_noise"] if track_frac is not None else []))
         for i, (v, d) in enumerate(zip(voids, all_diameters)):
             cx, cy = v.centroid
@@ -1412,7 +1547,9 @@ def main() -> None:
                     min(args.grid - 1, int(cy // cell_h)), min(args.grid - 1, int(cx // cell_w)),
                     f"{major_px[i] * pix2mm:.3f}", f"{minor_px[i] * pix2mm:.3f}", f"{aspect[i]:.3f}", f"{angle[i]:.1f}",
                     "hole" if from_hole[i] else "outline",
-                    f"{2 * np.sqrt(hole_area[i] / np.pi) * pix2mm:.3f}" if from_hole[i] else ""]
+                    f"{2 * np.sqrt(hole_area[i] / np.pi) * pix2mm:.3f}" if from_hole[i] else "",
+                    f"{rules['area_mm2'][i]:.3f}", rules["squares"][i], rules["squares_touched"][i],
+                    int(kept_a[i]), int(kept_b[i])]
             if track_frac is not None:
                 line += [f"{track_frac[i]:.3f}", f"{core_frac[i]:.3f}", int(noise[i])]
             writer.writerow(line)
