@@ -60,7 +60,12 @@ SYMMETRY_COARSE_STEP_DEG = 1.0
 SYMMETRY_FINE_STEP_DEG = 0.1
 
 
-def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], tuple[int, int]]:
+def find_top_border_shoulder_points(
+    mask: np.ndarray,
+    smooth_window: int = SMOOTH_WINDOW,
+    slope_step: int = SLOPE_STEP,
+    slope_threshold: float = SLOPE_THRESHOLD,
+) -> tuple[tuple[int, int], tuple[int, int]]:
     """Locate the two points where the object's rounded top cap transitions into its legs.
 
     Traces the outer top boundary (topmost foreground pixel per column),
@@ -72,7 +77,7 @@ def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], 
         raise ValueError("No object found in image")
     x_min, x_max = xs_all.min(), xs_all.max()
     w = x_max - x_min + 1
-    if w < 2 * SLOPE_STEP:
+    if w < 2 * slope_step:
         raise ValueError("Object too narrow to reliably locate its top-border shoulders")
 
     top_row_per_col = np.full(w, -1, dtype=np.int64)
@@ -84,20 +89,20 @@ def find_top_border_shoulder_points(mask: np.ndarray) -> tuple[tuple[int, int], 
     xs = np.where(has_fg)[0] + x_min
     ys = top_row_per_col[has_fg]
 
-    kernel = np.ones(SMOOTH_WINDOW) / SMOOTH_WINDOW
+    kernel = np.ones(smooth_window) / smooth_window
     ys_smooth = np.convolve(ys.astype(float), kernel, mode="same")
 
     center = int(np.argmin(ys_smooth))  # peak of the top cap
     left = center
-    while left - SLOPE_STEP > 0:
-        slope = (ys_smooth[left] - ys_smooth[left - SLOPE_STEP]) / SLOPE_STEP
-        if slope < -SLOPE_THRESHOLD:
+    while left - slope_step > 0:
+        slope = (ys_smooth[left] - ys_smooth[left - slope_step]) / slope_step
+        if slope < -slope_threshold:
             break
         left -= 1
     right = center
-    while right + SLOPE_STEP < len(xs) - 1:
-        slope = (ys_smooth[right + SLOPE_STEP] - ys_smooth[right]) / SLOPE_STEP
-        if slope > SLOPE_THRESHOLD:
+    while right + slope_step < len(xs) - 1:
+        slope = (ys_smooth[right + slope_step] - ys_smooth[right]) / slope_step
+        if slope > slope_threshold:
             break
         right += 1
 

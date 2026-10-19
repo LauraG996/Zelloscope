@@ -5,9 +5,20 @@ The foam is expected to keep its relative shape: it may shift, rotate and
 shrink/swell uniformly, but should not distort. This script separates those
 two kinds of change. Each frame's silhouette is registered onto a reference
 frame (the first image, unless --reference is given) with a similarity
-transform -- translation, rotation and one uniform scale -- fitted by ICP on
-the object's outer and inner (hole) contours. What the similarity cannot
-explain is the real shape change, reported as:
+transform -- translation, rotation and one uniform scale. The rotation comes
+from the top-border shoulder line (see straighten.py's
+find_top_border_shoulder_points): the line through the two points where the
+top cap turns into the legs is found in both images, and the frame is
+rotated by the difference in that line's angle. Scale and translation are
+then fitted by ICP on the object's outer and inner (hole) contours with the
+rotation held fixed. (--align fit instead lets ICP choose the rotation too.)
+
+The specimen may also be flipped over between shots (in the sample series,
+7 of 11 frames are mirror images of the first). No rotation can align a
+mirror image, so each frame is also compared against a left-right mirrored
+reference, and whichever orientation overlaps better is kept and reported
+in the "mirrored" column.
+What the similarity cannot explain is the real shape change, reported as:
 
   * anisotropy / shear: from an additional affine fit, how far the change is
     from uniform (e.g. shrinking more in height than in width);
@@ -25,13 +36,13 @@ frame, coloured by local deviation) plus shape_tracking.csv.
 import argparse
 import csv
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-from straighten import IMAGE_EXTS, largest_foreground_mask
+from straighten import IMAGE_EXTS, find_top_border_shoulder_points, largest_foreground_mask
 
 # Registration runs on a downsampled mask: contours are long, smooth curves,
 # so a ~1000px working size keeps sub-pixel (full-res) accuracy from the
@@ -49,6 +60,13 @@ ICP_CONVERGENCE_PX = 1e-3
 # Colour scale for the overlay: deviations at or beyond this many working-
 # scale px saturate to full red/blue.
 DEVIATION_COLOR_RANGE_PX = 4.0
+# Shoulder-line detection parameters (full-res px). Much heavier smoothing
+# than straighten.py's defaults: those let a foam-cell bump on the cap pass
+# for a shoulder (shoulder distance varied 1039-2433px across the sample
+# series); these give a consistent ~2550-2680px on every frame.
+SHOULDER_SMOOTH_WINDOW = 151
+SHOULDER_SLOPE_STEP = 120
+SHOULDER_SLOPE_THRESHOLD = 0.8
 
 
 @dataclass
@@ -64,6 +82,7 @@ class ShapeChange:
     max_out_px: float         # largest outward deviation (locally swollen)
     max_in_px: float          # largest inward deviation (locally pulled in), <= 0
     rms_dev_pct: float        # RMS deviation as % of the reference's size
+    mirrored: bool = False    # frame matched the left-right mirrored reference (specimen flipped over)
 
 
 @dataclass
@@ -72,6 +91,7 @@ class Silhouette:
     points: np.ndarray        # (N, 2) float contour points, border-clipped ones removed
     factor: float             # full-res px per working px
     size: float               # sqrt(foam area), working px -- a length scale for %
+    shoulders: np.ndarray     # (2, 2) left/right top-border shoulder points, working px
 
 
 def load_silhouette(path: Path) -> tuple[np.ndarray, Silhouette]:
@@ -82,6 +102,11 @@ def load_silhouette(path: Path) -> tuple[np.ndarray, Silhouette]:
     factor = max(gray.shape) / WORK_SIZE
     small = cv2.resize(gray, None, fx=1 / factor, fy=1 / factor, interpolation=cv2.INTER_AREA)
     mask = largest_foreground_mask(small)
+    # Shoulders are found on the full-res mask, which the detection
+    # parameters are tuned for, then brought to working scale.
+    shoulders = np.array(find_top_border_shoulder_points(
+        largest_foreground_mask(gray), SHOULDER_SMOOTH_WINDOW, SHOULDER_SLOPE_STEP, SHOULDER_SLOPE_THRESHOLD,
+    ), dtype=np.float64) / factor
 
     contours, _ = cv2.findContours(mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
     points = np.vstack([c.reshape(-1, 2) for c in contours]).astype(np.float64)
@@ -94,7 +119,20 @@ def load_silhouette(path: Path) -> tuple[np.ndarray, Silhouette]:
     if len(points) < 50:
         raise ValueError(f"Too little object contour found in {path.name}")
     size = float(np.sqrt(np.count_nonzero(mask)))
-    return image, Silhouette(mask=mask, points=points, factor=factor, size=size)
+    return image, Silhouette(mask=mask, points=points, factor=factor, size=size, shoulders=shoulders)
+
+
+def mirrored(sil: Silhouette) -> Silhouette:
+    """Left-right mirror image of a silhouette (for a specimen flipped over between shots)."""
+    w = sil.mask.shape[1]
+    flip_x = lambda pts: np.column_stack([w - 1 - pts[:, 0], pts[:, 1]])
+    return replace(
+        sil,
+        mask=np.ascontiguousarray(sil.mask[:, ::-1]),
+        points=flip_x(sil.points),
+        # Mirroring swaps which shoulder is on the left.
+        shoulders=flip_x(sil.shoulders)[::-1],
+    )
 
 
 class NearestEdge:
@@ -133,6 +171,46 @@ def _fit_similarity(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
     m = np.zeros((2, 3))
     m[:, :2] = scale * rot
     m[:, 2] = mu_d - m[:, :2] @ mu_s
+    return m
+
+
+def _rotation_matrix(angle_rad: float) -> np.ndarray:
+    c, s = np.cos(angle_rad), np.sin(angle_rad)
+    return np.array([[c, -s], [s, c]])
+
+
+def _shoulder_angle(sil: Silhouette) -> float:
+    (x1, y1), (x2, y2) = sil.shoulders
+    return float(np.arctan2(y2 - y1, x2 - x1))
+
+
+def _fixed_rotation_fitter(rot: np.ndarray):
+    """Least-squares scale + translation mapping src -> dst, with the rotation fixed to rot."""
+    def fit(src: np.ndarray, dst: np.ndarray) -> np.ndarray:
+        r_src = src @ rot.T
+        mu_s, mu_d = r_src.mean(0), dst.mean(0)
+        s, d = r_src - mu_s, dst - mu_d
+        scale = (s * d).sum() / (s ** 2).sum()
+        m = np.zeros((2, 3))
+        m[:, :2] = scale * rot
+        m[:, 2] = mu_d - scale * mu_s
+        return m
+    return fit
+
+
+def fit_shoulder_aligned(ref: Silhouette, target: NearestEdge, frame: Silhouette) -> np.ndarray:
+    """Similarity whose rotation is the change in the shoulder line's angle.
+
+    Starts with the shoulder lines laid on top of each other (midpoints
+    matched, scaled by their length ratio), then refines scale and
+    translation against the whole contour.
+    """
+    rot = _rotation_matrix(_shoulder_angle(frame) - _shoulder_angle(ref))
+    scale = np.linalg.norm(np.diff(frame.shoulders, axis=0)) / np.linalg.norm(np.diff(ref.shoulders, axis=0))
+    init = np.zeros((2, 3))
+    init[:, :2] = scale * rot
+    init[:, 2] = frame.shoulders.mean(0) - init[:, :2] @ ref.shoulders.mean(0)
+    m, _ = icp(ref, target, _fixed_rotation_fitter(rot), init)
     return m
 
 
@@ -235,9 +313,22 @@ def silhouette_iou(ref: Silhouette, frame: Silhouette, m: np.ndarray) -> float:
     return np.count_nonzero(a & b) / union if union else 1.0
 
 
-def compare(ref: Silhouette, frame: Silhouette) -> tuple[ShapeChange, np.ndarray, np.ndarray]:
+def compare(
+    ref: Silhouette, frame: Silhouette, align: str = "shoulder-line"
+) -> tuple[ShapeChange, np.ndarray, np.ndarray, np.ndarray, Silhouette]:
+    """Returns (change, mapped reference contour, signed deviation, similarity matrix,
+    reference in the orientation used).
+
+    ref is compared both as-is and mirrored; the orientation with the better
+    aligned-silhouette IoU wins.
+    """
     target = NearestEdge(frame)
-    sim = fit_similarity(ref, target, frame)
+    fit = fit_shoulder_aligned if align == "shoulder-line" else fit_similarity
+    candidates = []
+    for is_mirrored, r in ((False, ref), (True, mirrored(ref))):
+        m = fit(r, target, frame)
+        candidates.append((silhouette_iou(r, frame, m), is_mirrored, r, m))
+    iou, is_mirrored, ref, sim = max(candidates, key=lambda c: c[0])
     aff, _ = icp(ref, target, _fit_affine, sim)
 
     a = sim[:, :2]
@@ -262,13 +353,14 @@ def compare(ref: Silhouette, frame: Silhouette) -> tuple[ShapeChange, np.ndarray
         dy_px=float(sim[1, 2] * f),
         anisotropy=anisotropy,
         shear_deg=shear,
-        iou=silhouette_iou(ref, frame, sim),
+        iou=iou,
         mean_abs_dev_px=float(np.abs(dev).mean() * f),
         max_out_px=float(max(dev.max(), 0.0) * f),
         max_in_px=float(min(dev.min(), 0.0) * f),
         rms_dev_pct=float(np.sqrt((dev ** 2).mean()) / (ref.size * scale) * 100),
+        mirrored=is_mirrored,
     )
-    return change, moved, dev
+    return change, moved, dev, sim, ref
 
 
 def _deviation_color(d: float) -> tuple[int, int, int]:
@@ -279,16 +371,30 @@ def _deviation_color(d: float) -> tuple[int, int, int]:
     return (int(255 * -t), int(255 * (1 + t)), 0)
 
 
-def draw_overlay(image: np.ndarray, moved: np.ndarray, dev: np.ndarray, factor: float,
-                 change: ShapeChange, label: str) -> np.ndarray:
+def draw_overlay(image: np.ndarray, moved: np.ndarray, dev: np.ndarray, frame: Silhouette,
+                 ref_shoulders: np.ndarray, change: ShapeChange, label: str) -> np.ndarray:
+    """ref_shoulders: the reference's shoulder points already mapped into the frame (working px)."""
     out = image.copy()
     h, w = out.shape[:2]
+    factor = frame.factor
     radius = max(2, int(round(w / 600)))
     for (x, y), d in zip(moved * factor, dev):
         cv2.circle(out, (int(round(x)), int(round(y))), radius, _deviation_color(d), -1, cv2.LINE_AA)
 
+    # Shoulder lines: the frame's own (magenta) and the reference's mapped
+    # into the frame (white, dashed by drawing dots), so the rotation used
+    # for alignment can be checked by eye.
+    p1, p2 = (tuple(int(round(v)) for v in p * factor) for p in frame.shoulders)
+    cv2.line(out, p1, p2, (255, 0, 255), radius, cv2.LINE_AA)
+    for p in (p1, p2):
+        cv2.circle(out, p, radius * 5, (255, 0, 255), radius, cv2.LINE_AA)
+    a, b = ref_shoulders * factor
+    for t in np.linspace(0, 1, 40):
+        q = a + (b - a) * t
+        cv2.circle(out, (int(round(q[0])), int(round(q[1]))), radius, (255, 255, 255), -1, cv2.LINE_AA)
+
     lines = [
-        label,
+        label + ("  [specimen flipped: compared to mirrored reference]" if change.mirrored else ""),
         f"scale {change.scale * 100:.2f}%  (area {change.scale ** 2 * 100:.2f}%)",
         f"rotation {change.rotation_deg:+.2f} deg  shift ({change.dx_px:+.0f}, {change.dy_px:+.0f}) px",
         f"anisotropy {change.anisotropy:.4f}  shear {change.shear_deg:+.2f} deg",
@@ -296,6 +402,7 @@ def draw_overlay(image: np.ndarray, moved: np.ndarray, dev: np.ndarray, factor: 
         f"local dev: mean {change.mean_abs_dev_px:.1f}px, "
         f"+{change.max_out_px:.0f} / {change.max_in_px:.0f} px",
         "red = sticks out, blue = pulled in (vs. uniform scale)",
+        "magenta = shoulder line, white dots = reference's shoulder line",
     ]
     font_scale = w / 1600
     thick = max(1, int(round(font_scale * 2)))
@@ -310,6 +417,7 @@ def draw_overlay(image: np.ndarray, moved: np.ndarray, dev: np.ndarray, factor: 
 CSV_HEADER = [
     "filename", "scale_pct", "area_pct", "rotation_deg", "dx_px", "dy_px",
     "anisotropy", "shear_deg", "iou", "rms_dev_pct", "mean_abs_dev_px", "max_out_px", "max_in_px",
+    "mirrored",
 ]
 
 
@@ -318,7 +426,7 @@ def csv_row(name: str, c: ShapeChange) -> list[str]:
         name, f"{c.scale * 100:.3f}", f"{c.scale ** 2 * 100:.3f}", f"{c.rotation_deg:.3f}",
         f"{c.dx_px:.1f}", f"{c.dy_px:.1f}", f"{c.anisotropy:.5f}", f"{c.shear_deg:.3f}",
         f"{c.iou:.5f}", f"{c.rms_dev_pct:.3f}", f"{c.mean_abs_dev_px:.2f}",
-        f"{c.max_out_px:.1f}", f"{c.max_in_px:.1f}",
+        f"{c.max_out_px:.1f}", f"{c.max_in_px:.1f}", "yes" if c.mirrored else "no",
     ]
 
 
@@ -329,6 +437,11 @@ def main() -> None:
     parser.add_argument(
         "--reference", type=Path, default=None,
         help="Reference image to compare against (default: first image in the directory)",
+    )
+    parser.add_argument(
+        "--align", choices=("shoulder-line", "fit"), default="shoulder-line",
+        help="How to get the rotation between frames: from the top-border shoulder line's "
+             "angle (default), or fitted by ICP along with scale and shift",
     )
     args = parser.parse_args()
 
@@ -346,14 +459,16 @@ def main() -> None:
         writer.writerow(CSV_HEADER)
         for src in files:
             image, frame = load_silhouette(src)
-            change, moved, dev = compare(ref, frame)
-            overlay = draw_overlay(image, moved, dev, frame.factor, change, f"{src.name} vs {ref_path.name}")
+            change, moved, dev, sim, used_ref = compare(ref, frame, args.align)
+            overlay = draw_overlay(
+                image, moved, dev, frame, _apply(sim, used_ref.shoulders), change, f"{src.name} vs {ref_path.name}"
+            )
             cv2.imwrite(str(args.output / src.name), overlay)
             writer.writerow(csv_row(src.name, change))
             print(
                 f"{src.name}: scale {change.scale * 100:.2f}%, rot {change.rotation_deg:+.2f} deg, "
                 f"anisotropy {change.anisotropy:.4f}, IoU {change.iou:.4f}, "
-                f"RMS dev {change.rms_dev_pct:.2f}%"
+                f"RMS dev {change.rms_dev_pct:.2f}%" + (", mirrored" if change.mirrored else "")
             )
     print(f"Results written to {csv_path}")
 
