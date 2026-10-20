@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 
 import cv2
 import pytest
@@ -40,7 +41,7 @@ def test_build_ref_and_inspect(tmp_path, good_images, capsys):
 
     res_dir = tmp_path / "results"
     assert main(["inspect", "--calibration", str(cal), "--ref", str(ref2), "-o", str(res_dir), str(test)]) == 1
-    results = {r["image"].split("/")[-1]: r for r in json.loads((res_dir / "results.json").read_text())["results"]}
+    results = {Path(r["image"]).name: r for r in json.loads((res_dir / "results.json").read_text())["results"]}
     assert results["ok.png"]["PASS"] is True
     assert results["narrow.png"]["PASS"] is False and results["narrow.png"]["reasons"]
     assert (res_dir / "ok_deviation.png").exists() and (res_dir / "narrow_deviation.png").exists()
