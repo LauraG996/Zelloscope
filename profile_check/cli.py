@@ -141,7 +141,8 @@ def cmd_show_ref(args) -> int:
             parts.append((al.apply(p.outer), al.apply(p.cavity)))
     out = args.output or Path(args.ref).with_suffix(".png")
     title = f"Reference {Path(args.ref).name} ({len(ref.parts)} parts)"
-    draw_reference(ref.outer, ref.cavity, m, out, title, parts)
+    tol = None if args.no_band else _contour_tol(args, cfg)
+    draw_reference(ref.outer, ref.cavity, m, out, title, tol, parts)
     print(f"L={m['length']} W={m['inner_width_max']} T={m['base_thickness']} outerW={m['outer_width_max']} -> {out}")
     return 0
 
@@ -184,6 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("-o", "--output", type=Path, help="PNG to write (default: next to the reference)")
     r.add_argument("--parts", action="store_true", help="also outline the parts it was built from")
     r.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
+    r.add_argument("--contour-tol", type=float, help="min/max band width in mm (default: from config)")
+    r.add_argument("--no-band", action="store_true", help="draw the ideal shape only, without min/max lines")
     c = sub.add_parser("calibrate", help="px/mm from a checkerboard target image")
     c.add_argument("image", type=Path)
     c.add_argument("--inner-corners", required=True, help="inner corners as COLSxROWS, e.g. 9x6")

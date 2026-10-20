@@ -26,8 +26,9 @@ python -m pytest            # ~1 min, synthetic images only
    leave-one-out: the reference is rebuilt from N−1 parts and the left-out part is inspected. It writes
    `refs/nmc_u.npz` plus `refs/nmc_u.report.json`.
    To see the reference shape on its own, run `python -m profile_check show-ref refs/nmc_u.npz`. It writes
-   `refs/nmc_u.png` with the length, inner width and base thickness drawn in; add `--parts` to also outline
-   the parts it was built from.
+   `refs/nmc_u.png`: the ideal shape (white) with min/max lines at −/+ the contour tolerance (blue/orange),
+   which is the band a part's outline must stay inside, plus the length, inner width and base thickness.
+   `--parts` also outlines the parts it was built from; `--no-band` draws the ideal shape only.
 3. **Inspect.**
    ```
    python -m profile_check inspect --calibration calibration.yaml --ref refs/nmc_u.npz -o results/ new/
