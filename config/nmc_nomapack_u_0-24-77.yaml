@@ -1,0 +1,61 @@
+# Zelloscope profile check - NMC NOMAPACK U 0-24/77 (blue PE-LD foam U-profile, cut-end images).
+#
+# All lengths in mm. The image scale (px/mm) is deliberately NOT part of this file: it depends on the
+# camera setup and must be passed with --px-per-mm or --calibration for every run.
+
+product: NMC NOMAPACK U 0-24/77
+
+# Dimensions from the NMC drawing. Keys must match measurement names in profile_check/measure.py.
+# TODO(NMC): confirm where the 24 mm width and the 12 mm thickness are measured. Current definitions:
+#   inner_width_max - widest cavity row, perpendicular to the profile axis
+#   base_thickness  - on the centre line, cavity bottom -> outer base (median over +-band_mm)
+#   length          - outer extent along the profile axis, base -> tips
+spec:
+  inner_width_max: {nominal: 24.0, min: 24.0, max: 27.0}   # 24 -0/+3
+  base_thickness:  {nominal: 12.0, min: 11.0, max: 13.0}   # 12 +-1
+  length:          {nominal: 77.0, min: 76.0, max: 80.0}   # 77 -1/+3
+
+# Allowed 99th-percentile |deviation| of the outer and cavity contours from the reference.
+# Taken from the spec, not from sample statistics: with only 5 good parts the spread is not representative.
+# TODO(NMC): revisit once the reference is rebuilt from more NMC-approved parts.
+contour_tolerance_mm: 1.0
+
+# Measured and reported, but never a reason to FAIL (no spec yet).
+# TODO(NMC): add limits for tip overlap / wall asymmetry when NMC provides them.
+report_only: [outer_width_max, wall_left, wall_right, wall_asym, tip_height_diff]
+
+segmentation:
+  # Foam = pixels inside this OpenCV HSV box (H 0-179, S/V 0-255).
+  # TODO: tune on the first pilot images from the NMC rig (lighting/background may differ).
+  hue: [90, 130]
+  sat_min: 80
+  val_min: 90
+  # Close + open with this kernel to remove foam-cell texture and specks.
+  cleanup_kernel_mm: 0.5
+  # If the cavity is open (legs not touching), bridge the mouth with increasingly large closings.
+  bridge_close_mm: [1.0, 2.0, 4.0, 7.0, 12.0]
+  # Mask resolution used for the bridging closings (large kernels are slow at full resolution).
+  bridge_work_px_per_mm: 5.0
+  # A hole must cover at least this fraction of the filled outer area to count as the cavity.
+  min_cavity_area_frac: 0.02
+
+measurement:
+  # Contours are resampled to this spacing before measuring / comparing.
+  contour_step_mm: 0.1
+  # base_thickness is the median over centre-line columns within +-this distance.
+  base_thickness_band_mm: 1.0
+  # Inner width is reported every N mm, measured upwards from the cavity bottom.
+  width_profile_step_mm: 5.0
+
+alignment:
+  # Raster canvas (mm frame) used for IoU alignment and mean masks.
+  canvas_res_px_per_mm: 10.0
+  coarse_res_px_per_mm: 2.5
+  canvas_size_mm: 130.0
+  # score = IoU(foam) + cavity_weight * IoU(cavity)
+  cavity_weight: 0.5
+
+reference:
+  # align to first sample -> average -> re-align to mean -> average again (= 2 iterations)
+  mean_iterations: 2
+  mask_threshold: 0.5

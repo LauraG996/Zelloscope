@@ -1,0 +1,23 @@
+[project]
+name = "zelloscope-profile-check"
+version = "0.1.0"
+description = "Zelloscope profile shape check for foam U-profiles (cut-end images)"
+requires-python = ">=3.10"
+dependencies = ["opencv-python-headless>=4.8", "numpy>=1.24", "pyyaml>=6.0"]
+
+[project.optional-dependencies]
+test = ["pytest>=7"]
+
+[project.scripts]
+zelloscope-profile = "profile_check.cli:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["profile_check"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
