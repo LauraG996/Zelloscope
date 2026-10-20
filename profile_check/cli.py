@@ -25,7 +25,7 @@ import cv2
 
 from .calibration import load_calibration, px_per_mm_from_checkerboard, save_calibration
 from .config import DEFAULT_CONFIG, load_config
-from .pipeline import expand_images, inspect_part, load_part
+from .pipeline import IMAGE_EXTS, expand_images, inspect_part, load_part
 from .reference import Reference, build_reference
 from .report import draw_overlay, summary_line
 from .segmentation import SegmentationError
@@ -45,13 +45,21 @@ def _contour_tol(args, cfg) -> float:
 def _images(args) -> list[Path]:
     files = expand_images(args.images)
     if not files and not getattr(args, "extend", None):
-        sys.exit("no input images")
+        exts = ", ".join(sorted(IMAGE_EXTS))
+        sys.exit("no input images. List image files and/or folders at the end of the command "
+                 f"(folders are searched for {exts}, not recursively); -o is the output, not the input.")
     return files
+
+
+def _check_output_not_dir(path: Path) -> None:
+    if path.is_dir():
+        sys.exit(f"-o {path} is a folder; -o is the reference file to write, e.g. -o refs/nmc_u.npz")
 
 
 def cmd_build(args) -> int:
     cfg = load_config(args.config)
     px_per_mm, tol = _scale(args), _contour_tol(args, cfg)
+    _check_output_not_dir(args.output)
     parts = []
     if args.extend:
         old = Reference.load(args.extend)
