@@ -8,6 +8,9 @@
      Add more good parts later without the original images:
        python -m profile_check build-ref --calibration calib.yaml --extend ref.npz -o ref_v2.npz new_good/
 
+     Draw the reference shape (add --parts to outline the parts it was built from):
+       python -m profile_check show-ref ref.npz --parts
+
   3) Inspect parts against the spec + reference contour:
        python -m profile_check inspect --calibration calib.yaml --ref ref.npz -o results/ test/
 
@@ -27,7 +30,9 @@ from .calibration import load_calibration, px_per_mm_from_checkerboard, save_cal
 from .config import DEFAULT_CONFIG, load_config
 from .pipeline import IMAGE_EXTS, expand_images, inspect_part, load_part
 from .reference import Reference, build_reference
-from .report import draw_overlay, summary_line
+from .geometry import align
+from .measure import measure
+from .report import draw_overlay, draw_reference, summary_line
 from .segmentation import SegmentationError
 
 
@@ -125,6 +130,22 @@ def cmd_inspect(args) -> int:
     return 0 if all_ok else 1
 
 
+def cmd_show_ref(args) -> int:
+    cfg = load_config(args.config)
+    ref = Reference.load(args.ref)
+    m = measure(ref.outer, ref.cavity, cfg.measurement)
+    parts = []
+    if args.parts:
+        for p in ref.parts:
+            al = align(p.outer, p.cavity, ref.outer, ref.cavity, cfg.alignment)
+            parts.append((al.apply(p.outer), al.apply(p.cavity)))
+    out = args.output or Path(args.ref).with_suffix(".png")
+    title = f"Reference {Path(args.ref).name} ({len(ref.parts)} parts)"
+    draw_reference(ref.outer, ref.cavity, m, out, title, parts)
+    print(f"L={m['length']} W={m['inner_width_max']} T={m['base_thickness']} outerW={m['outer_width_max']} -> {out}")
+    return 0
+
+
 def cmd_calibrate(args) -> int:
     img = cv2.imread(str(args.image), cv2.IMREAD_COLOR)
     if img is None:
@@ -158,6 +179,11 @@ def build_parser() -> argparse.ArgumentParser:
         else:
             s.add_argument("--ref", type=Path, required=True)
             s.add_argument("-o", "--outdir", type=Path, default=Path("results"))
+    r = sub.add_parser("show-ref", help="draw the reference shape to a PNG")
+    r.add_argument("ref", type=Path, help="reference .npz from build-ref")
+    r.add_argument("-o", "--output", type=Path, help="PNG to write (default: next to the reference)")
+    r.add_argument("--parts", action="store_true", help="also outline the parts it was built from")
+    r.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     c = sub.add_parser("calibrate", help="px/mm from a checkerboard target image")
     c.add_argument("image", type=Path)
     c.add_argument("--inner-corners", required=True, help="inner corners as COLSxROWS, e.g. 9x6")
@@ -168,4 +194,5 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    return {"build-ref": cmd_build, "inspect": cmd_inspect, "calibrate": cmd_calibrate}[args.cmd](args)
+    return {"build-ref": cmd_build, "inspect": cmd_inspect, "calibrate": cmd_calibrate,
+            "show-ref": cmd_show_ref}[args.cmd](args)

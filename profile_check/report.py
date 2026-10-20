@@ -4,6 +4,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .measure import line_extents
 from .pipeline import InspectionResult
 
 OVERLAY_PX_PER_MM = 8.0
@@ -42,6 +43,61 @@ def draw_overlay(ref_outer: np.ndarray, ref_cavity: np.ndarray, res: InspectionR
                               *res.reasons[:2]]):
         cv2.putText(img, line, (10, size[1] - 60 + 20 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.45,
                     (220, 220, 220), 1, cv2.LINE_AA)
+    Path(path).parent.mkdir(parents=True, exist_ok=True)
+    cv2.imwrite(str(path), img)
+
+
+def draw_reference(ref_outer: np.ndarray, ref_cavity: np.ndarray, m: dict, path: str | Path, title: str,
+                   parts: list[tuple[np.ndarray, np.ndarray]] = (), px_per_mm: float = OVERLAY_PX_PER_MM) -> None:
+    """The reference shape alone, base at the bottom, with its main dimensions and a 10 mm scale bar.
+
+    `parts` (already aligned to the reference) are drawn as thin grey outlines to show the spread.
+    """
+    pts = np.vstack([ref_outer, ref_cavity, *[p for pair in parts for p in pair]])
+    lo = pts.min(axis=0) - [OVERLAY_MARGIN_MM + 14, OVERLAY_MARGIN_MM]
+    size = np.ceil((pts.max(axis=0) + OVERLAY_MARGIN_MM - lo) * px_per_mm).astype(int)
+    size += [0, 120]                                 # room for text
+    to_px = lambda p: np.round((np.asarray(p, float) - lo) * px_per_mm + [0, 50]).astype(np.int32)
+    pt = lambda x, y: tuple(int(v) for v in to_px([x, y]))
+
+    img = np.full((size[1], size[0], 3), 30, np.uint8)
+    foam = np.zeros(img.shape[:2], np.uint8)
+    cv2.fillPoly(foam, [to_px(ref_outer)], 1)
+    cv2.fillPoly(foam, [to_px(ref_cavity)], 0)
+    img[foam > 0] = (150, 100, 40)
+    for o, c in parts:
+        cv2.polylines(img, [to_px(o), to_px(c)], True, (140, 140, 140), 1, cv2.LINE_AA)
+    cv2.polylines(img, [to_px(ref_outer), to_px(ref_cavity)], True, (255, 255, 255), 2, cv2.LINE_AA)
+
+    yellow, font = (0, 220, 255), cv2.FONT_HERSHEY_SIMPLEX
+    label = lambda text, p: cv2.putText(img, text, p, font, 0.5, yellow, 1, cv2.LINE_AA)
+    # inner width at the widest cavity row
+    y_w = ref_cavity[:, 1].max() - m["inner_width_max_height_mm"]
+    cl, cr = (v[0] for v in line_extents(ref_cavity, np.array([y_w]), axis=1))
+    cv2.line(img, pt(cl, y_w), pt(cr, y_w), yellow, 2, cv2.LINE_AA)
+    label(f"W {m['inner_width_max']:.2f}", pt(cl + 1, y_w - 1))
+    # base thickness on the centre line
+    xc = (cl + cr) / 2
+    _, yc = line_extents(ref_cavity, np.array([xc]), axis=0)
+    cv2.line(img, pt(xc, yc[0]), pt(xc, yc[0] + m["base_thickness"]), yellow, 2, cv2.LINE_AA)
+    label(f"T {m['base_thickness']:.2f}", pt(xc + 1, yc[0] + m["base_thickness"] / 2))
+    # length along the axis, left of the part
+    x_l = ref_outer[:, 0].min() - 5
+    y0, y1 = ref_outer[:, 1].min(), ref_outer[:, 1].max()
+    cv2.line(img, pt(x_l, y0), pt(x_l, y1), yellow, 2, cv2.LINE_AA)
+    label(f"L {m['length']:.2f}", pt(x_l - 13, (y0 + y1) / 2))
+    # 10 mm scale bar
+    sb = (int(10), size[1] - 75)
+    cv2.line(img, sb, (sb[0] + int(round(10 * px_per_mm)), sb[1]), (255, 255, 255), 3)
+    cv2.putText(img, "10 mm", (sb[0], sb[1] - 8), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
+
+    cv2.putText(img, title, (10, 32), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
+    lines = [f"outer width {m['outer_width_max']:.2f}  walls {m['wall_left']:.2f}/{m['wall_right']:.2f}"
+             f"  tip diff {m['tip_height_diff']:.2f}  (mm)"]
+    if parts:
+        lines.append("white = reference (mean), grey = the parts it was built from")
+    for i, line in enumerate(lines):
+        cv2.putText(img, line, (10, size[1] - 40 + 20 * i), font, 0.45, (220, 220, 220), 1, cv2.LINE_AA)
     Path(path).parent.mkdir(parents=True, exist_ok=True)
     cv2.imwrite(str(path), img)
 

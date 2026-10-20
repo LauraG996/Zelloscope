@@ -39,6 +39,9 @@ def test_build_ref_and_inspect(tmp_path, good_images, capsys):
                  "-o", str(ref2), str(tmp_path / "more.png")]) == 0
     assert json.loads(ref2.with_suffix(".report.json").read_text())["reference"]["n_parts"] == 4
 
+    assert main(["show-ref", str(ref2), "--parts"]) == 0
+    assert ref2.with_suffix(".png").exists()
+
     res_dir = tmp_path / "results"
     assert main(["inspect", "--calibration", str(cal), "--ref", str(ref2), "-o", str(res_dir), str(test)]) == 1
     results = {Path(r["image"]).name: r for r in json.loads((res_dir / "results.json").read_text())["results"]}
