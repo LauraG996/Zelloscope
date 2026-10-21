@@ -41,6 +41,8 @@ def test_build_ref_and_inspect(tmp_path, good_images, capsys):
 
     assert main(["show-ref", str(ref2), "--parts"]) == 0
     assert ref2.with_suffix(".png").exists()
+    assert main(["make-ideal", str(ref2), "--dims", "mid"]) == 0
+    assert (tmp_path / "ref2_ideal.npz").exists()
 
     res_dir = tmp_path / "results"
     assert main(["inspect", "--calibration", str(cal), "--ref", str(ref2), "-o", str(res_dir), str(test)]) == 1

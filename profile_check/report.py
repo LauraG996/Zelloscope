@@ -80,7 +80,7 @@ def draw_overlay(ref_outer: np.ndarray, ref_cavity: np.ndarray, res: InspectionR
 
 def draw_reference(ref_outer: np.ndarray, ref_cavity: np.ndarray, m: dict, path: str | Path, title: str,
                    tol: float | None = None, parts: list[tuple[np.ndarray, np.ndarray]] = (),
-                   px_per_mm: float = OVERLAY_PX_PER_MM) -> None:
+                   px_per_mm: float = OVERLAY_PX_PER_MM, shape_label: str = "mean of good parts") -> None:
     """The reference (ideal) shape, base at the bottom, with its main dimensions and a 10 mm scale bar.
 
     With `tol`, min/max lines are drawn at -/+tol around both contours: the band a part's outline must stay
@@ -130,7 +130,7 @@ def draw_reference(ref_outer: np.ndarray, ref_cavity: np.ndarray, m: dict, path:
     cv2.putText(img, title, (10, 32), font, 0.8, (255, 255, 255), 2, cv2.LINE_AA)
     lines = [f"outer width {m['outer_width_max']:.2f}  walls {m['wall_left']:.2f}/{m['wall_right']:.2f}"
              f"  tip diff {m['tip_height_diff']:.2f}  (mm)"]
-    legend = "white = ideal (mean of good parts)"
+    legend = f"white = ideal ({shape_label})"
     if tol:
         legend += f", blue = min (-{tol} mm), orange = max (+{tol} mm)"
     if parts:

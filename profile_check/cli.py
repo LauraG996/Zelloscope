@@ -11,6 +11,9 @@
      Draw the reference shape (add --parts to outline the parts it was built from):
        python -m profile_check show-ref ref.npz --parts
 
+     Optionally reshape it to the drawing's dimensions (outline kept from the parts):
+       python -m profile_check make-ideal ref.npz --dims nominal -o ref_ideal.npz
+
   3) Inspect parts against the spec + reference contour:
        python -m profile_check inspect --calibration calib.yaml --ref ref.npz -o results/ test/
 
@@ -29,7 +32,7 @@ import cv2
 from .calibration import load_calibration, px_per_mm_from_checkerboard, save_calibration
 from .config import DEFAULT_CONFIG, load_config
 from .pipeline import IMAGE_EXTS, expand_images, inspect_part, load_part
-from .reference import Reference, build_reference
+from .reference import Reference, build_reference, make_ideal, target_dimensions
 from .geometry import align
 from .measure import measure
 from .report import draw_overlay, draw_reference, summary_line
@@ -141,9 +144,42 @@ def cmd_show_ref(args) -> int:
             parts.append((al.apply(p.outer), al.apply(p.cavity)))
     out = args.output or Path(args.ref).with_suffix(".png")
     title = f"Reference {Path(args.ref).name} ({len(ref.parts)} parts)"
+    label = "mean of good parts"
+    if ref.meta.get("kind") == "ideal":
+        t = ref.meta["ideal_targets"]
+        label = (f"{ref.meta.get('ideal_mode') or 'custom'} W {t.get('inner_width_max')} "
+                 f"T {t.get('base_thickness')} L {t.get('length')}")
+        title = f"Ideal reference {Path(args.ref).name}"
     tol = None if args.no_band else _contour_tol(args, cfg)
-    draw_reference(ref.outer, ref.cavity, m, out, title, tol, parts)
+    draw_reference(ref.outer, ref.cavity, m, out, title, tol, parts, shape_label=label)
     print(f"L={m['length']} W={m['inner_width_max']} T={m['base_thickness']} outerW={m['outer_width_max']} -> {out}")
+    return 0
+
+
+def cmd_make_ideal(args) -> int:
+    cfg = load_config(args.config)
+    ref = Reference.load(args.ref)
+    targets = target_dimensions(cfg, args.dims)
+    for key, value in (("inner_width_max", args.width), ("base_thickness", args.thickness),
+                       ("length", args.length)):
+        if value is not None:
+            targets[key] = value
+    for key, v in targets.items():
+        lim = cfg.spec[key]
+        if not lim.contains(v):
+            sys.exit(f"target {key}={v} is outside the spec range [{lim.min}, {lim.max}]")
+        if v in (lim.min, lim.max):
+            print(f"note: {key}={v} is at the edge of the spec range [{lim.min}, {lim.max}]; good parts on the "
+                  f"other side of the range will deviate up to {lim.max - lim.min} mm from this shape "
+                  f"(use --dims mid to centre it)")
+    ideal = make_ideal(ref, cfg, targets, args.dims)
+    out = args.output or Path(args.ref).with_name(Path(args.ref).stem + "_ideal.npz")
+    ideal.save(out)
+    src, m = ref.meta.get("reference_measurements") or {}, ideal.meta["reference_measurements"]
+    print(f"{'':16}{'mean':>8}{'ideal':>8}")
+    for key in ("length", "inner_width_max", "base_thickness", "outer_width_max", "wall_left", "wall_right"):
+        print(f"{key:16}{src.get(key, float('nan')):8.2f}{m[key]:8.2f}")
+    print(f"ideal reference saved to {out}; use it with inspect --ref {out}")
     return 0
 
 
@@ -187,6 +223,15 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     r.add_argument("--contour-tol", type=float, help="min/max band width in mm (default: from config)")
     r.add_argument("--no-band", action="store_true", help="draw the ideal shape only, without min/max lines")
+    i = sub.add_parser("make-ideal", help="reshape a reference to the drawing's dimensions")
+    i.add_argument("ref", type=Path, help="reference .npz from build-ref (its outline is kept)")
+    i.add_argument("-o", "--output", type=Path, help="ideal reference to write (default: <ref>_ideal.npz)")
+    i.add_argument("--dims", choices=("nominal", "mid"), default="nominal",
+                   help="nominal = drawing values (24/12/77), mid = middle of each accept range (25.5/12/78)")
+    i.add_argument("--width", type=float, help="override target inner width (mm)")
+    i.add_argument("--thickness", type=float, help="override target base thickness (mm)")
+    i.add_argument("--length", type=float, help="override target length (mm)")
+    i.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     c = sub.add_parser("calibrate", help="px/mm from a checkerboard target image")
     c.add_argument("image", type=Path)
     c.add_argument("--inner-corners", required=True, help="inner corners as COLSxROWS, e.g. 9x6")
@@ -198,4 +243,4 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     return {"build-ref": cmd_build, "inspect": cmd_inspect, "calibrate": cmd_calibrate,
-            "show-ref": cmd_show_ref}[args.cmd](args)
+            "show-ref": cmd_show_ref, "make-ideal": cmd_make_ideal}[args.cmd](args)

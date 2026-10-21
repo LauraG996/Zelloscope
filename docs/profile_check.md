@@ -29,6 +29,19 @@ python -m pytest            # ~1 min, synthetic images only
    `refs/nmc_u.png`: the ideal shape (white) with min/max lines at −/+ the contour tolerance (blue/orange),
    which is the band a part's outline must stay inside, plus the length, inner width and base thickness.
    `--parts` also outlines the parts it was built from; `--no-band` draws the ideal shape only.
+   **Ideal shape from the drawing (optional).** The drawing only fixes inner width, base thickness and length,
+   so the outline still comes from the good parts; `make-ideal` reshapes the mean so those three come out
+   exactly at the drawing values. Width: only the cavity is scaled, so the outer outline is kept and the walls
+   take up the difference. Thickness/length: the profile is stretched along its axis, base zone and the rest
+   separately.
+   ```
+   python -m profile_check make-ideal refs/nmc_u.npz --dims mid -o refs/nmc_u_ideal.npz
+   ```
+   `--dims nominal` uses the drawing's nominal values (24 / 12 / 77); `--dims mid` uses the middle of each
+   accept range (25.5 / 12 / 78); `--width/--thickness/--length` override single values. Because the width
+   (24 −0/+3) and length (77 −1/+3) tolerances are one-sided, the nominal shape sits at or near the edge of
+   the accept range, and in-spec parts at the other side then fail the 1 mm contour check. Use `mid` for
+   inspection unless NMC says otherwise. Then inspect with `--ref refs/nmc_u_ideal.npz`.
 3. **Inspect.**
    ```
    python -m profile_check inspect --calibration calibration.yaml --ref refs/nmc_u.npz -o results/ new/

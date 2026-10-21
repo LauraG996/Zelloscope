@@ -109,3 +109,72 @@ def build_reference(parts: list[Part], cfg: Config, px_per_mm: float | None = No
     report = dict(samples=samples, leave_one_out=loo, reference=meta)
     meta = dict(meta, samples=samples, leave_one_out=loo)
     return Reference(ref_o, ref_c, list(parts), meta), report
+
+
+def target_dimensions(cfg: Config, mode: str = "nominal") -> dict[str, float]:
+    """Spec dimensions to shape the ideal reference to: the drawing's nominal values or the middle of each
+    accept range (these differ when the tolerance is one-sided, e.g. width 24 -0/+3)."""
+    if mode == "nominal":
+        return {k: lim.nominal for k, lim in cfg.spec.items()}
+    if mode == "mid":
+        return {k: (lim.min + lim.max) / 2 for k, lim in cfg.spec.items()}
+    raise ValueError(f"unknown target mode '{mode}' (nominal or mid)")
+
+
+def _reshape(outer: np.ndarray, cavity: np.ndarray, m: dict, t: dict) -> tuple[np.ndarray, np.ndarray]:
+    """One correction step towards the target inner width, base thickness and length (canonical frame,
+    y down, base at the bottom).
+
+    Width: only the cavity is scaled across the axis, so the outer outline is kept and the walls take up the
+    difference. Thickness / length: a piecewise-linear stretch along the axis, the base zone (cavity bottom ->
+    outer base) and the part above it separately, applied to both contours.
+    """
+    o, c = outer.copy(), cavity.copy()
+    if "inner_width_max" in t:
+        cl, cr = c[:, 0].min(), c[:, 0].max()
+        xc = (cl + cr) / 2
+        c[:, 0] = xc + (c[:, 0] - xc) * t["inner_width_max"] / m["inner_width_max"]
+
+    y_bot, y_top, y_cb = o[:, 1].max(), o[:, 1].min(), c[:, 1].max()
+    base = y_bot - y_cb
+    k_t = t.get("base_thickness", m["base_thickness"]) / m["base_thickness"]
+    new_base = base * k_t
+    new_len = t.get("length", m["length"])
+    k_l = (new_len - new_base) / (y_cb - y_top)
+
+    def ymap(y):
+        return np.where(y >= y_cb, y_bot - (y_bot - y) * k_t, y_bot - new_base - (y_cb - y) * k_l)
+
+    o[:, 1], c[:, 1] = ymap(o[:, 1]), ymap(c[:, 1])
+    return o, c
+
+
+def ideal_shape(outer: np.ndarray, cavity: np.ndarray, targets: dict[str, float], cfg: Config,
+                iterations: int = 5, tol_mm: float = 0.01) -> tuple[np.ndarray, np.ndarray]:
+    """Reshape a (mean) reference so its spec measurements equal `targets`.
+
+    The drawing only fixes these dimensions; everything else about the outline (outer width, leg lean,
+    corner and tip shape) is kept from the input shape. Iterates because the measurement definitions
+    (widest row, median over a band) do not map exactly onto the stretch.
+    """
+    unknown = set(targets) - {"inner_width_max", "base_thickness", "length"}
+    if unknown:
+        raise ValueError(f"don't know how to reshape for {sorted(unknown)}")
+    o, c = outer, cavity
+    for _ in range(iterations):
+        m = measure(o, c, cfg.measurement)
+        if all(abs(m[k] - v) <= tol_mm for k, v in targets.items()):
+            break
+        o, c = _reshape(o, c, m, targets)
+        o, c = canonicalize(o, c)
+    step = cfg.measurement.contour_step_mm
+    return resample(o, step), resample(c, step)
+
+
+def make_ideal(ref: Reference, cfg: Config, targets: dict[str, float], mode: str = "") -> Reference:
+    o, c = ideal_shape(ref.outer, ref.cavity, targets, cfg)
+    meta = dict(ref.meta, kind="ideal", ideal_targets=targets, ideal_mode=mode,
+                source_reference_measurements=ref.meta.get("reference_measurements"),
+                reference_measurements=measure(o, c, cfg.measurement),
+                created=dt.datetime.now().isoformat(timespec="seconds"))
+    return Reference(o, c, list(ref.parts), meta)

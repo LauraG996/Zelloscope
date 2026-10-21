@@ -51,3 +51,30 @@ def test_save_load_and_extend(cfg, built, good_parts, tmp_path):
     extra = part_from_image(syn.render(angle_deg=300, seed=42), syn.PX_PER_MM, cfg, name="new")
     bigger, _ = build_reference(loaded.parts + [extra], cfg, run_loo=False)
     assert bigger.meta["n_parts"] == 6
+
+
+@pytest.mark.parametrize("mode", ["nominal", "mid"])
+def test_ideal_shape_hits_drawing_dimensions(cfg, built, mode):
+    from profile_check.reference import make_ideal, target_dimensions
+    ref, _ = built
+    targets = target_dimensions(cfg, mode)
+    ideal = make_ideal(ref, cfg, targets, mode)
+    m = measure(ideal.outer, ideal.cavity, cfg.measurement)
+    for key, value in targets.items():
+        assert m[key] == pytest.approx(value, abs=0.05), key
+    # The outline the drawing doesn't specify is kept from the mean shape.
+    src = measure(ref.outer, ref.cavity, cfg.measurement)
+    assert m["outer_width_max"] == pytest.approx(src["outer_width_max"], abs=0.1)
+    assert ideal.meta["kind"] == "ideal"
+
+
+def test_mid_range_ideal_passes_good_and_fails_bad(cfg, built, sample_image):
+    from conftest import SAMPLE_SHAPE
+    from profile_check.pipeline import inspect_part
+    from profile_check.reference import make_ideal, target_dimensions
+    ref, _ = built
+    ideal = make_ideal(ref, cfg, target_dimensions(cfg, "mid"), "mid")
+    good = part_from_image(syn.warp(sample_image, 65, mirror=True), syn.PX_PER_MM, cfg)
+    bad = part_from_image(syn.render(angle_deg=20, sx=0.93, **SAMPLE_SHAPE), syn.PX_PER_MM, cfg)
+    assert inspect_part(good, ideal.outer, ideal.cavity, cfg).passed
+    assert not inspect_part(bad, ideal.outer, ideal.cavity, cfg).passed
