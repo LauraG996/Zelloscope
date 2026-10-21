@@ -3,6 +3,7 @@ import base64
 import datetime as dt
 import html
 import io
+from pathlib import Path
 
 import matplotlib
 
@@ -32,7 +33,7 @@ plt.rcParams.update({
 
 def _png(fig) -> str:
     buf = io.BytesIO()
-    fig.savefig(buf, format="png", dpi=110, bbox_inches="tight")
+    fig.savefig(buf, format="png", dpi=140, bbox_inches="tight")
     plt.close(fig)
     return base64.b64encode(buf.getvalue()).decode()
 
@@ -240,232 +241,458 @@ def fig_relaxation(a: Analysis) -> str | None:
 
 # ---------------- HTML -----------------
 
-def _img(b64: str, alt: str) -> str:
-    return f'<img alt="{html.escape(alt)}" src="data:image/png;base64,{b64}">'
+FONTS = ("https://fonts.googleapis.com/css2?family=Barlow+Semi+Condensed:wght@600;700&"
+         "family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap")
+
+CSS = """
+/* Layout: one reading column; findings first (tiles + two finding cards), evidence sections below,
+   figures sit on light 'paper' panels in both themes because the charts are rendered on paper. */
+:root{
+  --bg:#f2f4f7; --surface:#ffffff; --paper:#fcfcfb; --ink:#11151b; --ink2:#47505d; --muted:#778190;
+  --paper-ink:#11151b; --paper-ink2:#47505d;  /* text on the always-light figure paper */
+  --line:#dce1e8; --accent:#1c5cab; --accent-soft:#e2ecf8; --crit:#c23434; --crit-soft:#fbe9e9;
+  --warn:#8a5a00; --warn-soft:#fdf1d6; --ok:#0b7a0b; --ok-soft:#e3f4e3; --bar:#2a78d6;
+  --display:"Barlow Semi Condensed","Arial Narrow",system-ui,sans-serif;
+  --body:"IBM Plex Sans",system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono:"IBM Plex Mono",ui-monospace,"SFMono-Regular",Consolas,monospace;
+}
+@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){
+  --bg:#0e1115; --surface:#161a20; --ink:#e7ebf0; --ink2:#b2bbc7; --muted:#8a94a3; --line:#2a313b;
+  --accent:#86b6ef; --accent-soft:#18283c; --crit:#ef8585; --crit-soft:#3a1d1f; --warn:#f2c35a;
+  --warn-soft:#352a12; --ok:#6fcf6f; --ok-soft:#163018; --bar:#3987e5; color-scheme:dark}}
+:root[data-theme="dark"]{
+  --bg:#0e1115; --surface:#161a20; --ink:#e7ebf0; --ink2:#b2bbc7; --muted:#8a94a3; --line:#2a313b;
+  --accent:#86b6ef; --accent-soft:#18283c; --crit:#ef8585; --crit-soft:#3a1d1f; --warn:#f2c35a;
+  --warn-soft:#352a12; --ok:#6fcf6f; --ok-soft:#163018; --bar:#3987e5; color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.6 var(--body)}
+body::before{content:"";position:fixed;inset:0 0 auto;height:env(safe-area-inset-top,0px);z-index:10;background:var(--surface)}
+.wrap{max-width:1120px;margin:0 auto;padding-left:max(16px,env(safe-area-inset-left,0px));
+  padding-right:max(16px,env(safe-area-inset-right,0px))}
+header.hero{background:var(--surface);border-bottom:1px solid var(--line)}
+header.hero .wrap{padding-block:32px 24px;display:grid;gap:14px}
+.eyebrow{font:500 12px/1 var(--mono);letter-spacing:.08em;text-transform:uppercase;color:var(--muted)}
+h1{font:700 clamp(30px,5vw,46px)/1.05 var(--display);margin:0;letter-spacing:.005em;text-wrap:balance}
+h1 .sub{display:block;font:500 17px/1.4 var(--body);color:var(--ink2);margin-top:8px;letter-spacing:0}
+.specs{display:flex;flex-wrap:wrap;gap:8px}
+.spec{font:500 13px/1 var(--mono);border:1px solid var(--line);border-radius:4px;padding:7px 10px;color:var(--ink2);
+  background:var(--bg)}
+.spec b{color:var(--ink);font-weight:500}
+.meta{display:flex;flex-wrap:wrap;gap:6px 18px;color:var(--ink2);font-size:13px}
+.meta span{white-space:nowrap}
+.badge{display:inline-flex;align-items:center;gap:6px;font:600 12px/1 var(--body);text-transform:uppercase;
+  letter-spacing:.06em;color:var(--warn);background:var(--warn-soft);border-radius:999px;padding:6px 10px;
+  justify-self:start}
+nav.toc{position:sticky;top:env(safe-area-inset-top,0px);z-index:5;background:color-mix(in srgb,var(--bg) 92%,transparent);
+  backdrop-filter:blur(6px);border-bottom:1px solid var(--line)}
+nav.toc .wrap{display:flex;gap:4px;overflow-x:auto;padding-block:8px;scrollbar-width:none}
+nav.toc a{flex:none;color:var(--ink2);text-decoration:none;font-size:13px;padding:5px 10px;border-radius:6px}
+nav.toc a:hover,nav.toc a:focus-visible{background:var(--accent-soft);color:var(--accent);outline:none}
+main .wrap{padding-block:28px 72px;display:grid;gap:44px}
+section{display:grid;gap:16px;min-width:0;scroll-margin-top:60px}
+h2{font:700 26px/1.15 var(--display);margin:0;text-wrap:balance}
+h3{font:600 15px/1.3 var(--body);margin:0}
+p{margin:0} .lead{color:var(--ink2);max-width:72ch}
+.tiles{display:grid;grid-template-columns:repeat(auto-fit,minmax(170px,1fr));gap:12px}
+.tile{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:14px 16px;display:grid;gap:4px;min-width:0}
+.tile .k{font-size:12px;color:var(--muted);text-transform:uppercase;letter-spacing:.06em}
+.tile .v{font:600 30px/1.1 var(--display);font-variant-numeric:tabular-nums}
+.tile .v small{font:500 15px var(--body);color:var(--ink2);margin-left:4px}
+.tile .d{font-size:13px;color:var(--ink2)}
+@media (max-width:560px){.tile:last-child:nth-child(odd){grid-column:1/-1}}
+.tile.crit{border-left:4px solid var(--crit)} .tile.warn{border-left:4px solid var(--warn)}
+.grid2{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.card{background:var(--surface);border:1px solid var(--line);border-radius:8px;padding:18px 20px;display:grid;
+  gap:14px;align-content:start;min-width:0}
+.mode{display:grid;grid-template-columns:64px 1fr;gap:4px 12px;align-items:center}
+.mode .n{font:500 12px var(--mono);color:var(--muted)}
+.mode .bar{height:8px;background:var(--accent-soft);border-radius:4px;overflow:hidden}
+.mode .bar i{display:block;height:100%;background:var(--bar);border-radius:4px}
+.mode .txt{grid-column:2;font-size:14px}
+.mode .txt b{font-variant-numeric:tabular-nums}
+.flag{display:grid;grid-template-columns:auto 1fr;gap:2px 12px;align-items:baseline;padding-bottom:12px;
+  border-bottom:1px solid var(--line)}
+.flag:last-child{border-bottom:0;padding-bottom:0}
+.flag .t{font:500 15px var(--mono)}
+.flag .why{grid-column:2;font-size:14px;color:var(--ink2)}
+.pill{display:inline-flex;align-items:center;gap:4px;font:600 11px/1 var(--body);letter-spacing:.04em;
+  text-transform:uppercase;border-radius:999px;padding:4px 8px;white-space:nowrap}
+.pill.crit{color:var(--crit);background:var(--crit-soft)} .pill.warn{color:var(--warn);background:var(--warn-soft)}
+.pill.ok{color:var(--ok);background:var(--ok-soft)} .pill.info{color:var(--accent);background:var(--accent-soft)}
+.callout{background:var(--warn-soft);border-radius:8px;padding:16px 20px;display:grid;gap:6px}
+.callout h3{color:var(--warn)}
+.callout p{max-width:80ch}
+ul.plain{margin:0;padding-left:18px;display:grid;gap:6px}
+figure{margin:0;background:var(--paper);border:1px solid var(--line);border-radius:8px;padding:12px;display:grid;
+  gap:10px;min-width:0}
+figure img{display:block;width:100%;height:auto}
+figure.narrow{max-width:560px}
+figcaption{font-size:13px;color:var(--paper-ink2)}
+figcaption b{color:var(--paper-ink)}
+.figs2{display:grid;grid-template-columns:repeat(auto-fit,minmax(340px,1fr));gap:16px;align-items:start}
+.tw{overflow-x:auto;background:var(--surface);border:1px solid var(--line);border-radius:8px}
+table{border-collapse:collapse;font-size:13px;width:100%}
+th,td{padding:7px 12px;text-align:right;white-space:nowrap;border-bottom:1px solid var(--line)}
+tbody tr:last-child td{border-bottom:0}
+th{font-weight:600;font-size:12px;color:var(--ink2);background:var(--bg);position:sticky;top:0}
+td{font-family:var(--mono);font-size:12.5px;font-variant-numeric:tabular-nums}
+td.txt{font-family:var(--body);font-size:13px;white-space:normal;min-width:220px;text-align:left}
+td:first-child,th:first-child{text-align:left}
+tr.hl td{background:var(--crit-soft)}
+details{background:var(--surface);border:1px solid var(--line);border-radius:8px}
+details>summary{cursor:pointer;padding:12px 16px;font-weight:600;font-size:14px;color:var(--ink2);list-style:none}
+details>summary::before{content:"+";display:inline-block;width:18px;color:var(--accent);font-family:var(--mono)}
+details[open]>summary::before{content:"\\2212"}
+details>summary:focus-visible{outline:2px solid var(--accent);outline-offset:2px;border-radius:8px}
+details>.tw{border:0;border-top:1px solid var(--line);border-radius:0 0 8px 8px}
+.note{font-size:13px;color:var(--muted);max-width:80ch}
+.cols2{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:16px}
+footer{border-top:1px solid var(--line);color:var(--muted);font-size:12px}
+footer .wrap{padding-block:20px 32px}
+a{color:var(--accent)}
+@media (prefers-reduced-motion:reduce){*{scroll-behavior:auto!important}}
+html{scroll-behavior:smooth}
+"""
+
+LABELS = {
+    "name": "Part", "timestamp": "Time", "process_window": "Process window", "mirrored": "Mirrored",
+    "visible_depth_mm": "Visible depth (mm)", "T2": "T²", "T2_limit": "T² limit",
+    "shape_abnormal": "Shape", "main_mode": "Main mode", "SPE": "Residual", "SPE_limit": "Residual limit",
+    "new_deformation": "New deformation", "spec_ok": "Spec", "inner_width_max": "Inner width (mm)",
+    "base_thickness": "Base (mm)", "outer_width_max": "Outer width (mm)", "wall_left": "Left wall (mm)",
+    "wall_right": "Right wall (mm)", "cavity_width_mid": "Cavity mid (mm)", "lean_left_deg": "Left lean (°)",
+    "lean_right_deg": "Right lean (°)", "length": "Length (mm)", "feature": "Feature", "target": "Target",
+    "rho": "ρ", "p": "p", "q": "q", "n": "n",
+}
 
 
-def _table(df, cols=None, max_rows=200) -> str:
+def _label(c: str) -> str:
+    return LABELS.get(c, c.replace("_", " "))
+
+
+def _pill(kind: str, text: str) -> str:
+    glyph = {"crit": "▲", "warn": "●", "ok": "✓", "info": "•"}[kind]
+    return f'<span class="pill {kind}" aria-label="{html.escape(text)}">{glyph} {html.escape(text)}</span>'
+
+
+def _fmt(col: str, v):
+    """Cell HTML: flags become labelled pills, numbers are compact, times short."""
+    if col in ("shape_abnormal",):
+        return _pill("crit", "Abnormal") if v else _pill("ok", "Normal")
+    if col == "new_deformation":
+        return _pill("crit", "Yes") if v else "–"
+    if col == "spec_ok" or col.endswith("_ok"):
+        return _pill("ok", "In spec") if v else _pill("warn", "Out")
+    if isinstance(v, (bool, np.bool_)):
+        return "yes" if v else "no"
+    if isinstance(v, (float, np.floating)):
+        return "" if np.isnan(v) else (f"{v:.3g}" if abs(v) < 1000 else f"{v:.0f}")
+    if isinstance(v, dt.datetime):
+        return v.strftime("%Y-%m-%d %H:%M")
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return ""
+    return html.escape(str(v))
+
+
+def _table(df, cols=None, max_rows=500, highlight=None, text_cols=()) -> str:
     df = df if cols is None else df[[c for c in cols if c in df.columns]]
-    head = "".join(f"<th>{html.escape(str(c))}</th>" for c in df.columns)
+    head = "".join(f"<th>{html.escape(_label(str(c)))}</th>" for c in df.columns)
     body = []
-    for _, r in df.head(max_rows).iterrows():
-        cells = []
-        for v in r:
-            if isinstance(v, (bool, np.bool_)):
-                v = "yes" if v else "no"
-            elif isinstance(v, float):
-                v = "" if np.isnan(v) else f"{v:.3g}" if abs(v) < 1000 else f"{v:.0f}"
-            elif isinstance(v, (dt.datetime,)):
-                v = v.strftime("%Y-%m-%d %H:%M")
-            cells.append(f"<td>{html.escape(str(v))}</td>")
-        body.append("<tr>" + "".join(cells) + "</tr>")
+    for i, (_, r) in enumerate(df.head(max_rows).iterrows()):
+        cls = ' class="hl"' if highlight is not None and bool(highlight.iloc[i]) else ""
+        cells = "".join(f'<td{" class=txt" if c in text_cols else ""}>{_fmt(c, v)}</td>' for c, v in r.items())
+        body.append(f"<tr{cls}>{cells}</tr>")
     return f'<div class="tw"><table><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
 
 
-def summary_points(a: Analysis) -> list[str]:
+class _Figures:
+    def __init__(self):
+        self.n = 0
+
+    def __call__(self, b64: str, title: str, caption: str, narrow: bool = False) -> str:
+        self.n += 1
+        return (f'<figure{" class=narrow" if narrow else ""}><img alt="{html.escape(title)}" '
+                f'src="data:image/png;base64,{b64}"><figcaption><b>Figure {self.n}. {html.escape(title)}.</b> '
+                f'{caption}</figcaption></figure>')
+
+
+def _spec_tag(name: str, lim) -> str:
+    lo, hi = lim.nominal - lim.min, lim.max - lim.nominal
+    tol = f"±{lo:g}" if abs(lo - hi) < 1e-9 else f"−{lo:g}/+{hi:g}"
+    return f'<span class="spec">{html.escape(_label(name).split(" (")[0])} <b>{lim.nominal:g} {tol}</b> mm</span>'
+
+
+def _stability_pill(a: Analysis, i: int) -> str:
+    if not a.stability:
+        return ""
+    c = a.stability["cos_median"][i]
+    return _pill("ok", "stable") if c >= 0.9 else _pill("info", "fairly stable") if c >= 0.7 else \
+        _pill("warn", "not yet stable")
+
+
+def _flag_reasons(a: Analysis, r) -> list[str]:
+    why = []
+    if r["shape_abnormal"]:
+        md = int(r["main_mode"][2:]) - 1
+        name = a.modes[md]["name"].split(";")[0] if md < len(a.modes) else ""
+        why.append(f"unusual amount of mode {md + 1}" + (f" ({name})" if name else ""))
+    if r["new_deformation"]:
+        why.append("a deformation the other parts don't have")
+    for k, lim in a.cfg.spec.spec.items():
+        if f"{k}_ok" in r and not r[f"{k}_ok"]:
+            why.append(f"{_label(k).split(' (')[0].lower()} {r[k]:.2f} mm (spec {lim.min:g}–{lim.max:g})")
+    return why
+
+
+def _head(a: Analysis) -> str:
+    return (f"<title>{html.escape(a.cfg['product'].replace('NMC ', '').split(' 0-')[0])} Shape Variation</title>\n"
+            f'<meta name="claude:viewport-fit-sides" content="cover">\n'
+            f'<link rel="preconnect" href="https://fonts.googleapis.com">'
+            f'<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>'
+            f'<link rel="stylesheet" href="{FONTS}">\n<style>{CSS}</style>\n')
+
+
+def render_html(a: Analysis, standalone: bool = True) -> str:
+    """The report. standalone=False leaves out <html>/<head>/<body> (for hosts that wrap the page themselves)."""
     t, m = a.table, a.model
     n = len(t)
-    pts = []
+    fig = _Figures()
+    out = []
+    add = out.append
     days = sorted({ts.date().isoformat() for ts in t["timestamp"] if ts is not None and ts == ts})
-    view = (f"within {a.depth_mm:.1f} mm of the base (the tips are outside the frame)" if not a.closed
-            else "over the whole outline")
-    pts.append(f"{n} parts analysed{(' from ' + ', '.join(days)) if days else ''}; "
-               f"{len(a.skipped)} image(s) skipped. Shapes are compared {view}.")
+    flagged = t[t["shape_abnormal"] | t["new_deformation"]]
+    spec_out = int((~t["spec_ok"]).sum())
     kept = 100 * m.explained[: m.n_keep].sum()
-    pts.append(f"{m.n_keep} modes describe {kept:.0f} % of the shape variation. The largest:")
-    for md in a.modes[:3]:
-        stab = ""
+
+    # ---- header
+    add('<header class="hero"><div class="wrap">')
+    add('<div class="eyebrow">Zelloscope · shape-variation report</div>')
+    add(f'<h1>{html.escape(a.cfg["product"])}<span class="sub">Cut-end cross-sections of blue PE-LD foam '
+        f'U-profiles: how the whole shape varies from part to part.</span></h1>')
+    add('<div class="specs">' + "".join(_spec_tag(k, v) for k, v in a.cfg.spec.spec.items()) +
+        f'<span class="spec">Contour tolerance <b>{a.cfg.spec.contour_tolerance_mm:g}</b> mm</span></div>')
+    add('<div class="meta">' +
+        f'<span>{n} parts · {", ".join(days) if days else "no timestamps"}</span>' +
+        (f'<span>Window {a.depth_mm:.1f} mm from the base</span>' if not a.closed else '<span>Full outline</span>') +
+        f'<span>Generated {dt.datetime.now():%Y-%m-%d %H:%M}</span></div>')
+    if n < 30:
+        add(f'<span class="badge">● Provisional · only {n} parts</span>')
+    add('</div></header>')
+
+    sections = [("summary", "Summary"), ("shape", "Shape model"), ("thickness", "Wall thickness"),
+                ("drift", "Drift"), ("anomalies", "Anomalies"), ("cells", "Cells"), ("links", "Links"),
+                ("extrusion", "After extrusion"), ("next", "Next steps"), ("data", "Data")]
+    add('<nav class="toc" aria-label="Sections"><div class="wrap">' +
+        "".join(f'<a href="#{i}">{html.escape(l)}</a>' for i, l in sections) + '</div></nav>')
+    add('<main><div class="wrap">')
+
+    # ---- summary
+    add('<section id="summary"><h2>Summary</h2><div class="tiles">')
+    add(f'<div class="tile"><span class="k">Parts analysed</span><span class="v">{n}</span>'
+        f'<span class="d">{len(a.skipped)} image(s) skipped</span></div>')
+    add(f'<div class="tile"><span class="k">Shape modes</span><span class="v">{m.n_keep}</span>'
+        f'<span class="d">cover {kept:.0f} % of the variation</span></div>')
+    add(f'<div class="tile{" crit" if len(flagged) else ""}"><span class="k">Abnormal shapes</span>'
+        f'<span class="v">{len(flagged)}<small>of {n}</small></span><span class="d">vs. the other parts</span></div>')
+    add(f'<div class="tile{" warn" if spec_out else ""}"><span class="k">Outside drawing limits</span>'
+        f'<span class="v">{spec_out}<small>of {n}</small></span><span class="d">as measured here</span></div>')
+    add('<div class="tile"><span class="k">Compared over</span><span class="v">'
+        + (f'{a.depth_mm:.1f}<small>mm</small></span><span class="d">from the base; tips out of frame</span>'
+           if not a.closed else 'full<small>outline</small></span><span class="d">tips included</span>') + '</div>')
+    add('</div><div class="grid2">')
+
+    add('<div class="card"><h3>How the shape varies</h3>')
+    for md in a.modes[:4]:
+        i = md["mode"] - 1
+        add(f'<div class="mode"><span class="n">Mode {md["mode"]}</span><span class="bar"><i style="width:'
+            f'{100 * md["explained"]:.1f}%"></i></span><span class="txt"><b>{100 * md["explained"]:.0f} %</b> · '
+            f'{html.escape(md["name"])} {_stability_pill(a, i)}</span></div>')
+    add('<p class="note">Mode = one independent way the shape changes. "Stable" = the same mode comes back when the '
+        'parts are resampled.</p></div>')
+
+    add('<div class="card"><h3>Parts to look at</h3>')
+    if len(flagged):
+        for _, r in flagged.iterrows():
+            ts = r["timestamp"]
+            when = ts.strftime("%H:%M") if isinstance(ts, dt.datetime) else ""
+            pw = r.get("process_window")
+            add(f'<div class="flag"><span class="t">{when}</span><span>{_pill("crit", "Abnormal")} '
+                f'<span class="note">{html.escape(r["name"])}{(" · " + html.escape(str(pw))) if isinstance(pw, str) else ""}'
+                f'</span></span><span class="why">{html.escape("; ".join(_flag_reasons(a, r)))}</span></div>')
+    else:
+        add('<p>No part has an abnormal shape compared with the others.</p>')
+    add('</div></div>')
+
+    if spec_out:
+        rows = []
+        for k in ("inner_width_max", "base_thickness"):
+            if k in t:
+                lim = a.cfg.spec.spec[k]
+                rows.append(f"{_label(k).split(' (')[0]}: median {t[k].median():.2f} mm, range "
+                            f"{t[k].min():.2f}–{t[k].max():.2f} mm (drawing {lim.min:g}–{lim.max:g} mm)")
+        add('<div class="callout"><h3>Open question for NMC</h3><p>' + html.escape(
+            f"{spec_out} of {n} parts are outside the drawing limits as measured here. "
+            "Before treating them as rejects, NMC needs to confirm where the 24 mm width and the 12 mm "
+            "thickness are measured.") + '</p><p class="note" style="color:inherit">' +
+            "<br>".join(html.escape(x) for x in rows) + '</p></div>')
+
+    signals = [(k, sorted({v['rule'] for v in c['violations']}), len({v['index'] for v in c['violations']}))
+               for k, c in a.charts.items() if c["violations"]]
+    if signals:
+        add('<div class="card"><h3>Drift signals</h3><ul class="plain">' + "".join(
+            f'<li><b>{html.escape(_label(k))}</b>: {html.escape(", ".join(r))} ({c} point{"s" if c > 1 else ""})</li>'
+            for k, r, c in signals) + '</ul></div>')
+    add('</section>')
+
+    # ---- shape model
+    add('<section id="shape"><h2>Shape model</h2>')
+    add('<p class="lead">Every part is aligned to the mean shape by rotation and position, and mirrored where the '
+        'other cut end was imaged. There is no scaling, so size differences stay in the model. Each mode is one '
+        'independent way the shape varies.</p>')
+    add('<div class="figs2">')
+    add(fig(fig_overlay(a), "All parts on the mean shape", "Grey: each aligned part. Black: the mean. "
+            "Base at the bottom, legs up."))
+    add(fig(fig_variance(a), "Share of the variation per mode", f"Bars: each mode. Line: running total. "
+            f"Modes up to the dashed line ({100 * a.cfg['shape_model']['variance_keep']:.0f} %) are kept."))
+    add('</div>')
+    add(fig(fig_modes(a), "The modes", "Grey: mean shape. Blue and orange: the mean moved 2 standard deviations "
+            "each way along the mode. Displacements are magnified so the change is visible; the table gives the "
+            "real sizes."))
+    rows = []
+    for md in a.modes:
+        i = md["mode"] - 1
+        r = {"Mode": md["mode"], "Share": f"{100 * md['explained']:.1f} %", "What changes (+2 sd)": md["name"],
+             "RMS per sd (mm)": md["rms_mm_per_sd"]}
         if a.stability:
-            c = a.stability["cos_median"][md["mode"] - 1]
-            stab = " (reproducible)" if c >= 0.9 else " (not yet reproducible with this many parts)" if c < 0.7 \
-                else " (fairly reproducible)"
-        pts.append(f"&nbsp;&nbsp;Mode {md['mode']} ({100 * md['explained']:.0f} %){stab}: {html.escape(md['name'])}.")
-    for k in ("inner_width_max", "base_thickness"):
-        if k in t:
-            lim = a.cfg.spec.spec.get(k)
-            out = int((~t[f"{k}_ok"]).sum()) if f"{k}_ok" in t else 0
-            pts.append(f"{k.replace('_', ' ')}: median {t[k].median():.2f} mm (range {t[k].min():.2f}-{t[k].max():.2f})"
-                       + (f"; {out} of {n} outside {lim.min}-{lim.max} mm as measured here" if lim else "") + ".")
+            r["Stability"] = a.stability["cos_median"][i]
+            r["Share, 90 % range"] = (f"{100 * a.stability['explained_p05'][i]:.0f}–"
+                                      f"{100 * a.stability['explained_p95'][i]:.0f} %")
+        rows.append(r)
+    add(_table(pd.DataFrame(rows), text_cols=("What changes (+2 sd)",)))
+    add('<details><summary>Feature changes per mode, from −2 sd to +2 sd</summary>' +
+        _table(pd.DataFrame([dict(mode=md["mode"], **md["deltas"]) for md in a.modes])) + '</details>')
+    add('<p class="note">Stability is the median |cos| between a mode and its match when the parts are resampled '
+        '(bootstrap). Near 1: the same mode every time. Below about 0.7: the data does not pin the mode down yet.</p>')
+    add('</section>')
+
+    # ---- thickness
+    add('<section id="thickness"><h2>Wall thickness</h2>')
     if a.thickness is not None and len(a.thickness_grid):
         mean = np.nanmean(a.thickness, axis=0)
         sd = np.nanstd(a.thickness, axis=0)
         i0 = int(np.argmin(np.abs(a.thickness_grid)))
         j = int(np.nanargmax(sd))
-        pts.append(f"Wall thickness: {mean[i0]:.2f} mm at the base centre, {np.nanmin(mean):.2f}-{np.nanmax(mean):.2f} mm "
-                   f"along the U; parts differ most at {a.thickness_grid[j]:+.0f} mm from the base centre "
-                   f"(sd {sd[j]:.2f} mm).")
-    signals = [(k, sorted({v['rule'] for v in c['violations']}), len({v['index'] for v in c['violations']}))
-               for k, c in a.charts.items() if c["violations"]]
-    if signals:
-        pts.append("Drift / SPC signals: " + "; ".join(f"{k} ({', '.join(r)}; {c} point(s))" for k, r, c in signals)
-                   + ".")
+        add(f'<p class="lead">Measured along the middle of the foam (the medial axis) from the left leg, through the '
+            f'base, to the right leg. Mean {mean[i0]:.2f} mm at the base centre and {np.nanmin(mean):.2f}–'
+            f'{np.nanmax(mean):.2f} mm along the U. Parts differ most {abs(a.thickness_grid[j]):.0f} mm from the '
+            f'base centre on the {"right" if a.thickness_grid[j] > 0 else "left"} (sd {sd[j]:.2f} mm).</p>')
+        add(fig(fig_thickness(a), "Thickness along the U", "Top: mean and range of all parts. Bottom: each part's "
+                "difference from the mean, parts in time order; red is thicker, blue thinner."))
     else:
-        pts.append("No SPC signals on the charted modes and dimensions.")
-    ab = t[t["shape_abnormal"] | t["new_deformation"]]
-    if len(ab):
-        items = []
-        for _, r in ab.iterrows():
-            why = []
-            if r["shape_abnormal"]:
-                md = int(r["main_mode"][2:]) - 1
-                why.append(f"unusual amount of mode {md + 1}" + (f" ({a.modes[md]['name'].split(';')[0]})"
-                                                                 if md < len(a.modes) else ""))
-            if r["new_deformation"]:
-                why.append("a deformation not seen in the other parts")
-            items.append(f"{r['name']}: {', '.join(why)}")
-        pts.append("Abnormal shapes: " + html.escape("; ".join(items)) + ".")
-    else:
-        pts.append("No part has an abnormal shape relative to the others.")
-    if isinstance(a.correlations, dict) and len(a.correlations["table"]):
-        top = a.correlations["table"].iloc[0]
-        sig = (a.correlations["table"]["q"] < 0.05).sum()
-        pts.append(f"Strongest link: {top['feature']} vs {top['target']} (Spearman rho {top['rho']:+.2f}, n {top['n']}); "
-                   f"{sig} link(s) survive the multiple-testing correction (q < 0.05). Exploratory only.")
-    return pts
+        add('<p>Not available.</p>')
+    add('</section>')
 
+    # ---- drift
+    add('<section id="drift"><h2>Drift</h2>')
+    add('<p class="lead">Control charts of the main modes and dimensions, parts in time order. Limits come from the '
+        'parts themselves. A signal is a point beyond the limits, 8 in a row on one side of the centre line, or '
+        '6 steadily rising or falling. Shaded bands mark the process-change windows (proc. N).</p>')
+    add(fig(fig_control_charts(a), "Control charts", "Solid: centre line. Dashed: ±3 sigma limits. "
+            "Red ring: a signal. PC<i>n</i> is shape mode <i>n</i>."))
+    add('</section>')
 
-CSS = """
-:root{--surface:#fcfcfb;--bg:#f4f3f0;--ink:#0b0b0b;--ink2:#52514e;--muted:#898781;--line:#e1e0d9;--crit:#d03b3b}
-@media (prefers-color-scheme: dark){:root:not([data-theme="light"]){--surface:#1a1a19;--bg:#111110;--ink:#f0efec;
---ink2:#c3c2b7;--muted:#9a998f;--line:#383835}}
-:root[data-theme="dark"]{--surface:#1a1a19;--bg:#111110;--ink:#f0efec;--ink2:#c3c2b7;--muted:#9a998f;--line:#383835}
-body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.5 system-ui,-apple-system,"Segoe UI",sans-serif}
-main{max-width:1100px;margin:0 auto;padding:24px 16px 64px}
-h1{font-size:26px;margin:0 0 4px} h2{font-size:19px;margin:36px 0 8px;border-top:1px solid var(--line);padding-top:20px}
-.sub{color:var(--ink2);margin:0 0 20px}
-section.card{background:var(--surface);border:1px solid var(--line);border-radius:10px;padding:16px 20px}
-img{max-width:100%;height:auto;border-radius:6px;background:#fcfcfb}
-.tw{overflow-x:auto} table{border-collapse:collapse;font-size:12px;margin:8px 0}
-th,td{border-bottom:1px solid var(--line);padding:4px 8px;text-align:right;white-space:nowrap}
-th{color:var(--ink2);font-weight:600} td:first-child,th:first-child{text-align:left}
-ul.sum li{margin:4px 0} .warn{color:var(--crit)} .note{color:var(--ink2);font-size:13px}
-details{margin:8px 0} summary{cursor:pointer;color:var(--ink2)}
-"""
+    # ---- anomalies
+    add('<section id="anomalies"><h2>Anomalies</h2>')
+    add(f'<p class="lead">T² measures how far a part is from all the other parts in the first {a.t2["k"]} modes; '
+        f'above its limit (α = {a.cfg["monitoring"]["t2_alpha"]}) the shape is abnormal. The residual catches a '
+        'deformation that a model built without the part cannot explain. The spec check is independent of both.</p>')
+    add(fig(fig_anomaly(a), "Distance from the other parts", "Each part's T² divided by its limit; "
+            "above 1 the shape is abnormal.", narrow=True))
+    ts = t.sort_values("T2", ascending=False)
+    add(_table(ts, ["name", "T2", "T2_limit", "shape_abnormal", "main_mode", "SPE", "SPE_limit", "new_deformation",
+                    "inner_width_max", "base_thickness", "spec_ok"] + (["length"] if a.closed else []),
+               highlight=(ts["shape_abnormal"] | ts["new_deformation"])))
+    add('</section>')
 
-
-def render_html(a: Analysis) -> str:
-    t = a.table
-    parts = []
-    add = parts.append
-    add(f"<!doctype html><html lang='en'><head><meta charset='utf-8'><meta name='viewport' "
-        f"content='width=device-width,initial-scale=1'><title>Shape Variation Report</title><style>{CSS}</style>"
-        f"</head><body><main>")
-    add(f"<h1>Shape variation - {html.escape(a.cfg['product'])}</h1>")
-    add(f"<p class='sub'>Generated {dt.datetime.now():%Y-%m-%d %H:%M} from {len(a.records)} image(s); "
-        f"config {html.escape(a.cfg.source)}</p>")
-
-    add("<h2>Summary</h2><section class='card'><ul class='sum'>")
-    for p in summary_points(a):
-        add(f"<li>{p}</li>")
-    add("</ul><p class='note'>With few parts every number here is provisional: modes, limits and correlations "
-        "will move as more parts are added.</p></section>")
-
-    add("<h2>Data</h2>")
-    used = t[["name", "timestamp", "process_window", "mirrored", "visible_depth_mm"]].copy()
-    used["scale (mm/px)"] = [s.record.mm_per_px for s in a.shapes]
-    used["scale from"] = [s.record.scale_source for s in a.shapes]
-    add(_table(used))
-    if a.skipped:
-        add("<p class='warn'>Skipped images:</p><ul>" +
-            "".join(f"<li>{html.escape(n)}: {html.escape(r)}</li>" for n, r in a.skipped) + "</ul>")
-
-    add("<h2>Shape model</h2>")
-    add("<p>All parts aligned to their mean (rotation and position, mirrored where the other cut end was imaged; "
-        "no scaling, so size differences stay in the model). Each mode is one independent way the shape varies; "
-        "the plots show the mean shape and the shape at -2 and +2 standard deviations along the mode.</p>")
-    add(_img(fig_overlay(a), "all aligned parts with the mean shape"))
-    add(_img(fig_modes(a), "mode plots"))
-    add(_img(fig_variance(a), "explained variance per mode"))
-    rows = []
-    for md in a.modes:
-        r = dict(mode=md["mode"], explained=f"{100 * md['explained']:.1f} %", name=md["name"],
-                 rms_mm_per_sd=md["rms_mm_per_sd"])
-        if a.stability:
-            i = md["mode"] - 1
-            r["stability (median |cos|)"] = a.stability["cos_median"][i]
-            r["explained 90% interval"] = (f"{100 * a.stability['explained_p05'][i]:.0f}-"
-                                           f"{100 * a.stability['explained_p95'][i]:.0f} %")
-        rows.append(r)
-    add(_table(pd.DataFrame(rows)))
-    add("<details><summary>Feature changes per mode (from -2 sd to +2 sd)</summary>" +
-        _table(pd.DataFrame([dict(mode=md["mode"], **md["deltas"]) for md in a.modes])) + "</details>")
-    add("<p class='note'>Stability: |cos| between each mode and the matching mode of PCA on resampled parts "
-        "(bootstrap). Near 1 = the same mode every time; below ~0.7 = the mode is not yet pinned down by the data.</p>")
-
-    add("<h2>Wall thickness</h2>")
-    if a.thickness is not None and len(a.thickness_grid):
-        add("<p>Thickness = 2 x the distance from the medial axis (skeleton) of the foam to its nearest edge, along "
-            "the U from the left end through the base to the right end.</p>")
-        add(_img(fig_thickness(a), "wall thickness profile and heat map"))
-    else:
-        add("<p>Not available.</p>")
-
-    add("<h2>Drift (control charts)</h2>")
-    add("<p>Parts in time order. Limits from the parts themselves (individuals chart, sigma from the moving range). "
-        "Signals: a point beyond the limits, 8 in a row on one side, or 6 steadily rising/falling. Grey bands and "
-        "labels (proc. N) mark the configured process-change windows. PCn = shape mode n.</p>")
-    add(_img(fig_control_charts(a), "control charts"))
-
-    add("<h2>Anomalies</h2>")
-    add(f"<p>T² = distance of a part from the others in the first {a.t2['k']} modes, each part compared with "
-        f"all <em>other</em> parts (Hotelling limit at alpha = {a.cfg['monitoring']['t2_alpha']}). "
-        "Residual (SPE) = shape change the model built without that part cannot explain - a new kind of "
-        "deformation. The hard spec check is listed alongside and is independent of both.</p>")
-    add(_img(fig_anomaly(a), "anomaly ranking"))
-    add(_table(t.sort_values("T2", ascending=False),
-               ["name", "T2", "T2_limit", "shape_abnormal", "main_mode", "SPE", "SPE_limit", "new_deformation",
-                "spec_ok", "inner_width_max", "base_thickness"] + (["length"] if a.closed else [])))
-
-    add("<h2>Cell structure</h2>")
+    # ---- cells
+    add('<section id="cells"><h2>Cell structure</h2>')
     if isinstance(a.cells, dict):
-        add(f"<p>{sum(a.cells['n_cells'])} cells in {len(a.cells['n_cells'])} parts (cells touching the foam edge are "
-            "left out, so density reads slightly low in the outermost bins). Maps average all parts in the "
-            "aligned frame.</p>")
-        add(_img(fig_cell_maps(a), "cell maps"))
+        add(f'<p class="lead">{sum(a.cells["n_cells"]):,} cells in {len(a.cells["n_cells"])} parts. Cells touching '
+            'the foam edge are left out, so density reads slightly low in the outermost bins. The maps average all '
+            'parts in the aligned frame.</p>')
+        add(fig(fig_cell_maps(a), "Cell maps", "Mean cell diameter, cells per mm² and elongation "
+                "(long axis / short axis) in 2 mm bins, with the mean outline."))
         cell_cols = [c for c in t.columns if c.startswith("cell_")]
-        add(_table(t, ["name"] + cell_cols))
+        add('<details><summary>Cell features per part</summary>' + _table(t, ["name"] + cell_cols) + '</details>')
     else:
-        add(f"<p>{html.escape(str(a.cells))}</p>")
+        add(f'<p class="lead">{html.escape(str(a.cells))}. Run <code>analyze --cells</code> to include it.</p>')
+    add('</section>')
 
-    add("<h2>Links to cells / process</h2>")
+    # ---- links
+    add('<section id="links"><h2>Links to cells and process</h2>')
     if isinstance(a.correlations, dict):
-        add(f"<p>Spearman rank correlations (n = {a.correlations['n']}), sorted by strength. q = p-value corrected for "
-            "testing many pairs (Benjamini-Hochberg); only q &lt; 0.05 is worth following up, and with this little "
-            "data even that needs confirming on new parts.</p>")
-        add(_table(a.correlations["table"].head(25)))
+        tab = a.correlations["table"]
+        sig = int((tab["q"] < 0.05).sum()) if len(tab) else 0
+        add(f'<p class="lead">Spearman rank correlations between cell or process features and the shape '
+            f'(n = {a.correlations["n"]}). q corrects for testing many pairs; {sig} link(s) have q &lt; 0.05. '
+            'With this little data, treat every link as a lead to check on new parts.</p>')
+        add(_table(tab.head(15), highlight=tab.head(15)["q"] < 0.05))
         for target, f in a.correlations["forests"].items():
-            imp = ", ".join(f"{k} {v:.3f}" for k, v in f["importance"][:5])
-            add(f"<p class='note'>Random forest for {target}: leave-one-out R² = {f['loo_r2']} "
-                f"(&le; 0 means no predictive value); top features by permutation importance: {html.escape(imp)}.</p>")
+            imp = ", ".join(f"{k} ({v:.3f})" for k, v in f["importance"][:4])
+            verdict = "no predictive value" if f["loo_r2"] <= 0 else "some predictive value"
+            add(f'<p class="note">Random forest for {html.escape(target)}: leave-one-out R² = {f["loo_r2"]} '
+                f'({verdict}). Most used features: {html.escape(imp)}.</p>')
     else:
-        add(f"<p>{html.escape(str(a.correlations))}</p>")
+        add(f'<p class="lead">{html.escape(str(a.correlations))}.</p>')
+    add('</section>')
 
-    add("<h2>Shape change after extrusion</h2>")
+    # ---- extrusion
+    add('<section id="extrusion"><h2>Shape change after extrusion</h2>')
     if isinstance(a.relaxation, dict):
         rel = fig_relaxation(a)
         if rel:
-            add(_img(rel, "relaxation fits"))
-        rows = [dict(target=k, tau_min=round(v["tau"], 1), tau_se=round(v["tau_se"], 1),
-                     settles_after_min=round(v["settle_min"], 0), amplitude=round(v["amplitude"], 3),
-                     r2=round(v["r2"], 3), early_pred_rmse=round(v["early_prediction"]["rmse"], 3),
-                     no_model_rmse=round(v["early_prediction"]["rmse_without_model"], 3))
+            add(fig(rel, "Relaxation fits", "Points: repeated images of the same parts. Lines: the fitted "
+                    "exponential. Dashed: time to 95 % settled."))
+        rows = [{"Measure": k, "τ (min)": round(v["tau"], 1), "±": round(v["tau_se"], 1),
+                 "Settled after (min)": round(v["settle_min"], 0), "Change": round(v["amplitude"], 3),
+                 "R²": round(v["r2"], 3), "Early-image error": round(v["early_prediction"]["rmse"], 3),
+                 "Error without model": round(v["early_prediction"]["rmse_without_model"], 3)}
                 for k, v in a.relaxation.items() if "tau" in v]
         add(_table(pd.DataFrame(rows)))
     else:
-        add(f"<p>Not possible with this data: {html.escape(a.relaxation)}.</p>")
+        add(f'<p class="lead">Not possible with this data: {html.escape(a.relaxation)}. The model is ready; it needs '
+            'the same marked parts imaged several times after extrusion.</p>')
+    add('</section>')
 
-    add("<h2>What could not be done, and what to collect next</h2><section class='card'><p><strong>Not done / "
-        "limitations</strong></p><ul>")
-    for s in a.not_done:
-        add(f"<li>{html.escape(s)}</li>")
-    add("</ul><p><strong>Collect next</strong></p><ul>")
-    for s in a.collect_next:
-        add(f"<li>{html.escape(s)}</li>")
-    add("</ul></section>")
+    # ---- next steps
+    add('<section id="next"><h2>What could not be done, and what to collect next</h2><div class="cols2">')
+    add('<div class="card"><h3>Not possible yet</h3><ul class="plain">' +
+        "".join(f"<li>{html.escape(s)}</li>" for s in a.not_done) + '</ul></div>')
+    add('<div class="card"><h3>Collect next</h3><ul class="plain">' +
+        "".join(f"<li>{html.escape(s)}</li>" for s in a.collect_next) + '</ul></div>')
+    add('</div></section>')
 
-    add("<h2>All parts</h2>")
+    # ---- data
+    add('<section id="data"><h2>Data</h2>')
+    used = t[["name", "timestamp", "process_window", "mirrored", "visible_depth_mm"]].copy()
+    used["Scale (mm/px)"] = [s.record.mm_per_px for s in a.shapes]
+    used["Scale from"] = [Path(s.record.scale_source).name if s.record.scale_source != "png-metadata"
+                          else "PNG metadata" for s in a.shapes]
+    add(_table(used))
+    if a.skipped:
+        add('<div class="callout"><h3>Skipped images</h3><ul class="plain">' + "".join(
+            f"<li>{html.escape(nm)}: {html.escape(r)}</li>" for nm, r in a.skipped) + '</ul></div>')
     cols = ["name", "timestamp", "process_window"] + [k for k in KEY_DIMS if k in t] + \
            [c for c in t.columns if c.startswith("PC")] + ["T2", "spec_ok"]
-    add(_table(t, cols))
-    add("</main></body></html>")
-    return "\n".join(parts)
+    add('<details><summary>All measurements per part</summary>' + _table(t, cols) + '</details>')
+    add('</section>')
+
+    add('</div></main>')
+    add(f'<footer><div class="wrap">Zelloscope shape_variation · config {html.escape(Path(a.cfg.source).name)} '
+        f'· spec {html.escape(Path(a.cfg.spec.source).name)}</div></footer>')
+    body = "\n".join(out)
+    if not standalone:
+        return _head(a) + body
+    return ("<!doctype html><html lang='en'><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1,viewport-fit=cover'>"
+            + _head(a) + "</head><body>" + body + "</body></html>")
