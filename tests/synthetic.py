@@ -16,16 +16,22 @@ CAVITY_BGR = (22, 22, 26)
 
 
 def profile_mm(length=78.0, inner_width=25.5, base_thickness=12.0, outer_width=46.0, lean=4.0,
-               tip_solid=7.0, n=400):
-    """(outer, cavity) polygons in mm, y up, x centred, base at y=0."""
+               tip_solid=7.0, n=400, lean_right=None):
+    """(outer, cavity) polygons in mm, y up, x centred, base at y=0. `lean_right` (default = lean) lets the
+    right leg's outside lean differently, making the part asymmetric (so mirror images can be told apart)."""
     L, W, T, Wo = length, inner_width, base_thickness, outer_width
     r = 6.0                                  # base corner radius
     y = np.linspace(0.0, L, n)
-    h = np.where(y < r, Wo / 2 - r + r * np.clip(1 - (np.clip(r - y, 0, r) / r) ** 2.5, 0, 1) ** (1 / 2.5),
-                 Wo / 2 - lean * (y - r) / (L - r))
     dome = 8.0
-    h = np.where(y > L - dome, h * np.sqrt(np.clip(1 - ((y - (L - dome)) / dome) ** 2, 0, 1)), h)
-    outer = np.vstack([np.column_stack([h, y]), np.column_stack([-h[::-1], y[::-1]])])
+
+    def half_width(lean_):
+        h = np.where(y < r, Wo / 2 - r + r * np.clip(1 - (np.clip(r - y, 0, r) / r) ** 2.5, 0, 1) ** (1 / 2.5),
+                     Wo / 2 - lean_ * (y - r) / (L - r))
+        return np.where(y > L - dome, h * np.sqrt(np.clip(1 - ((y - (L - dome)) / dome) ** 2, 0, 1)), h)
+
+    h_r = half_width(lean if lean_right is None else lean_right)
+    h_l = half_width(lean)
+    outer = np.vstack([np.column_stack([h_r, y]), np.column_stack([-h_l[::-1], y[::-1]])])
 
     y_top = L - tip_solid
     yc = np.linspace(T, y_top, n)
@@ -50,13 +56,13 @@ def _fill(shape, polys, ppm_shift=4):
     return m.astype(np.float32) / 255
 
 
-def render(angle_deg=0.0, sx=1.0, sy=1.0, gap_mm=0.0, seam_mm=0.15, glare=True, seed=0,
+def render(angle_deg=0.0, sx=1.0, sy=1.0, gap_mm=0.0, seam_mm=0.15, glare=True, seed=0, offset_px=(0, 0),
            size=IMAGE_SIZE, ppm=PX_PER_MM, **shape):
     """BGR image of the profile. sx/sy scale the part's width/length (for out-of-spec variants)."""
     rng = np.random.default_rng(seed)
     outer, cavity = profile_mm(**shape)
     L = shape.get("length", 78.0)
-    centre = np.array([size / 2, size / 2])
+    centre = np.array([size / 2, size / 2]) + offset_px     # offset_px moves the part (e.g. tips out of frame)
     tf = lambda pts: _to_image(pts, centre, angle_deg, ppm, sx, sy, y_mid=L / 2)
     hw = shape.get("inner_width", 25.5)
 
