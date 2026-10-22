@@ -22,7 +22,15 @@ The analysis never guesses the scale. For each image it uses, in this order:
    source: confirmed by Laura Guerrero 2026-10-21
    ```
 
-Images with neither are reported and skipped. Cropped or resized exports have a different scale than the raw
+Images with neither are reported and skipped. If the value Zelloscope stored in a PNG is wrong (e.g. it was
+calibrated for another zoom setting), give that file its own entry in `scale.yaml`; an entry for a file wins
+over the PNG value:
+
+```yaml
+mm_per_px: 0.014019
+files:
+  capture_sample_20261022T112322.png: {mm_per_px: 0.020, source: "20 um/px, wider field of view"}
+``` Cropped or resized exports have a different scale than the raw
 frame: give them their own folder and `scale.yaml`, or don't use them.
 
 ## Optional per-folder metadata

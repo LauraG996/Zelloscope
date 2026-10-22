@@ -19,6 +19,7 @@ import yaml
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 _TIME_RE = re.compile(r"(\d{4}-\d{2}-\d{2})[_ T](\d{2})[-:](\d{2})(?:[-:](\d{2}))?")
+_COMPACT_TIME_RE = re.compile(r"(\d{4})(\d{2})(\d{2})T(\d{2})(\d{2})(\d{2})")      # e.g. capture_20261022T112322
 
 
 @dataclass
@@ -82,17 +83,34 @@ def zelloscope_metadata(path: Path) -> dict:
     return {}
 
 
-def _folder_scale(folder: Path) -> tuple[float | None, str]:
+def _folder_scale(folder: Path) -> tuple[tuple[float | None, str], dict[str, tuple[float, str]]]:
+    """The folder's default scale and per-file scales from its scale.yaml / scale.json:
+
+        mm_per_px: 0.014019            # default for the images in this folder
+        files:                         # optional: images with a different scale
+          capture_x.png: {mm_per_px: 0.020, source: "..."}
+    """
     for name in ("scale.yaml", "scale.yml", "scale.json"):
         p = folder / name
-        if p.exists():
-            data = json.loads(p.read_text()) if p.suffix == ".json" else yaml.safe_load(p.read_text())
+        if not p.exists():
+            continue
+        data = (json.loads(p.read_text()) if p.suffix == ".json" else yaml.safe_load(p.read_text())) or {}
+        files = {}
+        for fname, entry in (data.get("files") or {}).items():
             try:
-                v = float(data["mm_per_px"])
+                v = float(entry["mm_per_px"] if isinstance(entry, dict) else entry)
             except (TypeError, KeyError, ValueError):
-                return None, f"{p} has no valid mm_per_px"
-            return (v, str(p)) if v > 0 else (None, f"{p}: mm_per_px must be > 0")
-    return None, "no ZelloscopeData scale in the PNG and no scale.yaml in its folder"
+                continue
+            if v > 0:
+                files[fname] = (v, f"{p} (entry for {fname})")
+        if "mm_per_px" not in data:
+            return (None, f"{p} has no default mm_per_px"), files
+        try:
+            v = float(data["mm_per_px"])
+        except (TypeError, ValueError):
+            return (None, f"{p} has no valid mm_per_px"), files
+        return ((v, str(p)) if v > 0 else (None, f"{p}: mm_per_px must be > 0")), files
+    return (None, "no ZelloscopeData scale in the PNG and no scale.yaml in its folder"), {}
 
 
 def parse_timestamp(path: Path, zmeta: dict) -> dt.datetime | None:
@@ -104,7 +122,14 @@ def parse_timestamp(path: Path, zmeta: dict) -> dt.datetime | None:
                 pass
     m = _TIME_RE.search(path.stem)
     if not m:
-        return None
+        c = _COMPACT_TIME_RE.search(path.stem)
+        if not c:
+            return None
+        y, mo, d_, hh, mm, ss = c.groups()
+        try:
+            return dt.datetime(int(y), int(mo), int(d_), int(hh), int(mm), int(ss))
+        except ValueError:
+            return None
     d, hh, mm, ss = m.groups()
     try:
         return dt.datetime.fromisoformat(f"{d}T{hh}:{mm}:{ss or '00'}")
@@ -135,9 +160,13 @@ def discover(inputs, exclude: tuple[str, ...] = ()) -> list[ImageRecord]:
     for f in files:
         if f.parent not in folder_cache:
             folder_cache[f.parent] = (_folder_scale(f.parent), _parts_csv(f.parent))
-        (fscale, fsource), parts = folder_cache[f.parent]
+        ((fscale, fsource), per_file), parts = folder_cache[f.parent]
         zmeta = zelloscope_metadata(f)
-        if "p2mm" in zmeta:
+        # an explicit entry for this file wins (e.g. the PNG carries a scale from another zoom setting),
+        # then the scale Zelloscope stored in the PNG, then the folder default
+        if f.name in per_file:
+            scale, source = per_file[f.name]
+        elif "p2mm" in zmeta:
             scale, source = float(zmeta["p2mm"]), "png-metadata"
         else:
             scale, source = fscale, fsource

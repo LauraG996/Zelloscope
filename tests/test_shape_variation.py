@@ -84,6 +84,18 @@ def test_scale_from_png_metadata_beats_folder_file(tmp_path):
     assert r.timestamp.isoformat() == "2026-08-27T09:36:00"
 
 
+def test_per_file_scale_beats_png_metadata(tmp_path):
+    meta = base64.b64encode(json.dumps({"p2mm": 0.008063}).encode()).decode()
+    _png_with_itxt(tmp_path / "capture_sample_20261022T112322.png", "ZelloscopeData", meta)
+    _png_with_itxt(tmp_path / "other.png", "ZelloscopeData", meta)
+    (tmp_path / "scale.yaml").write_text("mm_per_px: 0.014\nfiles:\n  capture_sample_20261022T112322.png:\n"
+                                         "    mm_per_px: 0.020\n")
+    recs = {r.path.name: r for r in discover([tmp_path])}
+    assert recs["capture_sample_20261022T112322.png"].mm_per_px == pytest.approx(0.020)
+    assert recs["capture_sample_20261022T112322.png"].timestamp.isoformat() == "2026-10-22T11:23:22"
+    assert recs["other.png"].mm_per_px == pytest.approx(0.008063)          # no entry: PNG value as before
+
+
 def test_unknown_scale_is_reported_not_guessed(tmp_path):
     cv2.imwrite(str(tmp_path / "a.png"), np.zeros((8, 8, 3), np.uint8))
     r = discover([tmp_path])[0]
@@ -93,7 +105,7 @@ def test_unknown_scale_is_reported_not_guessed(tmp_path):
 
 def test_excluded_products(cfg):
     names = [r.path.name for r in discover([REAL_IMAGE.parent], tuple(cfg["exclude"]))]
-    assert "squarefoam2.png" not in names and len(names) == 11
+    assert "squarefoam2.png" not in names and sum(n.startswith("2026-06-04") for n in names) == 11
 
 
 # ---------------- segmentation -----------------

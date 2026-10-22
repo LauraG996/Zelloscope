@@ -2,3 +2,10 @@
 # squarefoam2.png is a different product and carries its own scale in its PNG metadata.
 mm_per_px: 0.014019
 source: confirmed by Laura Guerrero 2026-10-21
+
+# Images with a different scale. The capture below carries p2mm 0.008063 in its PNG metadata, which does not
+# match its field of view; an entry here wins over the PNG value.
+files:
+  capture_sample_20261022T112322.png:
+    mm_per_px: 0.020
+    source: "20 um/px, confirmed by Laura Guerrero 2026-10-22 (wider field of view, painted sample)"
