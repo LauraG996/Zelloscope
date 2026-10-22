@@ -146,12 +146,12 @@ def cmd_shrink(args) -> int:
     files = dict(old.get("files") or {})
     n = skipped = 0
     for r in discover(args.inputs, tuple(cfg["exclude"])):
-        if r.mm_per_px is None:
+        mm_per_px = r.mm_per_px or args.mm_per_px
+        if mm_per_px is None:
             print(f"{r.path.name}: skipped - scale unknown ({r.scale_source}); add a scale.yaml next to the images "
                   "or pass --mm-per-px")
             skipped += 1
             continue
-        mm_per_px = args.mm_per_px or r.mm_per_px
         img = cv2.imread(str(r.path), cv2.IMREAD_UNCHANGED)
         if img is None:
             print(f"{r.path.name}: skipped - cannot read")
@@ -169,7 +169,7 @@ def cmd_shrink(args) -> int:
         cv2.imwrite(str(dst), small, [cv2.IMWRITE_PNG_COMPRESSION, 9])
         new_scale = mm_per_px * w / size[0]
         files[dst.name] = {"mm_per_px": round(new_scale, 7),
-                           "source": f"{r.path.name}: {mm_per_px} mm/px, resized {w} -> {size[0]} px"}
+                           "source": f"{r.path.name}: {mm_per_px} mm/px{'' if r.mm_per_px else ' (--mm-per-px)'}, resized {w} -> {size[0]} px"}
         n += 1
         print(f"{r.path.name} -> {dst}  ({new_scale:.6f} mm/px, {dst.stat().st_size / 1e6:.1f} MB)")
     if n:

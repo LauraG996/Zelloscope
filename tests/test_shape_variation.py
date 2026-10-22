@@ -305,6 +305,14 @@ def test_cli_shrink_keeps_scale_and_dimensions(dataset, cfg, tmp_path):
     (r_big,), (r_small,) = discover([src]), discover([out])
     assert r_small.path.name == src.name and r_small.timestamp == r_big.timestamp
     assert r_small.mm_per_px == pytest.approx(2 / PPM, rel=2e-3)
+    # frames without any scale: --mm-per-px supplies it
+    bare = tmp_path / "bare"
+    bare.mkdir()
+    (bare / src.name).write_bytes(src.read_bytes())
+    assert sv_main(["shrink", str(bare), "-o", str(tmp_path / "s2"), "--px-per-mm", str(PPM / 2)]) == 1
+    assert sv_main(["shrink", str(bare), "-o", str(tmp_path / "s2"), "--px-per-mm", str(PPM / 2),
+                    "--mm-per-px", str(1 / PPM)]) == 0
+    assert discover([tmp_path / "s2"])[0].mm_per_px == pytest.approx(r_small.mm_per_px)
     big = extract(prepare(r_big, cfg), 50.0, 200, 200)
     small = extract(prepare(r_small, cfg), 50.0, 200, 200)
     assert np.abs(big.cavity_curve - small.cavity_curve).max() < 0.1
