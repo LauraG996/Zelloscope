@@ -121,7 +121,8 @@ the images (`overlay`), not against manual counts or Zelloscope's own cell measu
   definitions in `profile_check/measure.py`.
 * TODO(NMC): the tolerance for tip overlap / asymmetry. It is only measurable with the wider field of view.
   It is reported and never fails a part.
-* TODO(NMC): which day the process-change windows (`process_windows` in the config) belong to, and what changed.
+* Feed rate on 4 June: 60 → 57 → 55 → 58 → 60 kg/h (`process_windows` in the config; each part gets a
+  `feed_rate_kg_h` column used in the correlations). TODO(NMC): exact switch times, and the settings on 27 August.
 * The wider field of view (whole cross-section), for length, tips and legs closing at the mouth.
 * Repeated images of marked parts at fixed times after extrusion, for the relaxation model.
 * Process settings per image (line speed, melt/die temperature, cooling, batch / material lot).

@@ -49,15 +49,26 @@ class Analysis:
     collect_next: list[str] = field(default_factory=list)
 
 
-def process_window(ts: dt.datetime | None, cfg) -> str | None:
+def _window(ts: dt.datetime | None, cfg) -> dict | None:
     pw = cfg.get("process_windows")
     if not pw or ts is None or str(ts.date()) != str(pw.get("date")):
         return None
     hm = ts.strftime("%H:%M")
     for w in pw["windows"]:
         if (w["start"] is None or hm >= w["start"]) and (w["end"] is None or hm < w["end"]):
-            return w["label"]
+            return w
     return None
+
+
+def process_window(ts: dt.datetime | None, cfg) -> str | None:
+    w = _window(ts, cfg)
+    return w["label"] if w else None
+
+
+def process_settings(ts: dt.datetime | None, cfg) -> dict:
+    """Settings given on the part's process window (e.g. feed_rate_kg_h): every key except start/end/label."""
+    w = _window(ts, cfg) or {}
+    return {k: v for k, v in w.items() if k not in ("start", "end", "label")}
 
 
 def choose_depth(preps, cfg) -> float | None:
@@ -131,7 +142,8 @@ def run(inputs, cfg: AnalysisConfig, with_cells: bool = False, reference_names=N
         row["spec_ok"] = all(row[f"{k}_ok"] for k in cfg.spec.spec if f"{k}_ok" in row)
         for i in range(model.n_keep):
             row[f"PC{i + 1}"] = round(float(sc[i]), 4)
-        row.update(s.record.meta)
+        row.update(process_settings(s.record.timestamp, cfg))
+        row.update(s.record.meta)              # parts.csv wins over the window settings
         rows.append(row)
     table = pd.DataFrame(rows)
 

@@ -297,6 +297,17 @@ def test_cli_overlay(dataset, tmp_path):
     assert img is not None and img.shape[0] > 900
 
 
+def test_feed_rate_from_process_window(cfg):
+    import datetime as dt
+
+    from shape_variation.pipeline import process_settings, process_window
+    t = dt.datetime(2026, 6, 4, 13, 16, 5)
+    assert process_window(t, cfg) == "55 kg/h"
+    assert process_settings(t, cfg) == {"feed_rate_kg_h": 55}
+    assert process_settings(dt.datetime(2026, 6, 4, 9, 16), cfg)["feed_rate_kg_h"] == 60
+    assert process_settings(dt.datetime(2026, 8, 27, 13, 16), cfg) == {}
+
+
 def test_cli_shrink_keeps_scale_and_dimensions(dataset, cfg, tmp_path):
     d, truth = dataset
     src = d / f"{truth[0]['name']}.png"

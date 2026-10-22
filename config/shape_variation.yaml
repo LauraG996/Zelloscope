@@ -43,17 +43,18 @@ monitoring:
   run_length: 8             # SPC run rule: this many points in a row on one side of the centre line
   trend_length: 6           # SPC trend rule: this many points steadily rising or falling
 
-# Time windows with different process settings. Back-calculated from plots/4june_vs_27aug_plot.svg on the
-# sweet-bell branch; the plot overlays two days on one time-of-day axis.
-# TODO(NMC): confirm which day these windows belong to and what changed (feed rate?).
+# Time windows with different process settings, from plots/4june_vs_27aug_plot (moving average 30 min): the
+# material feed rate was changed 60 -> 57 -> 55 -> 58 -> 60 kg/h during 4 June (NMC, 2026-10-22). Any key besides
+# start/end/label becomes a column per part and is used in the correlations. Images 11:51-12:55 were not taken.
+# TODO(NMC): exact switch times (read off the plot) and whether 27 Aug used the same sequence.
 process_windows:
   date: 2026-06-04
   windows:
-    - {start: null,    end: "11:10", label: "Process change 1"}
-    - {start: "11:10", end: "12:57", label: "Process change 2"}
-    - {start: "12:57", end: "13:55", label: "Process change 3"}
-    - {start: "13:55", end: "14:56", label: "Process change 4"}
-    - {start: "14:56", end: null,    label: "Process change 5"}
+    - {start: null,    end: "11:10", label: "60 kg/h (start)", feed_rate_kg_h: 60}
+    - {start: "11:10", end: "12:57", label: "57 kg/h",         feed_rate_kg_h: 57}
+    - {start: "12:57", end: "13:55", label: "55 kg/h",         feed_rate_kg_h: 55}
+    - {start: "13:55", end: "14:56", label: "58 kg/h",         feed_rate_kg_h: 58}
+    - {start: "14:56", end: null,    label: "60 kg/h (end)",   feed_rate_kg_h: 60}
 
 cells:
   seed_smooth_mm: 0.2       # ported from cell_segmentation.py (14 px / 28 px at 0.014019 mm/px)
