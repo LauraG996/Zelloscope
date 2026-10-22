@@ -13,6 +13,7 @@ python -m shape_variation scales data/nmc_u/2026-06-04            # check every 
 python -m shape_variation analyze data/nmc_u/2026-06-04 data/nmc_u/2026-08-27 -o results/variation --cells
 python -m shape_variation score --model results/variation/model.npz new_images/ -o results/new.csv
 python -m shape_variation overlay data/nmc_u/2026-06-04 -o results/overlays          # check the segmentation
+python -m shape_variation shrink D:/raw/2026-06-04 -o data/nmc_u/2026-06-04  # raw frames -> 40 px/mm + scale.yaml
 ```
 
 `overlay` draws, over each image, the foam and cavity outlines, the window cut and every cell boundary. Measured

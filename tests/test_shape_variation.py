@@ -297,6 +297,19 @@ def test_cli_overlay(dataset, tmp_path):
     assert img is not None and img.shape[0] > 900
 
 
+def test_cli_shrink_keeps_scale_and_dimensions(dataset, cfg, tmp_path):
+    d, truth = dataset
+    src = d / f"{truth[0]['name']}.png"
+    out = tmp_path / "small"
+    assert sv_main(["shrink", str(src), "-o", str(out), "--px-per-mm", str(PPM / 2)]) == 0
+    (r_big,), (r_small,) = discover([src]), discover([out])
+    assert r_small.path.name == src.name and r_small.timestamp == r_big.timestamp
+    assert r_small.mm_per_px == pytest.approx(2 / PPM, rel=2e-3)
+    big = extract(prepare(r_big, cfg), 50.0, 200, 200)
+    small = extract(prepare(r_small, cfg), 50.0, 200, 200)
+    assert np.abs(big.cavity_curve - small.cavity_curve).max() < 0.1
+
+
 def test_surface_intercepts_recover_flattened_layer(cfg):
     """Synthetic slab, 40 px/mm: three layers of flattened cells (0.4 mm deep x 1.2 mm wide) under the top
     surface, then round 0.8 mm cells. The intercept method must see the flattening and a round core."""

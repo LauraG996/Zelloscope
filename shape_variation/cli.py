@@ -12,6 +12,9 @@
   Check which images have a known scale (nothing else is done):
       python -m shape_variation scales data/nmc_u
 
+  Shrink raw frames to the resolution the analysis uses (40 px/mm), to keep the repo small:
+      python -m shape_variation shrink D:/zelloscope/2026-06-04 -o data/nmc_u/2026-06-04
+
 Scale: from the ZelloscopeData PNG metadata or a scale.yaml (mm_per_px) in the image folder - never guessed;
 images without one are listed and skipped. Settings: config/shape_variation.yaml (--config).
 """
@@ -128,6 +131,57 @@ def cmd_scales(args) -> int:
     return 1 if missing else 0
 
 
+def cmd_shrink(args) -> int:
+    """Resize every image to --px-per-mm and write a scale.yaml with each file's exact new scale. Nothing is lost
+    for the analysis: shapes are worked at 20 px/mm and cells/walls at 40 px/mm."""
+    import cv2
+    import yaml
+
+    from .io import _COMPACT_TIME_RE, _TIME_RE
+    cfg = load_config(args.config)
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    scale_file = out / "scale.yaml"
+    old = (yaml.safe_load(scale_file.read_text()) or {}) if scale_file.exists() else {}
+    files = dict(old.get("files") or {})
+    n = skipped = 0
+    for r in discover(args.inputs, tuple(cfg["exclude"])):
+        if r.mm_per_px is None:
+            print(f"{r.path.name}: skipped - scale unknown ({r.scale_source}); add a scale.yaml next to the images "
+                  "or pass --mm-per-px")
+            skipped += 1
+            continue
+        mm_per_px = args.mm_per_px or r.mm_per_px
+        img = cv2.imread(str(r.path), cv2.IMREAD_UNCHANGED)
+        if img is None:
+            print(f"{r.path.name}: skipped - cannot read")
+            skipped += 1
+            continue
+        h, w = img.shape[:2]
+        f = min(1.0, args.px_per_mm * mm_per_px)
+        size = (max(1, round(w * f)), max(1, round(h * f)))
+        small = cv2.resize(img, size, interpolation=cv2.INTER_AREA) if f < 1 else img
+        # the PNG metadata (scale, time) is not copied, so the time must be in the name
+        name = r.path.stem
+        if r.timestamp and not (_TIME_RE.search(name) or _COMPACT_TIME_RE.search(name)):
+            name = r.timestamp.strftime("%Y-%m-%d_%H-%M-%S")
+        dst = out / f"{name}.png"
+        cv2.imwrite(str(dst), small, [cv2.IMWRITE_PNG_COMPRESSION, 9])
+        new_scale = mm_per_px * w / size[0]
+        files[dst.name] = {"mm_per_px": round(new_scale, 7),
+                           "source": f"{r.path.name}: {mm_per_px} mm/px, resized {w} -> {size[0]} px"}
+        n += 1
+        print(f"{r.path.name} -> {dst}  ({new_scale:.6f} mm/px, {dst.stat().st_size / 1e6:.1f} MB)")
+    if n:
+        data = {"mm_per_px": round(1 / args.px_per_mm, 7),
+                "source": f"shrunk to {args.px_per_mm:g} px/mm by 'python -m shape_variation shrink'; "
+                          "exact per-file values below",
+                "files": dict(sorted(files.items()))}
+        scale_file.write_text(yaml.safe_dump(data, sort_keys=False))
+    print(f"{n} images written to {out}, {skipped} skipped; scale in {scale_file}")
+    return 1 if skipped else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="python -m shape_variation", description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -150,7 +204,12 @@ def build_parser() -> argparse.ArgumentParser:
     o.add_argument("inputs", nargs="+")
     o.add_argument("-o", "--output", default="results/overlays", help="output folder")
     o.add_argument("--window", help="window depth in mm, 'auto' (this image's visible depth) or 'full'")
-    for p in (a, s, c, o):
+    k = sub.add_parser("shrink", help="resize raw frames to the analysis resolution and write their scale.yaml")
+    k.add_argument("inputs", nargs="+", help="image folders and/or files (raw frames)")
+    k.add_argument("-o", "--output", required=True, help="output folder, e.g. data/nmc_u/2026-06-04")
+    k.add_argument("--px-per-mm", type=float, default=40.0, help="target resolution (default 40 = cells' work resolution)")
+    k.add_argument("--mm-per-px", type=float, help="scale of the raw frames if they have none (e.g. 0.014019)")
+    for p in (a, s, c, o, k):
         p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     return ap
 
@@ -158,4 +217,4 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     return {"analyze": cmd_analyze, "score": cmd_score, "scales": cmd_scales,
-            "overlay": cmd_overlay}[args.cmd](args)
+            "overlay": cmd_overlay, "shrink": cmd_shrink}[args.cmd](args)
