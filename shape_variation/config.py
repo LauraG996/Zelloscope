@@ -23,7 +23,7 @@ DEFAULTS = {
     "monitoring": {"t2_alpha": 0.01, "spc_sigma": 3.0, "run_length": 8, "trend_length": 6},
     "process_windows": None,
     "cells": {"seed_smooth_mm": 0.2, "seed_min_separation_mm": 0.39, "wall_smooth_mm": 0.02,
-              "min_area_mm2": 0.02, "merged_area_factor": 4.0, "map_bin_mm": 2.0,
+              "min_area_mm2": 0.02, "merged_area_factor": 4.0, "map_bin_mm": 2.0, "flat_bin_mm": 1.0,
               "work_px_per_mm": 40.0},
     "relaxation": {"min_images_per_part": 3, "settle_fraction": 0.95},
 }

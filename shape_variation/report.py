@@ -258,6 +258,63 @@ def fig_surface(a: Analysis) -> str | None:
     return _png(fig)
 
 
+def fig_flattening_map(a: Analysis) -> str | None:
+    """Flattening against the nearest surface in small squares (mean of all parts), and the squares
+    summarised by distance from the nearest surface (edge vs centre)."""
+    from matplotlib.colors import LogNorm
+    from matplotlib.ticker import NullFormatter
+    flat = a.cells.get("flat_grid") if isinstance(a.cells, dict) else None
+    if flat is None or not np.isfinite(flat[0]).any():
+        return None
+    grid, ext, _ = flat
+    m = a.model
+    fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12, 5.6), gridspec_kw=dict(width_ratios=[1.15, 1]))
+    im = ax.imshow(grid, extent=ext, cmap=DIV, norm=LogNorm(vmin=0.5, vmax=2.0), interpolation="nearest")
+    _draw_shape(ax, m.mean, m.n_outer, m.closed, color=INK, lw=1.2)
+    ax.set_aspect("equal")                              # extent puts y = base (largest) at the bottom
+    ax.grid(False)
+    ax.set_xlabel("mm")
+    ax.set_title(f"Cell flattening in {a.cfg['cells']['flat_bin_mm']:g} mm squares (mean of {len(a.shapes)} parts)",
+                 loc="left")
+    cb = fig.colorbar(im, ax=ax, shrink=0.85)
+    cb.set_ticks([0.5, 0.7, 1, 1.4, 2])
+    cb.set_ticklabels(["0.5", "0.7", "1 (round)", "1.4", "2"])
+    cb.ax.yaxis.set_minor_formatter(NullFormatter())
+    cb.set_label("flattening against the nearest surface\n(red = squashed flat, blue = stretched inward)")
+    # each square's distance to the nearest surface of the mean shape (not the window cut)
+    x0, x1, y1, y0 = ext
+    ny, nx = grid.shape
+    xc = x0 + (np.arange(nx) + 0.5) * (x1 - x0) / nx
+    yc = y0 + (np.arange(ny) + 0.5) * (y1 - y0) / ny
+    X, Y = np.meshgrid(xc, yc)
+    curve = np.vstack(m.split(m.mean))
+    d = np.min(np.hypot(X[..., None] - curve[:, 0], Y[..., None] - curve[:, 1]), axis=-1)
+    ok = np.isfinite(grid)
+    bins = np.arange(0, d[ok].max() + 0.5, 0.5)
+    idx = np.digitize(d[ok], bins) - 1
+    mid, typ, lo, hi = [], [], [], []
+    for i in range(len(bins) - 1):
+        v = grid[ok][idx == i]
+        if len(v) >= 5:
+            mid.append((bins[i] + bins[i + 1]) / 2)
+            typ.append(float(np.exp(np.mean(np.log(v)))))
+            lo.append(float(np.percentile(v, 10)))
+            hi.append(float(np.percentile(v, 90)))
+    ax2.fill_between(mid, lo, hi, color="#b7d3f6", lw=0, label="10-90 % of squares")
+    ax2.plot(mid, typ, color=BLUE, marker="o", ms=4, label="typical square")
+    ax2.axhline(1, color=MUTED, lw=1, ls="--")
+    ax2.set_yscale("log")
+    ax2.set_yticks([0.7, 1, 1.4, 2])
+    ax2.set_yticklabels(["0.7", "1", "1.4", "2"])
+    ax2.yaxis.set_minor_formatter(NullFormatter())
+    ax2.set_xlabel("distance of the square from the nearest surface (mm)")
+    ax2.set_ylabel("flattening")
+    ax2.set_title("Edge vs centre", loc="left")
+    ax2.legend(loc="upper right")
+    fig.tight_layout()
+    return _png(fig)
+
+
 def fig_relaxation(a: Analysis) -> str | None:
     fits = {k: v for k, v in a.relaxation.items() if "tau" in v}
     if not fits:
@@ -687,6 +744,13 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
                     "image so that, in the core, the wall-to-wall distance matches the cell outlines (\u03c0/4 \u00d7 "
                     "the mean cell diameter)."))
             add(_table(t, ["name"] + layer_cols))
+        flat_fig = fig_flattening_map(a)
+        if flat_fig:
+            add(fig(flat_fig, "Flattening across the cross-section", "Each square: cell walls crossed per mm going "
+                    "straight in from the nearest surface, divided by walls crossed per mm along that surface, from "
+                    "all parts aligned on each other. Red: cells squashed flat against the surface; white: round; "
+                    "blue: cells stretched in towards the middle. Right: the same squares by distance from the "
+                    "nearest surface."))
         cell_cols = [c for c in t.columns if c.startswith("cell_")]
         add('<details><summary>Other cell features per part</summary>' + _table(t, ["name"] + cell_cols) +
             '</details>')

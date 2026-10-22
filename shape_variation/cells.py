@@ -146,17 +146,11 @@ def _walls(profile: np.ndarray, step_mm: float, scale: float, height: float) -> 
     return pk
 
 
-def surface_intercepts(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None,
-                       core_diameter_mm: float | None = None, max_depth_mm: float = 3.5,
-                       spacing_mm: float = 0.25, keep_points: bool = False) -> dict:
-    """Cell size against depth below each surface by the line-intercept method (as in ASTM D3576):
-    walls are counted along lines straight in from the surface (chord = how deep the cells are) and along
-    lines parallel to the surface at fixed depths (chord = how wide they are). Flattening = wide / deep.
-
-    The wall-detection sensitivity is calibrated per image: with `core_diameter_mm` (mean diameter of the
-    watershed cells, which are reliable in the core) it is chosen so that the mean chord in the core
-    (>= CORE_FROM_MM from the surface) equals pi/4 x that diameter, the mean chord of a round cell.
-    Returns per surface the binned profile (deep_mm, wide_mm, flattening) and the chosen sensitivity."""
+def _sample_lines(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None, levels, max_depth_mm: float,
+                  spacing_mm: float, min_run_mm: float = 2.0) -> dict:
+    """Wall-map profiles along lines straight in from each surface (every `spacing_mm` along it, up to
+    `max_depth_mm` or halfway to the other surface) and along lines parallel to each surface at the depths in
+    `levels` (mm). Lines are in small-image px; `to_canvas` maps them to the canonical raster."""
     from scipy.ndimage import gaussian_filter1d
     px_per_mm_full = 1.0 / prep.record.mm_per_px
     f = min(1.0, p["work_px_per_mm"] / px_per_mm_full)
@@ -185,8 +179,6 @@ def surface_intercepts(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float
             "cavity": cv2.distanceTransform((~cavity).astype(np.uint8), cv2.DIST_L2, 5)}
     step = 1.0 / res
     n_steps = int(max_depth_mm * res)
-    edges = np.asarray(SURFACE_BINS)
-    levels = (edges[:-1] + edges[1:]) / 2
 
     # ---- sample all lines once: (surface, kind, level or None, profile, xs, ys)
     lines = []
@@ -234,7 +226,7 @@ def surface_intercepts(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float
                 if len(idx) < 20:
                     continue
                 for run in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
-                    if len(run) < int(2 * res):                                 # at least 2 mm long
+                    if len(run) < int(min_run_mm * res):
                         continue
                     pts = c2[run].astype(float)
                     s_ = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
@@ -243,6 +235,25 @@ def surface_intercepts(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float
                     ys = np.interp(u, s_, pts[:, 1]).astype(np.float32)
                     prof = cv2.remap(ridge, xs.reshape(1, -1), ys.reshape(1, -1), cv2.INTER_LINEAR).ravel()
                     lines.append((surf, "tangent", level, prof, xs, ys))
+
+    return dict(lines=lines, step=step, scale=scale, res=res, to_canvas=m)
+
+
+def surface_intercepts(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None,
+                       core_diameter_mm: float | None = None, max_depth_mm: float = 3.5,
+                       spacing_mm: float = 0.25, keep_points: bool = False) -> dict:
+    """Cell size against depth below each surface by the line-intercept method (as in ASTM D3576):
+    walls are counted along lines straight in from the surface (chord = how deep the cells are) and along
+    lines parallel to the surface at fixed depths (chord = how wide they are). Flattening = wide / deep.
+
+    The wall-detection sensitivity is calibrated per image: with `core_diameter_mm` (mean diameter of the
+    watershed cells, which are reliable in the core) it is chosen so that the mean chord in the core
+    (>= CORE_FROM_MM from the surface) equals pi/4 x that diameter, the mean chord of a round cell.
+    Returns per surface the binned profile (deep_mm, wide_mm, flattening) and the chosen sensitivity."""
+    edges = np.asarray(SURFACE_BINS)
+    levels = (edges[:-1] + edges[1:]) / 2
+    smp = _sample_lines(img, prep, p, depth_mm, levels, max_depth_mm, spacing_mm)
+    lines, step, scale, res = smp["lines"], smp["step"], smp["scale"], smp["res"]
 
     def chords(height):
         res_ = {"outer": ([], [], []), "cavity": ([], [], [])}               # normal, tangent, wall points
@@ -287,6 +298,60 @@ def surface_intercepts(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float
         if keep_points:
             out[surf]["wall_points"] = np.array(best[surf][2]).reshape(-1, 2)
     return out
+
+
+def flattening_samples(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None, height: float,
+                       spacing_mm: float = 0.25, level_step_mm: float = 0.25, max_depth_mm: float = 8.0) -> dict:
+    """Wall crossings for a flattening map: sample points (canonical mm) along lines straight in from the
+    nearest surface ("normal") and parallel to it ("tangent"), covering the whole foam, each with a flag for
+    whether a wall was found there. Walls per mm along the normal divided by walls per mm along the tangent,
+    per area, is how flattened the cells are against the nearest surface (1 = round). `height` is the
+    calibrated wall sensitivity (surface_intercepts()["sensitivity"])."""
+    levels = np.arange(level_step_mm / 2, max_depth_mm, level_step_mm)
+    smp = _sample_lines(img, prep, p, depth_mm, levels, max_depth_mm, spacing_mm, min_run_mm=1.0)
+    out = {}
+    m = smp["to_canvas"]
+    for kind in ("normal", "tangent"):
+        xs, ys, walls = [], [], []
+        for surf, k, level, prof, lx, ly in smp["lines"]:
+            if k != kind:
+                continue
+            flag = np.zeros(len(prof), bool)
+            flag[_walls(prof, smp["step"], smp["scale"], height)] = True
+            xs.append(lx[:len(prof)])
+            ys.append(ly[:len(prof)])
+            walls.append(flag)
+        if xs:
+            px = np.column_stack([np.concatenate(xs), np.concatenate(ys)])
+            canvas = px @ m[:, :2].T + m[:, 2]
+            out[kind] = dict(xy_mm=prep.to_mm(canvas), wall=np.concatenate(walls), step_mm=smp["step"])
+        else:
+            out[kind] = dict(xy_mm=np.zeros((0, 2)), wall=np.zeros(0, bool), step_mm=smp["step"])
+    return out
+
+
+def flattening_grid(samples: list[dict], aligned: list, bin_mm: float, extent, min_walls: int = 20) -> tuple:
+    """Average flattening per square over parts: (walls per mm along the normal) / (walls per mm along the
+    tangent) in each `bin_mm` square of the aligned frame. Squares with fewer than `min_walls` walls counted in
+    either direction are left empty. Returns (grid, extent for imshow, walls counted)."""
+    x0, x1, y0, y1 = extent
+    nx, ny = max(1, int(np.ceil((x1 - x0) / bin_mm))), max(1, int(np.ceil((y1 - y0) / bin_mm)))
+    acc = {k: (np.zeros((ny, nx)), np.zeros((ny, nx))) for k in ("normal", "tangent")}     # walls, length
+    for smp, al in zip(samples, aligned):
+        for kind in ("normal", "tangent"):
+            d = smp[kind]
+            if not len(d["wall"]):
+                continue
+            xy = al.apply(d["xy_mm"])
+            ix = np.clip(((xy[:, 0] - x0) / bin_mm).astype(int), 0, nx - 1)
+            iy = np.clip(((xy[:, 1] - y0) / bin_mm).astype(int), 0, ny - 1)
+            np.add.at(acc[kind][0], (iy, ix), d["wall"].astype(float))
+            np.add.at(acc[kind][1], (iy, ix), d["step_mm"])
+    (wn, ln), (wt, lt) = acc["normal"], acc["tangent"]
+    with np.errstate(invalid="ignore", divide="ignore"):
+        grid = (wn / ln) / (wt / lt)
+    grid[(wn < min_walls) | (wt < min_walls)] = np.nan
+    return grid, (x0, x0 + nx * bin_mm, y0 + ny * bin_mm, y0), np.minimum(wn, wt)
 
 
 def surface_features(si: dict) -> dict:

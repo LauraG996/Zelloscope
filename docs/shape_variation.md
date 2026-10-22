@@ -101,6 +101,15 @@ about 3.4×, but that value is less certain: the cut face is blurred along the c
 some walls are missed and the cells read too wide. Check with `overlay`, where the detected walls are marked
 in cyan.
 
+Flattening map (`cells.flattening_samples()` / `flattening_grid()`, in the report under Cell structure): the
+foam is divided into 1 mm squares (`cells.flat_bin_mm`), in the frame where all parts are aligned on each
+other. Lines run straight in from each surface (every 0.25 mm) and parallel to it (every 0.25 mm of depth) all
+the way to the middle of the wall. In each square, flattening = walls crossed per mm going in / walls crossed
+per mm going along the nearest surface. Counting walls per mm instead of measuring whole cells works in small
+squares. First result (11 parts): about 1.6× in the outermost millimetre, round (1.0) from about 2.5–3 mm in,
+and slightly below 1 (about 0.85) in the middle of the thick base, where cells are a little taller than wide
+between the two surfaces.
+
 Other cell limitations: cells touching the foam edge are left out of the per-cell statistics and maps
 (the surface layer is covered by the intercepts above). The watershed has only been checked by eye against
 the images (`overlay`), not against manual counts or Zelloscope's own cell measurement.

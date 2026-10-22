@@ -4,8 +4,9 @@
 product: NMC NOMAPACK U 0-24/77
 spec_config: nmc_nomapack_u_0-24-77.yaml     # relative to this file
 
-# Files matching these regexes are ignored (other products in the same folders).
-exclude: ["squarefoam"]
+# Files matching these regexes are ignored: other products in the same folders, and the marker-painted
+# capture of 2026-10-22 (reversed wall contrast, different zoom; an experiment, not a production sample).
+exclude: ["squarefoam", "capture_sample_20261022T112322"]
 
 segmentation:
   method: otsu              # otsu = grey-level threshold (works on the 2026 rig images); hsv = profile_check's HSV box
@@ -61,6 +62,7 @@ cells:
   min_area_mm2: 0.02
   merged_area_factor: 4.0   # cells larger than this x the median cell area are several cells merged: dropped
   map_bin_mm: 2.0
+  flat_bin_mm: 1.0          # square size of the flattening map
   work_px_per_mm: 40.0      # images are downsampled to this before watershed (speed)
 
 relaxation:

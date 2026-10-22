@@ -220,7 +220,7 @@ def _relaxation(table: pd.DataFrame, cfg) -> dict | str:
 
 def _cells(a: Analysis) -> dict | str:
     p = a.cfg["cells"]
-    per_part, features, profiles = [], [], []
+    per_part, features, profiles, flat_samples = [], [], [], []
     for s, al in zip(a.shapes, a.aligned):
         img = cv2.imread(str(s.record.path), cv2.IMREAD_COLOR)
         c = cellmod.measure_cells(img, s.prepared, p)
@@ -241,6 +241,7 @@ def _cells(a: Analysis) -> dict | str:
         feats.update(cellmod.surface_features(si))
         features.append(feats)
         profiles.append(si)
+        flat_samples.append(cellmod.flattening_samples(img, s.prepared, p, a.depth_mm, si["sensitivity"]))
     if not any(features):
         return "no cells detected"
     pts = np.vstack([np.vstack(_aligned_polygons(s, al)) for s, al in zip(a.shapes, a.aligned)])
@@ -248,8 +249,9 @@ def _cells(a: Analysis) -> dict | str:
     foam_polys = [_aligned_polygons(s, al) for s, al in zip(a.shapes, a.aligned)]
     maps = {key: cellmod.binned_map(per_part, key, p["map_bin_mm"], extent, foam_polys)
             for key in ("diameter_mm", "density", "elongation")}
+    flat = cellmod.flattening_grid(flat_samples, a.aligned, p["flat_bin_mm"], extent)
     return dict(features=features, maps=maps, n_cells=[len(c["x_al"]) for c in per_part], per_part=per_part,
-                profiles=profiles)
+                profiles=profiles, flat_grid=flat)
 
 
 def _correlations(a: Analysis) -> dict | str:
