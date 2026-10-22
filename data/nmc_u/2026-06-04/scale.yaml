@@ -1,0 +1,268 @@
+mm_per_px: 0.025
+source: shrunk to 40 px/mm by 'python -m shape_variation shrink'; exact per-file values
+  below
+files:
+  2026-06-04_09-16-15.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-16-15.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-21-53.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-21-53.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-28-30.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-28-30.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-30-46.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-30-46.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-33-46.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-33-46.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-36-26.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-36-26.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-40-32.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-40-32.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-45-17.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-45-17.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-51-41.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-51-41.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_09-56-47.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_09-56-47.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-01-41.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-01-41.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-05-21.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-05-21.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-10-15.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-10-15.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-15-45.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-15-45.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-20-07.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-20-07.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-25-08.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-25-08.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-30-14.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-30-14.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-35-59.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-35-59.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-41-27.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-41-27.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-46-26.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-46-26.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-50-23.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-50-23.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_10-58-26.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_10-58-26.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-01-28.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-01-28.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-10-38.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-10-38.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-15-49.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-15-49.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-20-26.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-20-26.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-25-18.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-25-18.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-32-25.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-32-25.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-36-40.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-36-40.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-40-31.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-40-31.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-45-39.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-45-39.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_11-51-17.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_11-51-17.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_12-55-36.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_12-55-36.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-00-17.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-00-17.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-05-36.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-05-36.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-10-37.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-10-37.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-16-05.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-16-05.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-20-49.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-20-49.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-26-07.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-26-07.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-30-41.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-30-41.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-36-24.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-36-24.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-40-19.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-40-19.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-46-06.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-46-06.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-53-25.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-53-25.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_13-58-43.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_13-58-43.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-02-37.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-02-37.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-07-12.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-07-12.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-16-28.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-16-28.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-20-32.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-20-32.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-35-59.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-35-59.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-40-42.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-40-42.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-45-05.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-45-05.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-51-20.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-51-20.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_14-56-36.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_14-56-36.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-00-27.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-00-27.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-05-40.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-05-40.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-10-36.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-10-36.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-15-33.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-15-33.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-21-36.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-21-36.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-26-28.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-26-28.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-31-13.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-31-13.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-35-54.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-35-54.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-41-05.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-41-05.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-45-43.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-45-43.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-50-44.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-50-44.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
+  2026-06-04_15-55-51.png:
+    mm_per_px: 0.0249987
+    source: '2026-06-04_15-55-51.png: 0.014019 mm/px (--mm-per-px), resized 3800 ->
+      2131 px'
