@@ -220,7 +220,7 @@ def _relaxation(table: pd.DataFrame, cfg) -> dict | str:
 
 def _cells(a: Analysis) -> dict | str:
     p = a.cfg["cells"]
-    per_part, features = [], []
+    per_part, features, profiles = [], [], []
     for s, al in zip(a.shapes, a.aligned):
         img = cv2.imread(str(s.record.path), cv2.IMREAD_COLOR)
         c = cellmod.measure_cells(img, s.prepared, p)
@@ -233,9 +233,14 @@ def _cells(a: Analysis) -> dict | str:
         ang = (np.pi - c["angle_rad"]) if al.mirrored else c["angle_rad"]
         c["angle_al"] = ang + rot
         o, cav = _aligned_polygons(s, al)
-        f = cellmod.cell_features(c, o, cav, float(a.table.loc[len(per_part), "base_thickness"]))
         per_part.append(c)
-        features.append(f)
+        feats = cellmod.cell_features(c, o, cav)
+        # surface layer by line intercepts, calibrated so that the core agrees with the cell outlines
+        core_d = float(np.mean(c["diameter_mm"])) if len(c["diameter_mm"]) else None
+        si = cellmod.surface_intercepts(img, s.prepared, p, a.depth_mm, core_diameter_mm=core_d)
+        feats.update(cellmod.surface_features(si))
+        features.append(feats)
+        profiles.append(si)
     if not any(features):
         return "no cells detected"
     pts = np.vstack([np.vstack(_aligned_polygons(s, al)) for s, al in zip(a.shapes, a.aligned)])
@@ -243,7 +248,8 @@ def _cells(a: Analysis) -> dict | str:
     foam_polys = [_aligned_polygons(s, al) for s, al in zip(a.shapes, a.aligned)]
     maps = {key: cellmod.binned_map(per_part, key, p["map_bin_mm"], extent, foam_polys)
             for key in ("diameter_mm", "density", "elongation")}
-    return dict(features=features, maps=maps, n_cells=[len(c["x_al"]) for c in per_part], per_part=per_part)
+    return dict(features=features, maps=maps, n_cells=[len(c["x_al"]) for c in per_part], per_part=per_part,
+                profiles=profiles)
 
 
 def _correlations(a: Analysis) -> dict | str:

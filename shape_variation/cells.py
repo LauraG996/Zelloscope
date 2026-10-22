@@ -1,5 +1,7 @@
 """Foam cells: marker-controlled watershed (ported from cell_segmentation.py on the brave-hamilton branch, with
 its pixel parameters converted to mm), per-cell size/shape/orientation, and maps in the aligned shape frame."""
+import warnings
+
 import cv2
 import numpy as np
 from skimage.measure import regionprops
@@ -27,39 +29,71 @@ def segment_cells(gray: np.ndarray, mask: np.ndarray, px_per_mm: float, p: dict)
 
 
 def cell_labels(img: np.ndarray, prep: Prepared, p: dict):
-    """Watershed on the image downsampled to p["work_px_per_mm"]. Returns (labels, small image, scale factor f
-    from full-res px to small px, small px per mm, labels of the cells kept: not touching the foam edge and not
-    below the minimum area)."""
+    """Watershed on the image downsampled to p["work_px_per_mm"].
+
+    Returns (labels, small image, scale factor f from full-res px to small px, small px per mm, kept labels,
+    edge labels, foam mask, cavity mask) - masks in small-image px. Kept = not touching the foam edge, not below
+    the minimum area and not larger than `merged_area_factor` x the median cell area (several cells merged).
+    At the surfaces the watershed does not split the first cell layer (it makes strips along the surface), so
+    the surface layer is measured with surface_intercepts() instead."""
     px_per_mm_full = 1.0 / prep.record.mm_per_px
     f = min(1.0, p["work_px_per_mm"] / px_per_mm_full)
     small = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else img
     gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
     res = px_per_mm_full * f
 
-    # foam mask in this image's pixels: canonical foam mask mapped back through the inverse transform
+    # foam / cavity masks in this image's pixels: canonical masks mapped back through the inverse transform
     m = prep.image_to_canvas.copy()
     m[:, :2] /= f                                      # small-image px -> canvas px
     inv = cv2.invertAffineTransform(m)
-    mask = cv2.warpAffine(prep.foam.astype(np.uint8), inv, (gray.shape[1], gray.shape[0]),
-                          flags=cv2.INTER_NEAREST) > 0
-    mask = cv2.erode(mask.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
+    size = (gray.shape[1], gray.shape[0])
+    foam = cv2.warpAffine(prep.foam.astype(np.uint8), inv, size, flags=cv2.INTER_NEAREST) > 0
+    cavity = cv2.warpAffine(prep.cavity.astype(np.uint8), inv, size, flags=cv2.INTER_NEAREST) > 0
+    mask = cv2.erode(foam.astype(np.uint8), np.ones((3, 3), np.uint8)) > 0
 
     labels = segment_cells(gray, mask, res, p)
     edge = set(np.unique(labels[cv2.dilate((labels == 1).astype(np.uint8), np.ones((5, 5), np.uint8)) > 0]))
-    min_area = p["min_area_mm2"] * res * res
     areas = np.bincount(np.where(labels >= 2, labels, 0).ravel())
-    kept = {lab for lab in range(2, len(areas)) if areas[lab] >= min_area and lab not in edge}
-    return labels, small, f, res, kept
+    cell_areas = areas[2:][areas[2:] > 0]
+    min_area = p["min_area_mm2"] * res * res
+    max_area = p.get("merged_area_factor", 4.0) * float(np.median(cell_areas)) if len(cell_areas) else np.inf
+    kept = {lab for lab in range(2, len(areas)) if min_area <= areas[lab] <= max_area and lab not in edge}
+    return labels, small, f, res, kept, edge, foam, cavity
 
 
 def measure_cells(img: np.ndarray, prep: Prepared, p: dict) -> dict:
-    """Cells of one image with centroids in the canonical frame (mm). Cells touching the foam edge are dropped."""
-    labels, _, f, res, kept = cell_labels(img, prep, p)
-    out = {k: [] for k in ("x", "y", "area_mm2", "diameter_mm", "elongation", "angle_rad")}
+    """Cells of one image: centroid (canonical mm), size, elongation, orientation, and their relation to the
+    nearest surface - distance, which surface (outer or cavity), whether the cell touches it, and its extent
+    across the surface vs into the foam (flattening > 1 = squashed against the surface)."""
+    labels, _, f, res, kept, edge, foam, cavity = cell_labels(img, prep, p)
+    outside = ~foam & ~cavity
+    # distance (px) to the outer surface and to the cavity surface; the image border is not a surface
+    d_out = cv2.distanceTransform((~outside).astype(np.uint8), cv2.DIST_L2, 5) if outside.any() \
+        else np.full(foam.shape, np.inf, np.float32)
+    d_cav = cv2.distanceTransform((~cavity).astype(np.uint8), cv2.DIST_L2, 5) if cavity.any() \
+        else np.full(foam.shape, np.inf, np.float32)
+    g = {name: (cv2.Sobel(d, cv2.CV_32F, 1, 0, ksize=5), cv2.Sobel(d, cv2.CV_32F, 0, 1, ksize=5))
+         for name, d in (("outer", d_out), ("cavity", d_cav))}
+
+    keys = ("x", "y", "area_mm2", "diameter_mm", "elongation", "angle_rad", "surface_dist_mm", "at_surface",
+            "thick_mm", "wide_mm", "flattening")
+    out = {k: [] for k in keys}
+    surface = []
     for r in regionprops(np.where(labels >= 2, labels, 0)):
         if r.label not in kept:
             continue
         cy, cx = r.centroid
+        iy, ix = int(round(cy)), int(round(cx))
+        do, dc = float(d_out[iy, ix]), float(d_cav[iy, ix])
+        which = "outer" if do <= dc else "cavity"
+        gx, gy = g[which][0][iy, ix], g[which][1][iy, ix]
+        norm = np.hypot(gx, gy)
+        nvec = np.array([gx, gy]) / norm if norm > 0 else np.array([0.0, 1.0])     # (x, y), away from surface
+        tvec = np.array([-nvec[1], nvec[0]])
+        xy = r.coords[:, ::-1].astype(float)                                        # (x, y)
+        cov = np.cov(xy.T) if len(xy) > 2 else np.eye(2)
+        thick = 4.0 * np.sqrt(max(nvec @ cov @ nvec, 1e-9)) / res                  # ~ full width of an ellipse
+        wide = 4.0 * np.sqrt(max(tvec @ cov @ tvec, 1e-9)) / res
         out["x"].append(cx / f)
         out["y"].append(cy / f)
         out["area_mm2"].append(r.area / res ** 2)
@@ -67,7 +101,14 @@ def measure_cells(img: np.ndarray, prep: Prepared, p: dict) -> dict:
         out["elongation"].append(r.axis_major_length / max(r.axis_minor_length, 1e-6))
         # skimage orientation: angle between the row axis and the major axis -> angle from the x axis
         out["angle_rad"].append(np.pi / 2 - r.orientation)
-    cells = {k: np.asarray(v, float) for k, v in out.items()}
+        out["surface_dist_mm"].append(min(do, dc) / res)
+        out["at_surface"].append(r.label in edge)
+        out["thick_mm"].append(thick)
+        out["wide_mm"].append(wide)
+        out["flattening"].append(wide / thick)
+        surface.append(which)
+    cells = {k: np.asarray(v, bool if k == "at_surface" else float) for k, v in out.items()}
+    cells["surface"] = np.asarray(surface, dtype="<U6")
     xy = prep.image_px_to_mm(np.column_stack([cells["x"], cells["y"]])) if len(cells["x"]) else np.zeros((0, 2))
     cells["x_mm"], cells["y_mm"] = xy[:, 0], xy[:, 1]
     # orientation in the canonical frame: rotate by the image->canvas rotation
@@ -76,18 +117,210 @@ def measure_cells(img: np.ndarray, prep: Prepared, p: dict) -> dict:
     return cells
 
 
-# Overlay colours (BGR): kept cells, dropped cells, foam outline, cavity outline, window cut.
-KEPT_BGR, DROPPED_BGR, FOAM_BGR, CAVITY_BGR, CUT_BGR = (0, 230, 255), (200, 80, 255), (60, 220, 60), \
-    (0, 140, 255), (255, 200, 0)
+# Distance-from-surface bins (mm) for the surface profiles; "core" = cells further than CORE_FROM_MM in.
+SURFACE_BINS = (0.0, 0.5, 1.0, 1.5, 2.0, 3.0)   # deeper, lines that stop at the midline bias chords short
+CORE_FROM_MM = 2.0
+
+
+def wall_map(small: np.ndarray, foam: np.ndarray, res: float) -> np.ndarray:
+    """Ridge strength of the bright cell walls (Sato tubeness at ~0.025-0.05 mm), 0 outside the foam."""
+    from skimage.filters import sato
+    gray = cv2.cvtColor(small, cv2.COLOR_BGR2GRAY) if small.ndim == 3 else small
+    sig = [s * res / 40.0 for s in (1.0, 1.5, 2.0)]
+    ridge = sato(gray.astype(np.float32) / 255.0, sigmas=sig, black_ridges=False).astype(np.float32)
+    ridge[~foam] = 0
+    return ridge
+
+
+# Wall-detection sensitivities tried when calibrating against the core (peak height, in units of the 90th
+# percentile of the wall map; prominence = 0.75 x height).
+SENSITIVITY_GRID = (0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1.0, 1.1, 1.2)
+
+
+def _walls(profile: np.ndarray, step_mm: float, scale: float, height: float) -> np.ndarray:
+    """Indices of cell walls along a sampled line: ridge peaks at least 0.15 mm apart, above `height` and with a
+    prominence of 0.75 x `height` (both in units of `scale`)."""
+    from scipy.signal import find_peaks
+    pk, _ = find_peaks(profile, distance=max(1, int(round(0.15 / step_mm))), height=height * scale,
+                       prominence=0.75 * height * scale)
+    return pk
+
+
+def surface_intercepts(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None,
+                       core_diameter_mm: float | None = None, max_depth_mm: float = 3.5,
+                       spacing_mm: float = 0.25, keep_points: bool = False) -> dict:
+    """Cell size against depth below each surface by the line-intercept method (as in ASTM D3576):
+    walls are counted along lines straight in from the surface (chord = how deep the cells are) and along
+    lines parallel to the surface at fixed depths (chord = how wide they are). Flattening = wide / deep.
+
+    The wall-detection sensitivity is calibrated per image: with `core_diameter_mm` (mean diameter of the
+    watershed cells, which are reliable in the core) it is chosen so that the mean chord in the core
+    (>= CORE_FROM_MM from the surface) equals pi/4 x that diameter, the mean chord of a round cell.
+    Returns per surface the binned profile (deep_mm, wide_mm, flattening) and the chosen sensitivity."""
+    from scipy.ndimage import gaussian_filter1d
+    px_per_mm_full = 1.0 / prep.record.mm_per_px
+    f = min(1.0, p["work_px_per_mm"] / px_per_mm_full)
+    small = cv2.resize(img, None, fx=f, fy=f, interpolation=cv2.INTER_AREA) if f < 1 else img
+    res = px_per_mm_full * f
+    m = prep.image_to_canvas.copy()
+    m[:, :2] /= f
+    inv = cv2.invertAffineTransform(m)
+    size = (small.shape[1], small.shape[0])
+    foam = cv2.warpAffine(prep.foam.astype(np.uint8), inv, size, flags=cv2.INTER_NEAREST) > 0
+    cavity = cv2.warpAffine(prep.cavity.astype(np.uint8), inv, size, flags=cv2.INTER_NEAREST) > 0
+    # usable area: inside the window (if any, with 1 mm margin) and away from the image border
+    if depth_mm is not None:
+        rows = np.arange(prep.foam.shape[0])[:, None]
+        win = np.broadcast_to(rows >= prep.base_row - (depth_mm - 1.0) * prep.res, prep.foam.shape)
+        usable = cv2.warpAffine(win.astype(np.uint8) * 255, inv, size, flags=cv2.INTER_NEAREST) > 0
+    else:
+        usable = np.ones(foam.shape, bool)
+    border = int(round(1.0 * res))
+    usable[:border], usable[-border:], usable[:, :border], usable[:, -border:] = False, False, False, False
+
+    ridge = wall_map(small, foam, res)
+    scale = float(np.percentile(ridge[foam], 90)) if foam.any() else 1.0
+    outside = ~foam & ~cavity
+    dist = {"outer": cv2.distanceTransform((~outside).astype(np.uint8), cv2.DIST_L2, 5),
+            "cavity": cv2.distanceTransform((~cavity).astype(np.uint8), cv2.DIST_L2, 5)}
+    step = 1.0 / res
+    n_steps = int(max_depth_mm * res)
+    edges = np.asarray(SURFACE_BINS)
+    levels = (edges[:-1] + edges[1:]) / 2
+
+    # ---- sample all lines once: (surface, kind, level or None, profile, xs, ys)
+    lines = []
+    for surf, region in (("outer", foam | cavity), ("cavity", cavity)):
+        other = dist["cavity" if surf == "outer" else "outer"]
+        d_here = dist[surf]
+        cs, _ = cv2.findContours(region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        if cs:
+            c = max(cs, key=cv2.contourArea).reshape(-1, 2).astype(float)
+            cs_s = gaussian_filter1d(c, res * 1.0, axis=0, mode="wrap")         # direction smoothed over ~1 mm
+            tan = np.gradient(cs_s, axis=0)
+            nrm = np.column_stack([-tan[:, 1], tan[:, 0]])
+            nrm /= np.maximum(np.linalg.norm(nrm, axis=1, keepdims=True), 1e-9)
+            t = np.arange(n_steps, dtype=np.float32)
+            for i in range(0, len(c), max(1, int(round(spacing_mm * res)))):
+                x0, y0 = c[i]
+                nv = nrm[i]
+                px_, py_ = int(round(x0 + nv[0] * 0.5 * res)), int(round(y0 + nv[1] * 0.5 * res))
+                if not (0 <= py_ < foam.shape[0] and 0 <= px_ < foam.shape[1]) or not foam[py_, px_]:
+                    nv = -nv                                                    # point into the foam
+                xs, ys = x0 + nv[0] * t, y0 + nv[1] * t
+                ok = (xs >= 0) & (ys >= 0) & (xs < foam.shape[1] - 1) & (ys < foam.shape[0] - 1)
+                xs, ys = xs[ok], ys[ok]
+                xi, yi = xs.astype(int), ys.astype(int)
+                if len(xi) < 10 or not usable[yi[0], xi[0]]:
+                    continue
+                # stop where the line leaves the foam / usable area or gets closer to the other surface
+                good = foam[yi, xi] & usable[yi, xi] & (d_here[yi, xi] <= other[yi, xi] + 1)
+                good[:3] = True
+                stop = len(good) if good.all() else int(np.argmin(good))
+                if stop < 10:
+                    continue
+                prof = cv2.remap(ridge, xs[:stop].reshape(1, -1).astype(np.float32),
+                                 ys[:stop].reshape(1, -1).astype(np.float32), cv2.INTER_LINEAR).ravel()
+                lines.append((surf, "normal", None, prof, xs[:stop], ys[:stop]))
+        for level in levels:
+            iso = (d_here >= level * res).astype(np.uint8)
+            cs2, _ = cv2.findContours(iso, cv2.RETR_LIST, cv2.CHAIN_APPROX_NONE)
+            for c2 in cs2:
+                c2 = c2.reshape(-1, 2)
+                xi, yi = c2[:, 0], c2[:, 1]
+                on = (np.abs(d_here[yi, xi] - level * res) < 1.0) & foam[yi, xi] & usable[yi, xi] & \
+                     (d_here[yi, xi] < other[yi, xi])
+                idx = np.nonzero(on)[0]
+                if len(idx) < 20:
+                    continue
+                for run in np.split(idx, np.nonzero(np.diff(idx) > 1)[0] + 1):
+                    if len(run) < int(2 * res):                                 # at least 2 mm long
+                        continue
+                    pts = c2[run].astype(float)
+                    s_ = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(pts, axis=0).T))])
+                    u = np.arange(0, s_[-1], 1.0)
+                    xs = np.interp(u, s_, pts[:, 0]).astype(np.float32)
+                    ys = np.interp(u, s_, pts[:, 1]).astype(np.float32)
+                    prof = cv2.remap(ridge, xs.reshape(1, -1), ys.reshape(1, -1), cv2.INTER_LINEAR).ravel()
+                    lines.append((surf, "tangent", level, prof, xs, ys))
+
+    def chords(height):
+        res_ = {"outer": ([], [], []), "cavity": ([], [], [])}               # normal, tangent, wall points
+        for surf, kind, level, prof, xs, ys in lines:
+            pk = _walls(prof, step, scale, height)
+            if kind == "normal":
+                res_[surf][0].extend(((a_ + b_) / 2 * step, (b_ - a_) * step) for a_, b_ in zip(pk[:-1], pk[1:]))
+                res_[surf][2].extend(zip(xs[pk], ys[pk]))
+            else:
+                res_[surf][1].extend((level, float(b_ - a_) * step) for a_, b_ in zip(pk[:-1], pk[1:]))
+        return res_
+
+    def core_chord(r_):
+        c_ = [ch for surf in r_ for (d_, ch) in r_[surf][0] + r_[surf][1] if d_ >= CORE_FROM_MM]
+        return float(np.mean(c_)) if c_ else np.nan
+
+    if core_diameter_mm:
+        target = np.pi / 4 * core_diameter_mm
+        trials = [(h, chords(h)) for h in SENSITIVITY_GRID]
+        height, best = min(trials, key=lambda hr: abs(core_chord(hr[1]) - target) if np.isfinite(core_chord(hr[1]))
+                           else np.inf)
+    else:
+        target, height = float("nan"), 0.6
+        best = chords(height)
+
+    out = {"bin_mid_mm": levels, "res": res, "sensitivity": height, "core_chord_mm": core_chord(best),
+           "core_chord_target_mm": target}
+    for surf in ("outer", "cavity"):
+        nc = np.array(best[surf][0]).reshape(-1, 2)
+        tc = np.array(best[surf][1]).reshape(-1, 2)
+        idx_n, idx_t = np.digitize(nc[:, 0], edges) - 1, np.digitize(tc[:, 0], edges) - 1
+        deep, wide, n_n, n_t = [], [], [], []
+        for i in range(len(edges) - 1):
+            bn, bt = nc[idx_n == i, 1], tc[idx_t == i, 1]
+            n_n.append(len(bn))
+            n_t.append(len(bt))
+            deep.append(float(np.mean(bn)) if len(bn) >= 10 else np.nan)
+            wide.append(float(np.mean(bt)) if len(bt) >= 10 else np.nan)
+        deep, wide = np.array(deep), np.array(wide)
+        out[surf] = dict(deep_mm=deep, wide_mm=wide, flattening=wide / deep, n_normal=np.array(n_n),
+                         n_tangent=np.array(n_t))
+        if keep_points:
+            out[surf]["wall_points"] = np.array(best[surf][2]).reshape(-1, 2)
+    return out
+
+
+def surface_features(si: dict) -> dict:
+    """Per-part numbers from surface_intercepts: the first layer (0-0.5 mm) and the core (>= CORE_FROM_MM)."""
+    feats = {"wall_sensitivity": si["sensitivity"]}
+    mids = si["bin_mid_mm"]
+    core = mids >= CORE_FROM_MM
+    for surf in ("outer", "cavity"):
+        d = si[surf]
+        for name, sel in (("layer", slice(0, 1)), ("core", core)):
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)          # all-NaN (surface not in view)
+                feats[f"{surf}_{name}_flattening"] = round(float(np.nanmean(d["flattening"][sel])), 4)
+                feats[f"{surf}_{name}_deep_mm"] = round(float(np.nanmean(d["deep_mm"][sel])), 4)
+                feats[f"{surf}_{name}_wide_mm"] = round(float(np.nanmean(d["wide_mm"][sel])), 4)
+        # depth of the flattened zone: first bin whose flattening is within 10 % of round
+        fl = d["flattening"]
+        below = np.nonzero(np.isfinite(fl) & (fl < 1.1))[0]
+        feats[f"{surf}_flattened_depth_mm"] = round(float(mids[below[0]]), 3) if len(below) else float("nan")
+    return feats
+
+
+# Overlay colours (BGR): core cells, surface-layer cells, dropped cells, foam outline, cavity outline, window cut.
+KEPT_BGR, SURFACE_BGR, DROPPED_BGR, FOAM_BGR, CAVITY_BGR, CUT_BGR = (0, 230, 255), (255, 230, 60), \
+    (200, 80, 255), (60, 220, 60), (0, 140, 255), (255, 255, 255)
 
 
 def draw_segmentation(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None,
-                      with_cells: bool = True) -> tuple[np.ndarray, dict]:
+                      with_cells: bool = True, walls: bool = True) -> tuple[np.ndarray, dict]:
     """The image (at the cell working resolution) with the foam and cavity outlines, the window cut line and
-    every cell boundary: kept cells in yellow, cells dropped (touching the foam edge, too small, or outside the
-    window) in violet. Also returns the zoom-in points (small-image px) for the base centre and a leg."""
+    every cell boundary: measured cells in yellow, cells dropped (touching the edge, merged, too small, or outside
+    the window) in violet. With `walls`, the cell walls found by the surface intercepts are marked in cyan. Also returns the zoom-in points (small-image px) for the base centre and a leg."""
     if with_cells:
-        labels, small, f, res, kept = cell_labels(img, prep, p)
+        labels, small, f, res, kept, edge, _, _ = cell_labels(img, prep, p)
     else:
         px_per_mm_full = 1.0 / prep.record.mm_per_px
         f = min(1.0, p["work_px_per_mm"] / px_per_mm_full)
@@ -124,6 +357,14 @@ def draw_segmentation(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float 
         if cs:
             c = max(cs, key=cv2.contourArea).reshape(-1, 2)
             cv2.polylines(out, [np.round(to_img(c)).astype(np.int32)], True, colour, 2 * th, cv2.LINE_AA)
+    if with_cells and walls:
+        areas = np.bincount(np.where(labels >= 2, labels, 0).ravel())
+        kept_areas = np.array([areas[k] for k in kept if k < len(areas)], float)
+        core_d = float(np.mean(2 * np.sqrt(kept_areas / np.pi)) / res) if len(kept_areas) else None
+        si = surface_intercepts(img, prep, p, depth_mm, core_diameter_mm=core_d, keep_points=True)
+        for surf in ("outer", "cavity"):
+            for x, y in si[surf].get("wall_points", np.zeros((0, 2))):
+                cv2.circle(out, (int(round(x)), int(round(y))), max(1, th), SURFACE_BGR, -1)
     if depth_mm is not None:
         cut = canvas_of_mm([[-60, -depth_mm], [60, -depth_mm]])
         a, b = np.round(to_img(cut)).astype(int)
@@ -161,7 +402,8 @@ def overlay_panel(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | No
     cv2.putText(bar, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
     x = 12
     for text, colour in (("foam outline", FOAM_BGR), ("cavity", CAVITY_BGR), ("window cut", CUT_BGR),
-                         ("cells measured", KEPT_BGR), ("cells dropped (edge / outside window)", DROPPED_BGR)):
+                         ("cells", KEPT_BGR), ("walls on surface lines", SURFACE_BGR),
+                         ("dropped (edge / merged / outside window)", DROPPED_BGR)):
         cv2.rectangle(bar, (x, 44), (x + 18, 58), colour, -1)
         cv2.putText(bar, text, (x + 24, 57), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
         x += 34 + 9 * len(text)
@@ -173,34 +415,23 @@ def _order(angles: np.ndarray) -> float:
     return float(np.abs(np.mean(np.exp(2j * angles)))) if len(angles) else float("nan")
 
 
-def cell_features(cells: dict, outer: np.ndarray, cavity: np.ndarray, base_thickness: float,
-                  skin_mm: float = 1.5) -> dict:
-    """Per-part cell features overall and by region (aligned frame, y down, base at y ~ 0 at the bottom)."""
+def cell_features(cells: dict, outer: np.ndarray, cavity: np.ndarray) -> dict:
+    """Per-part cell features (aligned frame, y down, base at the bottom): overall and base vs legs."""
     x, y = cells["x_al"], cells["y_al"]
     if len(x) == 0:
         return {}
-    o = outer.astype(np.float32).reshape(-1, 1, 2)
-    dist_outer = np.array([abs(cv2.pointPolygonTest(o, (float(a), float(b)), True)) for a, b in zip(x, y)])
     cav_bottom = cavity[:, 1].max()
-    regions = {
-        "all": np.ones(len(x), bool),
-        "base": y > cav_bottom,
-        "legs": y <= cav_bottom,
-        "skin": dist_outer < skin_mm,
-        "core": dist_outer >= skin_mm,
-    }
+    regions = {"all": np.ones(len(x), bool), "base": y > cav_bottom, "legs": y <= cav_bottom}
     area = abs(cv2.contourArea(outer.astype(np.float32))) - abs(cv2.contourArea(cavity.astype(np.float32)))
     feats = dict(cell_count=int(len(x)), cell_density_per_mm2=round(len(x) / area, 4) if area > 0 else float("nan"))
     for name, sel in regions.items():
         if sel.sum() < 5:
             continue
-        d = cells["diameter_mm"][sel]
-        feats[f"cell_diam_{name}"] = round(float(np.mean(d)), 4)
+        feats[f"cell_diam_{name}"] = round(float(np.mean(cells["diameter_mm"][sel])), 4)
         feats[f"cell_elong_{name}"] = round(float(np.mean(cells["elongation"][sel])), 4)
         feats[f"cell_order_{name}"] = round(_order(cells["angle_al"][sel]), 4)
     feats["cell_diam_cv"] = round(float(np.std(cells["diameter_mm"]) / np.mean(cells["diameter_mm"])), 4)
-    if "cell_diam_skin" in feats and "cell_diam_core" in feats:
-        feats["cell_diam_skin_core_ratio"] = round(feats["cell_diam_skin"] / feats["cell_diam_core"], 4)
+
     return feats
 
 

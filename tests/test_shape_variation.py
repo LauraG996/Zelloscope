@@ -283,3 +283,42 @@ def test_cli_overlay(dataset, tmp_path):
     assert sv_main(["overlay", str(d / f"{truth[0]['name']}.png"), "-o", str(out), "--window", "50"]) == 0
     img = cv2.imread(str(out / f"{truth[0]['name']}_segmentation.jpg"))
     assert img is not None and img.shape[0] > 900
+
+
+def test_surface_intercepts_recover_flattened_layer(cfg):
+    """Synthetic slab, 40 px/mm: three layers of flattened cells (0.4 mm deep x 1.2 mm wide) under the top
+    surface, then round 0.8 mm cells. The intercept method must see the flattening and a round core."""
+    from shape_variation.cells import surface_features, surface_intercepts
+    from shape_variation.io import ImageRecord
+    from shape_variation.segment import Prepared
+    res, top = 40, 40
+    h, w = top + 9 * res, 20 * res
+    img = np.full((h, w), 8, np.uint8)
+    img[top:] = 70
+    walls = np.zeros((h, w), np.uint8)
+    depth_lines = [0.4, 0.8, 1.2] + list(np.arange(2.0, 9.0, 0.8))
+    for d in depth_lines:
+        walls[top + int(round(d * res))] = 255
+    for x in np.arange(0, w, 1.2 * res):
+        walls[top:top + int(1.2 * res), int(x)] = 255
+    for x in np.arange(0.4 * res, w, 0.8 * res):
+        walls[top + int(1.2 * res):, int(x)] = 255
+    walls = cv2.dilate(walls, np.ones((2, 2), np.uint8))
+    img = np.maximum(img, (walls * 0.6).astype(np.uint8))
+    img = cv2.GaussianBlur(img, (0, 0), 0.8)
+    img[:top] = 8
+    foam = np.zeros((h, w), bool)
+    foam[top:] = True
+    prep = Prepared(record=ImageRecord(Path("slab.png"), 1 / res, "test", None), foam=foam,
+                    cavity=np.zeros((h, w), bool), valid=np.ones((h, w), bool), res=float(res), base_row=float(h),
+                    axis_col=w / 2, visible_depth_mm=9.0, full_view=True,
+                    image_to_canvas=np.array([[1.0, 0, 0], [0, 1.0, 0]]))
+    p = dict(cfg["cells"], work_px_per_mm=float(res))
+    si = surface_intercepts(cv2.cvtColor(img, cv2.COLOR_GRAY2BGR), prep, p, None,
+                            core_diameter_mm=0.8 / (np.pi / 4))
+    flat = si["outer"]["flattening"]
+    assert flat[0] > 2.0, flat                                   # 1.2 / 0.4 = 3 in the first 0.5 mm
+    assert np.all((flat[3:] > 0.8) & (flat[3:] < 1.25)), flat    # round core from 1.5 mm
+    f = surface_features(si)
+    assert f["outer_layer_deep_mm"] == pytest.approx(0.4, abs=0.08)
+    assert f["outer_flattened_depth_mm"] <= 1.75

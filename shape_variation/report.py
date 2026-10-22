@@ -3,6 +3,7 @@ import base64
 import datetime as dt
 import html
 import io
+import warnings
 from pathlib import Path
 
 import matplotlib
@@ -222,6 +223,41 @@ def fig_cell_maps(a: Analysis) -> str:
     return _png(fig)
 
 
+def fig_surface(a: Analysis) -> str | None:
+    """Cell flattening and size (wall-to-wall distance) against depth below the outer / cavity surface."""
+    profs = a.cells.get("profiles") if isinstance(a.cells, dict) else None
+    if not profs:
+        return None
+    x = profs[0]["bin_mid_mm"]
+    fig, axes = plt.subplots(1, 2, figsize=(10, 3.4))
+    for surf, colour, name in (("outer", BLUE, "below the outer surface"), ("cavity", ORANGE, "below the cavity")):
+        for ax, key in ((axes[0], "flattening"), (axes[1], None)):
+            if key:
+                vals = np.array([pr[surf][key] for pr in profs])
+            else:
+                vals = np.array([pr[surf]["deep_mm"] for pr in profs])
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore", RuntimeWarning)
+                mean = np.nanmean(vals, axis=0)
+                lo, hi = np.nanmin(vals, axis=0), np.nanmax(vals, axis=0)
+            ax.fill_between(x, lo, hi, color=colour, alpha=0.15, lw=0)
+            ax.plot(x, mean, color=colour, marker="o", ms=4, label=name)
+            if key is None:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)
+                    wide = np.nanmean(np.array([pr[surf]["wide_mm"] for pr in profs]), axis=0)
+                ax.plot(x, wide, color=colour, ls="--", lw=1.5)
+    axes[0].axhline(1.0, color=MUTED, lw=1, ls="--")
+    axes[0].text(x[-1], 1.0, "round ", va="bottom", ha="right", color=MUTED, fontsize=8)
+    axes[0].set_title("flattening (width along the surface / depth into the foam)", loc="left")
+    axes[1].set_title("cell depth (solid) and width (dashed), mm wall to wall", loc="left")
+    for ax in axes:
+        ax.set_xlabel("depth below the surface (mm)")
+    axes[0].legend(loc="upper right")
+    fig.tight_layout()
+    return _png(fig)
+
+
 def fig_relaxation(a: Analysis) -> str | None:
     fits = {k: v for k, v in a.relaxation.items() if "tau" in v}
     if not fits:
@@ -363,6 +399,12 @@ LABELS = {
     "wall_right": "Right wall (mm)", "cavity_width_mid": "Cavity mid (mm)", "lean_left_deg": "Left lean (°)",
     "lean_right_deg": "Right lean (°)", "length": "Length (mm)", "feature": "Feature", "target": "Target",
     "rho": "ρ", "p": "p", "q": "q", "n": "n",
+    "outer_layer_flattening": "Outer: flattening", "outer_layer_deep_mm": "Outer: cell depth (mm)",
+    "outer_layer_wide_mm": "Outer: cell width (mm)", "outer_flattened_depth_mm": "Outer: flat zone (mm)",
+    "cavity_layer_flattening": "Cavity: flattening", "cavity_layer_deep_mm": "Cavity: cell depth (mm)",
+    "cavity_layer_wide_mm": "Cavity: cell width (mm)", "cavity_flattened_depth_mm": "Cavity: flat zone (mm)",
+    "outer_core_flattening": "Core flattening (outer side)", "cavity_core_flattening": "Core flattening (cavity side)",
+    "wall_sensitivity": "Wall sensitivity",
 }
 
 
@@ -617,13 +659,37 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
     # ---- cells
     add('<section id="cells"><h2>Cell structure</h2>')
     if isinstance(a.cells, dict):
-        add(f'<p class="lead">{sum(a.cells["n_cells"]):,} cells in {len(a.cells["n_cells"])} parts. Cells touching '
-            'the foam edge are left out, so density reads slightly low in the outermost bins. The maps average all '
-            'parts in the aligned frame.</p>')
+        add(f'<p class="lead">{sum(a.cells["n_cells"]):,} cells in {len(a.cells["n_cells"])} parts, including the '
+            'layer touching the surfaces. Patches much larger than a cell (several cells merged, mostly where the '
+            'walls are hidden at the surface) are left out. The maps average all parts in the aligned frame.</p>')
         add(fig(fig_cell_maps(a), "Cell maps", "Mean cell diameter, cells per mm² and elongation "
                 "(long axis / short axis) in 2 mm bins, with the mean outline."))
+        surf_fig = fig_surface(a)
+        layer_cols = [c for c in ("outer_layer_flattening", "outer_layer_deep_mm", "outer_layer_wide_mm",
+                                  "outer_flattened_depth_mm", "cavity_layer_flattening", "cavity_layer_deep_mm",
+                                  "cavity_layer_wide_mm", "cavity_flattened_depth_mm", "outer_core_flattening",
+                                  "cavity_core_flattening", "wall_sensitivity") if c in t]
+        if surf_fig:
+            mean_of = lambda col: t[col].mean() if col in t else float("nan")
+            add(f'<h3>Cells at the surfaces</h3><p class="lead">Measured by counting cell walls along lines '
+                f'straight in from each surface and along lines parallel to it (line-intercept method, as in ASTM '
+                f'D3576). In the first 0.5 mm the cells are {mean_of("outer_layer_flattening"):.2f}\u00d7 wider than '
+                f'deep below the outer surface and {mean_of("cavity_layer_flattening"):.2f}\u00d7 below the cavity; '
+                f'in the core about {mean_of("outer_core_flattening"):.2f}\u00d7. The flattened zone reaches about '
+                f'{mean_of("outer_flattened_depth_mm"):.1f} mm (outer) and {mean_of("cavity_flattened_depth_mm"):.1f} '
+                f'mm (cavity) into the foam.</p>'
+                '<p class="note">The cavity value for the first 0.5 mm is less certain: in these images the cut '
+                'face is blurred along the cavity edge, so some walls there are missed and the cells read wider '
+                'than they are. Check with <code>python -m shape_variation overlay</code>; the outer surface is '
+                'sharp.</p>')
+            add(fig(surf_fig, "Cells against depth below the surface", "Points: mean over parts in 0.5 mm "
+                    "steps (wider steps deeper in); bands: range of parts. Wall-detection sensitivity is set per "
+                    "image so that, in the core, the wall-to-wall distance matches the cell outlines (\u03c0/4 \u00d7 "
+                    "the mean cell diameter)."))
+            add(_table(t, ["name"] + layer_cols))
         cell_cols = [c for c in t.columns if c.startswith("cell_")]
-        add('<details><summary>Cell features per part</summary>' + _table(t, ["name"] + cell_cols) + '</details>')
+        add('<details><summary>Other cell features per part</summary>' + _table(t, ["name"] + cell_cols) +
+            '</details>')
     else:
         add(f'<p class="lead">{html.escape(str(a.cells))}. Run <code>analyze --cells</code> to include it.</p>')
     add('</section>')

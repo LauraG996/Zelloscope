@@ -77,9 +77,33 @@ per mode sd).
 * No cell feature correlates with the shape after the multiple-testing correction. With 11 parts this is
   expected. Collect more parts before reading anything into it.
 
-Cell limitations: the outer skin (~1–2 mm of small, compressed cells) is not split into cells and is left
-out, as is the layer of cells touching the cavity. The method has only been checked by eye against the
-images (`overlay`), not against manual counts or Zelloscope's own cell measurement.
+### Cells at the surfaces
+
+At both surfaces the first cell layer is flattened against the surface. The watershed does not split that
+layer into cells, so it is measured separately with the line-intercept method (as in ASTM D3576),
+`cells.surface_intercepts()`:
+
+* A wall map comes from a Sato ridge filter, which picks out the bright, line-like cell walls.
+* Walls are counted along lines going straight in from each surface (every 0.25 mm along the surface, up to
+  3.5 mm deep, stopping halfway to the other surface). The wall-to-wall distance along these lines is the
+  cell depth.
+* Walls are also counted along lines running parallel to the surface at 0.25, 0.75, 1.25, 1.75 and 2.5 mm
+  deep. The wall-to-wall distance there is the cell width. Flattening = width / depth (1 = round).
+* The wall-detection sensitivity is set per image: in the core (more than 2 mm in), the wall-to-wall distance
+  has to match π/4 × the mean diameter of the watershed cells, which are reliable there. All 11 images landed
+  on the same setting.
+* A synthetic test with known flattened cells (0.4 × 1.2 mm under the surface, 0.8 mm round below) checks
+  that both are recovered.
+
+First result (11 parts): in the first 0.5 mm the cells are about 1.8× wider than deep below the outer
+surface. They are nearly round (about 1.1×) from about 1.5–2 mm in. Below the cavity the first 0.5 mm reads
+about 3.4×, but that value is less certain: the cut face is blurred along the cavity edge in these images, so
+some walls are missed and the cells read too wide. Check with `overlay`, where the detected walls are marked
+in cyan.
+
+Other cell limitations: cells touching the foam edge are left out of the per-cell statistics and maps
+(the surface layer is covered by the intercepts above). The watershed has only been checked by eye against
+the images (`overlay`), not against manual counts or Zelloscope's own cell measurement.
 
 ## Open questions / what to collect
 
