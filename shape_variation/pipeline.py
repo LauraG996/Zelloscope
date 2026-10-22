@@ -71,19 +71,27 @@ def process_settings(ts: dt.datetime | None, cfg) -> dict:
     return {k: v for k, v in w.items() if k not in ("start", "end", "label")}
 
 
-def choose_depth(preps, cfg) -> float | None:
-    """Window depth for the data set: config number, 'full', or auto (deepest depth visible in every image)."""
+def choose_depth(preps, cfg) -> tuple[float | None, list]:
+    """Window depth for the data set: config number, 'full', or auto (deepest depth visible in every image).
+    In auto mode an image showing much less of the part than the others (the part touches the side of the frame)
+    would shrink the window for all of them; such images are returned as (prep, reason) to be skipped instead."""
     d = cfg["window"]["depth_mm"]
     if d == "full":
         bad = [p.record.name for p in preps if not p.full_view]
         if bad:
             raise SegmentationError(f"window 'full' needs the whole profile in every image; cut off in {bad}")
-        return None
+        return None, []
     if d == "auto":
         if all(p.full_view for p in preps):
-            return None
-        return float(min(p.visible_depth_mm for p in preps) - cfg["window"]["auto_margin_mm"])
-    return float(d)
+            return None, []
+        depths = np.array([p.visible_depth_mm for p in preps])
+        floor = cfg["window"]["auto_min_fraction"] * float(np.median(depths))
+        short = [(p, f"only {p.visible_depth_mm:.1f} mm of the part is visible (the others show at least "
+                     f"{floor:.1f} mm; the part touches the side of the image) - would shrink the window for all")
+                 for p in preps if p.visible_depth_mm < floor]
+        kept = depths[depths >= floor]
+        return float(kept.min() - cfg["window"]["auto_margin_mm"]), short
+    return float(d), []
 
 
 def _aligned_polygons(shape: Shape, al) -> tuple[np.ndarray, np.ndarray]:
@@ -105,7 +113,10 @@ def run(inputs, cfg: AnalysisConfig, with_cells: bool = False, reference_names=N
     if len(preps) < 3:
         raise SegmentationError(f"need at least 3 usable images, have {len(preps)}; skipped: {skipped}")
 
-    depth = choose_depth(preps, cfg)
+    depth, short = choose_depth(preps, cfg)
+    for p, reason in short:
+        skipped.append((p.record.path.name, reason))
+        preps.remove(p)
     sm = cfg["shape_model"]
     shapes = []
     for p in preps:

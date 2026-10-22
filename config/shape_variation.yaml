@@ -23,6 +23,7 @@ segmentation:
 window:
   depth_mm: auto
   auto_margin_mm: 1.0
+  auto_min_fraction: 0.8    # auto: images showing less than this x the median visible depth are skipped
 
 shape_model:
   n_outer: 200

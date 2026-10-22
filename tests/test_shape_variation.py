@@ -297,6 +297,17 @@ def test_cli_overlay(dataset, tmp_path):
     assert img is not None and img.shape[0] > 900
 
 
+def test_auto_window_skips_image_showing_little_of_the_part(cfg):
+    from types import SimpleNamespace
+
+    from shape_variation.pipeline import choose_depth
+    preps = [SimpleNamespace(full_view=False, visible_depth_mm=v, record=SimpleNamespace(name=str(v)))
+             for v in (49.0, 50.0, 51.0, 26.5)]
+    depth, short = choose_depth(preps, cfg)
+    assert depth == pytest.approx(49.0 - cfg["window"]["auto_margin_mm"])
+    assert [p.visible_depth_mm for p, _ in short] == [26.5]
+
+
 def test_feed_rate_from_process_window(cfg):
     import datetime as dt
 

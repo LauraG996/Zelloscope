@@ -16,7 +16,7 @@ DEFAULTS = {
     "exclude": [],
     "segmentation": {"method": "otsu", "blur_mm": 0.15, "cleanup_kernel_mm": 0.3, "max_pore_area_mm2": 8.0,
                      "work_px_per_mm": 20.0, "frame_margin_mm": 0.3},
-    "window": {"depth_mm": "auto", "auto_margin_mm": 1.0},
+    "window": {"depth_mm": "auto", "auto_margin_mm": 1.0, "auto_min_fraction": 0.8},
     "shape_model": {"n_outer": 200, "n_cavity": 200, "variance_keep": 0.95, "allow_mirror": True,
                     "bootstrap": 200, "mode_sigma": 2.0},
     "thickness": {"raster_px_per_mm": 20.0, "grid_step_mm": 1.0, "end_trim_mm": 10.0},
