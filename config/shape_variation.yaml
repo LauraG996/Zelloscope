@@ -1,0 +1,71 @@
+# Zelloscope shape-variation analysis - NMC NOMAPACK U 0-24/77.
+# Spec limits are reused from the profile_check config (spec_config); scale comes from the images / scale.yaml.
+
+product: NMC NOMAPACK U 0-24/77
+spec_config: nmc_nomapack_u_0-24-77.yaml     # relative to this file
+
+# Files matching these regexes are ignored (other products in the same folders).
+exclude: ["squarefoam"]
+
+segmentation:
+  method: otsu              # otsu = grey-level threshold (works on the 2026 rig images); hsv = profile_check's HSV box
+  blur_mm: 0.15             # smoothing before thresholding (averages out cell walls)
+  cleanup_kernel_mm: 0.3
+  max_pore_area_mm2: 8.0    # dark holes in the foam smaller than this are pores/cells, not the cavity
+  work_px_per_mm: 20.0      # resolution of the canonical raster
+  frame_margin_mm: 0.3      # foam this close to the image edge counts as cut off by the frame
+
+# The 2026-06-04 / 2026-08-27 images show only the base and ~40 mm of the legs (the tips are outside the frame).
+# All shapes are compared within the same window measured from the outer base:
+#   auto = the largest depth visible in every image (minus auto_margin_mm); full = whole profile (tips visible
+#   in all images, e.g. the wider field of view); a number = that depth in mm.
+window:
+  depth_mm: auto
+  auto_margin_mm: 1.0
+
+shape_model:
+  n_outer: 200
+  n_cavity: 200
+  variance_keep: 0.95
+  allow_mirror: true
+  bootstrap: 200            # resamples used to judge how stable each mode is
+  mode_sigma: 2.0           # mode plots show mean +- this many standard deviations
+
+thickness:
+  raster_px_per_mm: 20.0
+  grid_step_mm: 1.0
+  end_trim_mm: 10.0         # medial axis is unreliable this close to the window cut / tips (~1 wall)
+
+monitoring:
+  t2_alpha: 0.01            # Hotelling T^2 limit for "abnormal shape"
+  spc_sigma: 3.0
+  run_length: 8             # SPC run rule: this many points in a row on one side of the centre line
+  trend_length: 6           # SPC trend rule: this many points steadily rising or falling
+
+# Time windows with different process settings. Back-calculated from plots/4june_vs_27aug_plot.svg on the
+# sweet-bell branch; the plot overlays two days on one time-of-day axis.
+# TODO(NMC): confirm which day these windows belong to and what changed (feed rate?).
+process_windows:
+  date: 2026-06-04
+  windows:
+    - {start: null,    end: "11:10", label: "Process change 1"}
+    - {start: "11:10", end: "12:57", label: "Process change 2"}
+    - {start: "12:57", end: "13:55", label: "Process change 3"}
+    - {start: "13:55", end: "14:56", label: "Process change 4"}
+    - {start: "14:56", end: null,    label: "Process change 5"}
+
+cells:
+  seed_smooth_mm: 0.2       # ported from cell_segmentation.py (14 px / 28 px at 0.014019 mm/px)
+  seed_min_separation_mm: 0.39
+  wall_smooth_mm: 0.02
+  min_area_mm2: 0.02
+  merged_area_factor: 4.0   # cells larger than this x the median cell area are several cells merged: dropped
+  map_bin_mm: 2.0
+  work_px_per_mm: 40.0      # images are downsampled to this before watershed (speed)
+
+relaxation:
+  min_images_per_part: 3
+  settle_fraction: 0.95     # "stabilised" = this fraction of the total change has happened
+
+# TODO(NMC): where exactly are the 24 mm width and 12 mm thickness measured? (definitions in profile_check/measure.py)
+# TODO(NMC): tip overlap / asymmetry tolerance - only measurable with the wider field of view; reported, never failed.
