@@ -275,3 +275,11 @@ def test_cli_analyze_and_score(dataset, tmp_path):
     cv2.imwrite(str(new / "bad.png"), _render(51, 5.0, lean=4.0, lean_right=7.0, base_thickness=12.0,
                                               inner_width=21.0))
     assert sv_main(["score", "--model", str(out / "model.npz"), str(new / "bad.png")]) == 1
+
+
+def test_cli_overlay(dataset, tmp_path):
+    d, truth = dataset
+    out = tmp_path / "ov"
+    assert sv_main(["overlay", str(d / f"{truth[0]['name']}.png"), "-o", str(out), "--window", "50"]) == 0
+    img = cv2.imread(str(out / f"{truth[0]['name']}_segmentation.jpg"))
+    assert img is not None and img.shape[0] > 900

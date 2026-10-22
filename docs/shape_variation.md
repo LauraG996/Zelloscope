@@ -12,7 +12,12 @@ conda env create -f environment.yml        # or: pip install -r requirements-dev
 python -m shape_variation scales data/nmc_u/2026-06-04            # check every image has a scale
 python -m shape_variation analyze data/nmc_u/2026-06-04 data/nmc_u/2026-08-27 -o results/variation --cells
 python -m shape_variation score --model results/variation/model.npz new_images/ -o results/new.csv
+python -m shape_variation overlay data/nmc_u/2026-06-04 -o results/overlays          # check the segmentation
 ```
+
+`overlay` draws, over each image, the foam and cavity outlines, the window cut and every cell boundary. Measured
+cells are yellow; cells that were dropped are violet, either because they touch the foam edge or because they
+lie outside the window. It also adds 12 × 12 mm close-ups of the base and a leg.
 
 `analyze` writes the following to `results/variation/`:
 * `report.html` – the report: summary, mode plots, thickness heat map, control charts, anomaly ranking, cell maps,
@@ -48,7 +53,7 @@ An optional `parts.csv` in the image folder adds `part_id`, `batch`, process set
 | Drift | Individuals (SPC) charts of the main mode scores and key dimensions in time order: beyond 3 sigma, 8 in a row on one side, 6 rising or falling. Process-change windows are shaded. | `monitor.py` |
 | Anomalies | Hotelling T² in the first modes, at most one mode per 3 parts. Each part is compared with all the *other* parts, so it cannot hide itself. A leave-one-out residual (SPE) catches deformations the model has not seen. The hard spec check is reported separately. | `monitor.py` |
 | Relaxation | Pooled exponential fit for parts imaged repeatedly: y = c_part + A·exp(−t/τ). Gives the time to 95 % settled, and how well the first image predicts the final shape (leave one part out). | `relaxation.py` |
-| Cells | Watershed cell segmentation ported from `cell_segmentation.py`, with parameters in mm. Per cell: size, elongation and orientation, mapped into the aligned frame. Gives maps and per-region features (base / legs / skin / core). | `cells.py` |
+| Cells | Watershed cell segmentation ported from `cell_segmentation.py` (brave-hamilton branch), with parameters in mm. Per cell: size, elongation and orientation, mapped into the aligned frame. Gives maps and per-region features (base / legs / skin / core). | `cells.py` |
 | Links | Spearman correlations with a Benjamini-Hochberg q-value, plus a shallow random forest with leave-one-out R² and permutation importance. Exploratory only. | `correlate.py` |
 
 Repeatability on synthetic parts: imaging the same part at other angles or from the other cut end moves the
@@ -71,6 +76,10 @@ per mode sd).
   these rejects.
 * No cell feature correlates with the shape after the multiple-testing correction. With 11 parts this is
   expected. Collect more parts before reading anything into it.
+
+Cell limitations: the outer skin (~1–2 mm of small, compressed cells) is not split into cells and is left
+out, as is the layer of cells touching the cavity. The method has only been checked by eye against the
+images (`overlay`), not against manual counts or Zelloscope's own cell measurement.
 
 ## Open questions / what to collect
 

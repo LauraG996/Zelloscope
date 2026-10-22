@@ -6,6 +6,9 @@
   Score new parts against the saved model (abnormal shape, new deformation, spec):
       python -m shape_variation score --model results/variation/model.npz new_images/ -o results/new.csv
 
+  Draw the segmentation (outlines, window cut, every cell) over the image, to check it:
+      python -m shape_variation overlay data/nmc_u/2026-06-04 -o results/overlays
+
   Check which images have a known scale (nothing else is done):
       python -m shape_variation scales data/nmc_u
 
@@ -84,6 +87,38 @@ def cmd_score(args) -> int:
     return 1 if bad else 0
 
 
+def cmd_overlay(args) -> int:
+    import cv2
+
+    from .cells import overlay_panel
+    from .segment import prepare
+    cfg = load_config(args.config)
+    out = Path(args.output)
+    out.mkdir(parents=True, exist_ok=True)
+    window = args.window if args.window is not None else cfg["window"]["depth_mm"]
+    for r in discover(args.inputs, tuple(cfg["exclude"])):
+        if r.mm_per_px is None:
+            print(f"{r.path.name}: skipped - scale unknown ({r.scale_source})")
+            continue
+        try:
+            prep = prepare(r, cfg)
+        except SegmentationError as e:
+            print(f"{r.path.name}: skipped - {e}")
+            continue
+        if window == "full" or (window == "auto" and prep.full_view):
+            depth = None
+        elif window == "auto":
+            depth = prep.visible_depth_mm - cfg["window"]["auto_margin_mm"]
+        else:
+            depth = float(window)
+        img = cv2.imread(str(r.path), cv2.IMREAD_COLOR)
+        title = f"{r.path.name}  -  {'full outline' if depth is None else f'window {depth:.1f} mm from the base'}"
+        cv2.imwrite(str(out / f"{r.path.stem}_segmentation.jpg"), overlay_panel(img, prep, cfg["cells"], depth, title),
+                    [cv2.IMWRITE_JPEG_QUALITY, 90])
+        print(f"{r.path.name} -> {out / (r.path.stem + '_segmentation.jpg')}")
+    return 0
+
+
 def cmd_scales(args) -> int:
     cfg = load_config(args.config)
     missing = 0
@@ -111,11 +146,16 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("-o", "--output", help="CSV to write")
     c = sub.add_parser("scales", help="list the scale found for each image")
     c.add_argument("inputs", nargs="+")
-    for p in (a, s, c):
+    o = sub.add_parser("overlay", help="draw the shape and cell segmentation over each image")
+    o.add_argument("inputs", nargs="+")
+    o.add_argument("-o", "--output", default="results/overlays", help="output folder")
+    o.add_argument("--window", help="window depth in mm, 'auto' (this image's visible depth) or 'full'")
+    for p in (a, s, c, o):
         p.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     return ap
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
-    return {"analyze": cmd_analyze, "score": cmd_score, "scales": cmd_scales}[args.cmd](args)
+    return {"analyze": cmd_analyze, "score": cmd_score, "scales": cmd_scales,
+            "overlay": cmd_overlay}[args.cmd](args)
