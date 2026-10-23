@@ -186,8 +186,12 @@ def _sample_lines(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | No
         other = dist["cavity" if surf == "outer" else "outer"]
         d_here = dist[surf]
         cs, _ = cv2.findContours(region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if cs:
-            c = max(cs, key=cv2.contourArea).reshape(-1, 2).astype(float)
+        # the outer surface is the largest outline; every hole is a cavity surface
+        cs = sorted(cs, key=cv2.contourArea, reverse=True)[:1] if surf == "outer" else list(cs)
+        for c in cs:
+            c = c.reshape(-1, 2).astype(float)
+            if len(c) < 20:
+                continue
             cs_s = gaussian_filter1d(c, res * 1.0, axis=0, mode="wrap")         # direction smoothed over ~1 mm
             tan = np.gradient(cs_s, axis=0)
             nrm = np.column_stack([-tan[:, 1], tan[:, 0]])
@@ -380,7 +384,7 @@ KEPT_BGR, SURFACE_BGR, DROPPED_BGR, FOAM_BGR, CAVITY_BGR, CUT_BGR = (0, 230, 255
 
 
 def draw_segmentation(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None,
-                      with_cells: bool = True, walls: bool = True) -> tuple[np.ndarray, dict]:
+                      with_cells: bool = True, walls: bool = True, generic: bool = False) -> tuple[np.ndarray, dict]:
     """The image (at the cell working resolution) with the foam and cavity outlines, the window cut line and
     every cell boundary: measured cells in yellow, cells dropped (touching the edge, merged, too small, or outside
     the window) in violet. With `walls`, the cell walls found by the surface intercepts are marked in cyan. Also returns the zoom-in points (small-image px) for the base centre and a leg."""
@@ -419,8 +423,8 @@ def draw_segmentation(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float 
 
     for region, colour in ((prep.foam | prep.cavity, FOAM_BGR), (prep.cavity, CAVITY_BGR)):
         cs, _ = cv2.findContours(region.astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-        if cs:
-            c = max(cs, key=cv2.contourArea).reshape(-1, 2)
+        for c in (sorted(cs, key=cv2.contourArea)[-1:] if colour == FOAM_BGR else cs):
+            c = c.reshape(-1, 2)
             cv2.polylines(out, [np.round(to_img(c)).astype(np.int32)], True, colour, 2 * th, cv2.LINE_AA)
     if with_cells and walls:
         areas = np.bincount(np.where(labels >= 2, labels, 0).ravel())
@@ -435,6 +439,18 @@ def draw_segmentation(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float 
         a, b = np.round(to_img(cut)).astype(int)
         cv2.line(out, tuple(a), tuple(b), CUT_BGR, 2 * th, cv2.LINE_AA)
 
+    if generic:
+        # zoom points: the thickest wall (deepest point of the foam) and the outline point farthest from the centre
+        # (a corner), moved 3 mm into the foam
+        dist = cv2.distanceTransform(prep.foam.astype(np.uint8), cv2.DIST_L2, 5)
+        r_, c_ = np.unravel_index(int(np.argmax(dist)), dist.shape)
+        cs, _ = cv2.findContours((prep.foam | prep.cavity).astype(np.uint8), cv2.RETR_EXTERNAL,
+                                 cv2.CHAIN_APPROX_NONE)
+        o = max(cs, key=cv2.contourArea).reshape(-1, 2).astype(float)
+        far = o[np.argmax(np.hypot(o[:, 0] - prep.axis_col, o[:, 1] - prep.base_row))]
+        towards = np.array([prep.axis_col, prep.base_row]) - far
+        corner = far + towards / max(np.linalg.norm(towards), 1e-9) * 3.0 * prep.res
+        return out, {"thickest wall": to_img([[c_, r_]])[0], "corner": to_img([corner])[0], "res": res}
     # zoom points: base centre (6 mm up from the outer base) and the middle of the left leg at 2/3 depth
     base_pt = to_img(canvas_of_mm([[0, -6]]))[0]
     d = 0.66 * (depth_mm if depth_mm is not None else prep.visible_depth_mm)
@@ -446,15 +462,15 @@ def draw_segmentation(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float 
 
 
 def overlay_panel(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | None, title: str,
-                  zoom_mm: float = 12.0) -> np.ndarray:
-    """Whole image plus two zoomed crops (base, leg) side by side, with a legend."""
-    full, pts = draw_segmentation(img, prep, p, depth_mm)
+                  zoom_mm: float = 12.0, generic: bool = False) -> np.ndarray:
+    """Whole image plus two zoomed crops (base and leg; generic: thickest wall and a corner), with a legend."""
+    full, pts = draw_segmentation(img, prep, p, depth_mm, generic=generic)
     res = pts["res"]
     h = 900
     left = cv2.resize(full, (int(full.shape[1] * h / full.shape[0]), h), interpolation=cv2.INTER_AREA)
     crops = []
     half = int(zoom_mm * res / 2)
-    for key in ("base", "leg"):
+    for key in [k for k in pts if k != "res"]:
         x, y = np.round(pts[key]).astype(int)
         x0, y0 = max(0, x - half), max(0, y - half)
         c = full[y0:y0 + 2 * half, x0:x0 + 2 * half]
@@ -466,9 +482,11 @@ def overlay_panel(img: np.ndarray, prep: Prepared, p: dict, depth_mm: float | No
     bar = np.full((70, panel.shape[1], 3), 24, np.uint8)
     cv2.putText(bar, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (255, 255, 255), 2, cv2.LINE_AA)
     x = 12
-    for text, colour in (("foam outline", FOAM_BGR), ("cavity", CAVITY_BGR), ("window cut", CUT_BGR),
-                         ("cells", KEPT_BGR), ("walls on surface lines", SURFACE_BGR),
-                         ("dropped (edge / merged / outside window)", DROPPED_BGR)):
+    legend = ((("foam outline", FOAM_BGR), ("holes", CAVITY_BGR)) if generic else
+              (("foam outline", FOAM_BGR), ("cavity", CAVITY_BGR), ("window cut", CUT_BGR))) + \
+        (("cells", KEPT_BGR), ("walls on surface lines", SURFACE_BGR),
+         ("dropped (edge / merged)" if generic else "dropped (edge / merged / outside window)", DROPPED_BGR))
+    for text, colour in legend:
         cv2.rectangle(bar, (x, 44), (x + 18, 58), colour, -1)
         cv2.putText(bar, text, (x + 24, 57), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (230, 230, 230), 1, cv2.LINE_AA)
         x += 34 + 9 * len(text)
@@ -485,9 +503,13 @@ def cell_features(cells: dict, outer: np.ndarray, cavity: np.ndarray) -> dict:
     x, y = cells["x_al"], cells["y_al"]
     if len(x) == 0:
         return {}
-    cav_bottom = cavity[:, 1].max()
-    regions = {"all": np.ones(len(x), bool), "base": y > cav_bottom, "legs": y <= cav_bottom}
-    area = abs(cv2.contourArea(outer.astype(np.float32))) - abs(cv2.contourArea(cavity.astype(np.float32)))
+    holes = cavity if isinstance(cavity, list) else [cavity]           # generic mode: a list of holes
+    regions = {"all": np.ones(len(x), bool)}
+    if not isinstance(cavity, list):                                    # U profile: base vs legs
+        cav_bottom = cavity[:, 1].max()
+        regions.update(base=y > cav_bottom, legs=y <= cav_bottom)
+    area = abs(cv2.contourArea(outer.astype(np.float32))) - sum(abs(cv2.contourArea(h.astype(np.float32)))
+                                                                 for h in holes if len(h) >= 3)
     feats = dict(cell_count=int(len(x)), cell_density_per_mm2=round(len(x) / area, 4) if area > 0 else float("nan"))
     for name, sel in regions.items():
         if sel.sum() < 5:
@@ -509,7 +531,9 @@ def _foam_area_per_bin(foam_polys, bin_mm: float, x0: float, y0: float, nx: int,
         m = np.zeros((ny * sub, nx * sub), np.uint8)
         to_px = lambda q: np.round((q - [x0, y0]) * res * 16).astype(np.int32)
         cv2.fillPoly(m, [to_px(outer)], 1, cv2.LINE_8, shift=4)
-        cv2.fillPoly(m, [to_px(cavity)], 0, cv2.LINE_8, shift=4)
+        for h in (cavity if isinstance(cavity, list) else [cavity]):
+            if len(h) >= 3:
+                cv2.fillPoly(m, [to_px(h)], 0, cv2.LINE_8, shift=4)
         area += m.reshape(ny, sub, nx, sub).sum(axis=(1, 3)) / res ** 2
     return area
 

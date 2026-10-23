@@ -14,7 +14,7 @@ import numpy as np  # noqa: E402
 import pandas as pd  # noqa: E402
 from matplotlib.colors import LinearSegmentedColormap  # noqa: E402
 
-from .pipeline import KEY_DIMS, Analysis  # noqa: E402
+from .pipeline import Analysis  # noqa: E402
 
 # Reference data-viz palette (light): categorical slots, status, surfaces, ramps.
 BLUE, ORANGE, AQUA = "#2a78d6", "#eb6834", "#1baf7a"
@@ -39,10 +39,10 @@ def _png(fig) -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _draw_shape(ax, pts, n_outer, closed, **kw):
-    o, c = pts[:n_outer], pts[n_outer:]
-    for i, curve in enumerate((o, c)):
-        if closed:
+def _draw_shape(ax, pts, m, **kw):
+    """Draw a shape of model m: each curve separately (outer, then cavity / holes)."""
+    for i, curve in enumerate(m.contours(pts)):
+        if m.closed:
             curve = np.vstack([curve, curve[:1]])
         ax.plot(curve[:, 0], curve[:, 1], **(kw if i == 0 else {k: v for k, v in kw.items() if k != "label"}))
 
@@ -60,10 +60,14 @@ def fig_overlay(a: Analysis) -> str:
     m = a.model
     fig, ax = plt.subplots(figsize=(4.6, 4.6))
     for al in a.aligned:
-        _draw_shape(ax, al.points, m.n_outer, m.closed, color=MUTED, lw=0.8, alpha=0.6)
-    _draw_shape(ax, m.mean, m.n_outer, m.closed, color=INK, lw=2, label="mean shape")
+        _draw_shape(ax, al.points, m, color=MUTED, lw=0.8, alpha=0.6)
+    _draw_shape(ax, m.mean, m, color=INK, lw=2, label="mean shape")
+    if a.kind == "generic":
+        o = m.contours(m.mean)[0]
+        ax.plot(*o[0], "o", color=ORANGE, ms=6, label="outline start (0 mm)")
+        ax.annotate("", xy=o[6], xytext=o[0], arrowprops=dict(arrowstyle="->", color=ORANGE, lw=1.5))
     ax.plot([], [], color=MUTED, lw=0.8, label="individual parts")
-    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2)
+    ax.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2, fontsize=8)
     _shape_axes(ax)
     return _png(fig)
 
@@ -87,9 +91,9 @@ def fig_modes(a: Analysis) -> str:
         if i >= k:
             ax.axis("off")
             continue
-        _draw_shape(ax, m.mean, m.n_outer, m.closed, color=MUTED, lw=1.2, label="mean")
-        _draw_shape(ax, show(i, -1), m.n_outer, m.closed, color=BLUE, lw=2, label=f"mean - {n_sigma:g} sd")
-        _draw_shape(ax, show(i, 1), m.n_outer, m.closed, color=ORANGE, lw=2, label=f"mean + {n_sigma:g} sd")
+        _draw_shape(ax, m.mean, m, color=MUTED, lw=1.2, label="mean")
+        _draw_shape(ax, show(i, -1), m, color=BLUE, lw=2, label=f"mean - {n_sigma:g} sd")
+        _draw_shape(ax, show(i, 1), m, color=ORANGE, lw=2, label=f"mean + {n_sigma:g} sd")
         ax.set_title(f"Mode {i + 1} - {100 * m.explained[i]:.0f} % of variation", loc="left")
         _shape_axes(ax)
         if i == 0:
@@ -121,15 +125,18 @@ def fig_variance(a: Analysis) -> str:
 
 def fig_thickness(a: Analysis) -> str:
     g, t = a.thickness_grid, a.thickness
+    generic = a.kind == "generic"
     names = list(a.table["name"])
     fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(8, 2.6 + 0.22 * len(names) + 2.6),
                                    gridspec_kw=dict(height_ratios=[2.6, 0.22 * len(names) + 1]))
     mean = np.nanmean(t, axis=0)
     ax1.fill_between(g, np.nanmin(t, axis=0), np.nanmax(t, axis=0), color="#b7d3f6", lw=0, label="range of parts")
     ax1.plot(g, mean, color=BLUE, label="mean")
-    ax1.axvline(0, color=MUTED, lw=1)
+    if not generic:
+        ax1.axvline(0, color=MUTED, lw=1)
     ax1.set_ylabel("wall thickness (mm)")
-    ax1.set_xlabel("position along the U from the base centre (mm); left leg < 0 < right leg")
+    ax1.set_xlabel("position along the outer outline (mm from its start point, see Figure 1)" if generic else
+                   "position along the U from the base centre (mm); left leg < 0 < right leg")
     ax1.legend(loc="lower center", bbox_to_anchor=(0.5, 1.0), ncol=2)
     dev = t - mean
     lim = max(0.2, float(np.nanmax(np.abs(dev))))
@@ -181,8 +188,11 @@ def fig_control_charts(a: Analysis) -> str:
         if bad:
             ax.plot(x[bad], np.asarray(c["values"])[bad], ls="none", marker="o", ms=8, mfc="none", mec=CRITICAL,
                     mew=2)
-        unit = "deg" if key.endswith("_deg") else ("" if key.startswith("PC") or key == "T2" else "mm")
-        ax.set_title(f"{key} {('(' + unit + ')') if unit else ''}", loc="left")
+        if key in LABELS:
+            ax.set_title(LABELS[key], loc="left")
+        else:
+            unit = "deg" if key.endswith("_deg") else ("" if key.startswith("PC") or key == "T2" else "mm")
+            ax.set_title(f"{key} {('(' + unit + ')') if unit else ''}", loc="left")
         ax.set_xticks(x)
         ax.set_xticklabels(names, rotation=90, fontsize=6)
     for ax in axes.ravel()[len(keys):]:
@@ -214,7 +224,7 @@ def fig_cell_maps(a: Analysis) -> str:
     fig, axes = plt.subplots(1, 3, figsize=(12, 4.2))
     for ax, (key, (grid, ext)) in zip(axes, maps.items()):
         im = ax.imshow(grid, cmap=SEQ, extent=ext, interpolation="nearest")
-        _draw_shape(ax, a.model.mean, a.model.n_outer, a.model.closed, color=INK, lw=1)
+        _draw_shape(ax, a.model.mean, a.model, color=INK, lw=1)
         ax.set_aspect("equal")
         ax.set_title(titles[key], loc="left")
         ax.grid(False)
@@ -270,7 +280,7 @@ def fig_flattening_map(a: Analysis) -> str | None:
     m = a.model
     fig, (ax, ax2) = plt.subplots(1, 2, figsize=(12, 5.6), gridspec_kw=dict(width_ratios=[1.15, 1]))
     im = ax.imshow(grid, extent=ext, cmap=DIV, norm=LogNorm(vmin=0.5, vmax=2.0), interpolation="nearest")
-    _draw_shape(ax, m.mean, m.n_outer, m.closed, color=INK, lw=1.2)
+    _draw_shape(ax, m.mean, m, color=INK, lw=1.2)
     ax.set_aspect("equal")                              # extent puts y = base (largest) at the bottom
     ax.grid(False)
     ax.set_xlabel("mm")
@@ -462,6 +472,12 @@ LABELS = {
     "cavity_layer_wide_mm": "Cavity: cell width (mm)", "cavity_flattened_depth_mm": "Cavity: flat zone (mm)",
     "outer_core_flattening": "Core flattening (outer side)", "cavity_core_flattening": "Core flattening (cavity side)",
     "wall_sensitivity": "Wall sensitivity",
+    "area_mm2": "Foam area (mm²)", "outer_width": "Width (mm)", "outer_height": "Height (mm)",
+    "perimeter_mm": "Perimeter (mm)", "convexity": "Convexity", "hole_width": "Hole width (mm)",
+    "hole_height": "Hole height (mm)", "hole_x": "Hole offset x (mm)", "hole_y": "Hole offset y (mm)",
+    "hole_wall_left": "Wall left of hole (mm)", "hole_wall_right": "Wall right of hole (mm)",
+    "hole_wall_top": "Wall above hole (mm)", "hole_wall_bottom": "Wall below hole (mm)",
+    "thickness_min": "Thinnest wall (mm)", "thickness_median": "Median wall (mm)", "thickness_max": "Thickest wall (mm)",
 }
 
 
@@ -566,10 +582,15 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
     # ---- header
     add('<header class="hero"><div class="wrap">')
     add('<div class="eyebrow">Zelloscope · shape-variation report</div>')
-    add(f'<h1>{html.escape(a.cfg["product"])}<span class="sub">Cut-end cross-sections of blue PE-LD foam '
-        f'U-profiles: how the whole shape varies from part to part.</span></h1>')
-    add('<div class="specs">' + "".join(_spec_tag(k, v) for k, v in a.cfg.spec.spec.items()) +
-        f'<span class="spec">Contour tolerance <b>{a.cfg.spec.contour_tolerance_mm:g}</b> mm</span></div>')
+    what = "foam profiles" if a.kind == "generic" else "blue PE-LD foam U-profiles"
+    add(f'<h1>{html.escape(a.cfg["product"])}<span class="sub">Cut-end cross-sections of {what}: how the whole '
+        f'shape varies from part to part.</span></h1>')
+    if a.kind == "generic":
+        add('<div class="specs">' + ("".join(_spec_tag(k, v) for k, v in a.cfg.spec.spec.items()) or
+                                     '<span class="spec">No spec limits configured</span>') + '</div>')
+    else:
+        add('<div class="specs">' + "".join(_spec_tag(k, v) for k, v in a.cfg.spec.spec.items()) +
+            f'<span class="spec">Contour tolerance <b>{a.cfg.spec.contour_tolerance_mm:g}</b> mm</span></div>')
     add('<div class="meta">' +
         f'<span>{n} parts · {", ".join(days) if days else "no timestamps"}</span>' +
         (f'<span>Window {a.depth_mm:.1f} mm from the base</span>' if not a.closed else '<span>Full outline</span>') +
@@ -595,9 +616,14 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
         f'<span class="v">{len(flagged)}<small>of {n}</small></span><span class="d">vs. the other parts</span></div>')
     add(f'<div class="tile{" warn" if spec_out else ""}"><span class="k">Outside drawing limits</span>'
         f'<span class="v">{spec_out}<small>of {n}</small></span><span class="d">as measured here</span></div>')
-    add('<div class="tile"><span class="k">Compared over</span><span class="v">'
-        + (f'{a.depth_mm:.1f}<small>mm</small></span><span class="d">from the base; tips out of frame</span>'
-           if not a.closed else 'full<small>outline</small></span><span class="d">tips included</span>') + '</div>')
+    if a.kind == "generic":
+        n_holes = len(a.model.sizes) - 1
+        add('<div class="tile"><span class="k">Compared over</span><span class="v">full<small>outline</small></span>'
+            f'<span class="d">outer outline + {n_holes} hole{"" if n_holes == 1 else "s"}</span></div>')
+    else:
+        add('<div class="tile"><span class="k">Compared over</span><span class="v">'
+            + (f'{a.depth_mm:.1f}<small>mm</small></span><span class="d">from the base; tips out of frame</span>'
+               if not a.closed else 'full<small>outline</small></span><span class="d">tips included</span>') + '</div>')
     add('</div><div class="grid2">')
 
     add('<div class="card"><h3>How the shape varies</h3>')
@@ -622,7 +648,7 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
         add('<p>No part has an abnormal shape compared with the others.</p>')
     add('</div></div>')
 
-    if spec_out:
+    if spec_out and a.kind == "u_profile":
         rows = []
         for k in ("inner_width_max", "base_thickness"):
             if k in t:
@@ -649,8 +675,9 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
         'other cut end was imaged. There is no scaling, so size differences stay in the model. Each mode is one '
         'independent way the shape varies.</p>')
     add('<div class="figs2">')
-    add(fig(fig_overlay(a), "All parts on the mean shape", "Grey: each aligned part. Black: the mean. "
-            "Base at the bottom, legs up."))
+    add(fig(fig_overlay(a), "All parts on the mean shape", "Grey: each aligned part. Black: the mean. " +
+            ("Long axis horizontal; the orange dot and arrow mark where positions along the outline start "
+             "and which way they run." if a.kind == "generic" else "Base at the bottom, legs up.")))
     add(fig(fig_variance(a), "Share of the variation per mode", f"Bars: each mode. Line: running total. "
             f"Modes up to the dashed line ({100 * a.cfg['shape_model']['variance_keep']:.0f} %) are kept."))
     add('</div>')
@@ -662,12 +689,14 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
         i = md["mode"] - 1
         r = {"Mode": md["mode"], "Share": f"{100 * md['explained']:.1f} %", "What changes (+2 sd)": md["name"],
              "RMS per sd (mm)": md["rms_mm_per_sd"]}
+        if "where" in md:
+            r["Where the outline moves most"] = md["where"]
         if a.stability:
             r["Stability"] = a.stability["cos_median"][i]
             r["Share, 90 % range"] = (f"{100 * a.stability['explained_p05'][i]:.0f}–"
                                       f"{100 * a.stability['explained_p95'][i]:.0f} %")
         rows.append(r)
-    add(_table(pd.DataFrame(rows), text_cols=("What changes (+2 sd)",)))
+    add(_table(pd.DataFrame(rows), text_cols=("What changes (+2 sd)", "Where the outline moves most")))
     add('<details><summary>Feature changes per mode, from −2 sd to +2 sd</summary>' +
         _table(pd.DataFrame([dict(mode=md["mode"], **md["deltas"]) for md in a.modes])) + '</details>')
     add('<p class="note">Stability is the median |cos| between a mode and its match when the parts are resampled '
@@ -676,7 +705,18 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
 
     # ---- thickness
     add('<section id="thickness"><h2>Wall thickness</h2>')
-    if a.thickness is not None and len(a.thickness_grid):
+    if a.kind == "generic" and a.thickness is not None and np.isfinite(a.thickness).any():
+        mean = np.nanmean(a.thickness, axis=0)
+        sd = np.nanstd(a.thickness, axis=0)
+        j, k = int(np.nanargmin(mean)), int(np.nanargmax(sd))
+        add(f'<p class="lead">At each point of the outer outline: the diameter of the largest circle that touches '
+            f'the outline there and fits inside the foam (it stops at the hole or at the far side). Mean {np.nanmin(mean):.2f}–{np.nanmax(mean):.2f} mm around the part; thinnest '
+            f'{a.thickness_grid[j]:.0f} mm along the outline. Parts differ most {a.thickness_grid[k]:.0f} mm along '
+            f'the outline (sd {sd[k]:.2f} mm). At a rounded outside corner the circle cannot be larger than the '
+            f'rounding, so the dips at the corners show how round the corners are rather than a thin wall.</p>')
+        add(fig(fig_thickness(a), "Thickness around the part", "Top: mean and range of all parts. Bottom: each "
+                "part's difference from the mean, parts in time order; red is thicker, blue thinner."))
+    elif a.thickness is not None and len(a.thickness_grid):
         mean = np.nanmean(a.thickness, axis=0)
         sd = np.nanstd(a.thickness, axis=0)
         i0 = int(np.argmin(np.abs(a.thickness_grid)))
@@ -708,8 +748,8 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
     add(fig(fig_anomaly(a), "Distance from the other parts", "Each part's T² divided by its limit; "
             "above 1 the shape is abnormal.", narrow=True))
     ts = t.sort_values("T2", ascending=False)
-    add(_table(ts, ["name", "T2", "T2_limit", "shape_abnormal", "main_mode", "SPE", "SPE_limit", "new_deformation",
-                    "inner_width_max", "base_thickness", "spec_ok"] + (["length"] if a.closed else []),
+    add(_table(ts, ["name", "T2", "T2_limit", "shape_abnormal", "main_mode", "SPE", "SPE_limit", "new_deformation"]
+               + a.key_dims[:2] + ["spec_ok"] + (["length"] if a.closed and a.kind == "u_profile" else []),
                highlight=(ts["shape_abnormal"] | ts["new_deformation"])))
     add('</section>')
 
@@ -735,10 +775,11 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
                 f'in the core about {mean_of("outer_core_flattening"):.2f}\u00d7. The flattened zone reaches about '
                 f'{mean_of("outer_flattened_depth_mm"):.1f} mm (outer) and {mean_of("cavity_flattened_depth_mm"):.1f} '
                 f'mm (cavity) into the foam.</p>'
-                '<p class="note">The cavity value for the first 0.5 mm is less certain: in these images the cut '
-                'face is blurred along the cavity edge, so some walls there are missed and the cells read wider '
-                'than they are. Check with <code>python -m shape_variation overlay</code>; the outer surface is '
-                'sharp.</p>')
+                + ('<p class="note">The cavity value for the first 0.5 mm is less certain: in these images the cut '
+                   'face is blurred along the cavity edge, so some walls there are missed and the cells read wider '
+                   'than they are. Check with <code>python -m shape_variation overlay</code>; the outer surface is '
+                   'sharp.</p>' if a.kind == "u_profile" else
+                   '<p class="note">"Cavity" here means the edges of the holes.</p>'))
             add(fig(surf_fig, "Cells against depth below the surface", "Points: mean over parts in 0.5 mm "
                     "steps (wider steps deeper in); bands: range of parts. Wall-detection sensitivity is set per "
                     "image so that, in the core, the wall-to-wall distance matches the cell outlines (\u03c0/4 \u00d7 "
@@ -812,7 +853,7 @@ def render_html(a: Analysis, standalone: bool = True) -> str:
     if a.skipped:
         add('<div class="callout"><h3>Skipped images</h3><ul class="plain">' + "".join(
             f"<li>{html.escape(nm)}: {html.escape(r)}</li>" for nm, r in a.skipped) + '</ul></div>')
-    cols = ["name", "timestamp", "process_window"] + [k for k in KEY_DIMS if k in t] + \
+    cols = ["name", "timestamp", "process_window"] + [k for k in (a.shape_features or a.key_dims) if k in t] + \
            [c for c in t.columns if c.startswith("PC")] + ["T2", "spec_ok"]
     add('<details><summary>All measurements per part</summary>' + _table(t, cols) + '</details>')
     add('</section>')

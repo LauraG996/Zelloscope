@@ -6,19 +6,22 @@ from pathlib import Path
 import yaml
 
 from profile_check.config import Config as SpecConfig
+from profile_check.config import config_from_dict
 from profile_check.config import load_config as load_spec_config
 
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "config" / "shape_variation.yaml"
 
 DEFAULTS = {
     "product": "",
+    "kind": "u_profile",            # u_profile = NOMAPACK U (named dimensions, window from the base); generic = any shape
     "spec_config": None,
+    "spec": None,                   # generic: inline limits {feature: {nominal, min, max}} instead of spec_config
     "exclude": [],
     "segmentation": {"method": "otsu", "blur_mm": 0.15, "cleanup_kernel_mm": 0.3, "max_pore_area_mm2": 8.0,
                      "work_px_per_mm": 20.0, "frame_margin_mm": 0.3},
     "window": {"depth_mm": "auto", "auto_margin_mm": 1.0, "auto_min_fraction": 0.8},
     "shape_model": {"n_outer": 200, "n_cavity": 200, "variance_keep": 0.95, "allow_mirror": True,
-                    "bootstrap": 200, "mode_sigma": 2.0},
+                    "bootstrap": 200, "mode_sigma": 2.0, "orientations": 4},
     "thickness": {"raster_px_per_mm": 20.0, "grid_step_mm": 1.0, "end_trim_mm": 10.0},
     "monitoring": {"t2_alpha": 0.01, "spc_sigma": 3.0, "run_length": 8, "trend_length": 6},
     "process_windows": None,
@@ -52,7 +55,14 @@ def load_config(path: str | Path | None = None) -> AnalysisConfig:
     text = path.read_text()
     raw = json.loads(text) if path.suffix.lower() == ".json" else yaml.safe_load(text)
     cfg = AnalysisConfig(_merge(DEFAULTS, raw or {}))
+    if cfg["kind"] not in ("u_profile", "generic"):
+        raise ValueError(f"kind must be 'u_profile' or 'generic', not {cfg['kind']!r}")
     spec_path = cfg["spec_config"]
-    cfg.spec = load_spec_config((path.parent / spec_path) if spec_path else None)
+    if cfg["kind"] == "generic" and not spec_path:
+        # no product drawing: the limits (if any) are given inline, on the generic feature names
+        cfg.spec = config_from_dict(dict(product=cfg["product"], spec=cfg["spec"] or {}, contour_tolerance_mm=1.0),
+                                    source=str(path))
+    else:
+        cfg.spec = load_spec_config((path.parent / spec_path) if spec_path else None)
     cfg.source = str(path)
     return cfg

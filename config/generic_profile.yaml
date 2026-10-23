@@ -1,0 +1,58 @@
+# Zelloscope shape-variation analysis for any foam cross-section (kind: generic).
+# Copy this file per product and set the product name, the exclude list and (optionally) spec limits.
+#
+# What "generic" means: the part is whatever foam blob is in the image, with any number of holes (none for a
+# solid profile). No product geometry is assumed: shapes are compared on their full outline, modes are described
+# in plain geometry (width, height, hole size/position, walls around each hole, where the outline moves), and wall
+# thickness is given around the outline. The whole cross-section must be in the image.
+
+product: Square foam profile (example)
+kind: generic
+
+# Images matching these regexes are ignored (e.g. other products in the same folder).
+exclude: ["2026-06-04_", "capture_sample_"]
+
+# Optional limits on the measured features (names as in parts.csv / the report), e.g.
+# spec:
+#   hole_width: {nominal: 20.0, min: 19.0, max: 21.0}
+#   hole_wall_left: {nominal: 8.0, min: 7.0, max: 9.0}
+spec: null
+
+segmentation:
+  method: otsu
+  blur_mm: 0.15
+  cleanup_kernel_mm: 0.3
+  max_pore_area_mm2: 8.0      # enclosed dark regions smaller than this are pores, larger ones are holes
+  work_px_per_mm: 20.0
+  frame_margin_mm: 0.3        # a part this close to the image edge is cut off: skipped
+
+shape_model:
+  n_outer: 200                # points on the outer outline
+  n_cavity: 200               # points on each hole
+  variance_keep: 0.95
+  # Candidate orientations tried when matching parts: 4 = every 90 degrees, any way up. If the parts are always
+  # imaged the same way up, use orientations: 1 and allow_mirror: false so left/right and up/down keep their
+  # meaning (with a symmetric outline, e.g. a rectangle, "hole further left" can otherwise be matched to "right").
+  orientations: 4
+  allow_mirror: true
+  bootstrap: 200
+  mode_sigma: 2.0
+
+thickness:
+  raster_px_per_mm: 20.0
+
+monitoring:
+  t2_alpha: 0.01
+  spc_sigma: 3.0
+  run_length: 8
+  trend_length: 6
+
+cells:
+  seed_smooth_mm: 0.2
+  seed_min_separation_mm: 0.39
+  wall_smooth_mm: 0.02
+  min_area_mm2: 0.02
+  merged_area_factor: 4.0
+  map_bin_mm: 2.0
+  flat_bin_mm: 1.0
+  work_px_per_mm: 40.0

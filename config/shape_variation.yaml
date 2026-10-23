@@ -2,6 +2,7 @@
 # Spec limits are reused from the profile_check config (spec_config); scale comes from the images / scale.yaml.
 
 product: NMC NOMAPACK U 0-24/77
+kind: u_profile               # named U dimensions, window from the base; 'generic' = any shape (see generic_profile.yaml)
 spec_config: nmc_nomapack_u_0-24-77.yaml     # relative to this file
 
 # Files matching these regexes are ignored: other products in the same folders, and the marker-painted

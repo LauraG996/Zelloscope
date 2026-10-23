@@ -82,11 +82,18 @@ class ShapeModel:
     n_outer: int
     closed: bool
     n_keep: int
+    sizes: tuple = ()                # points per contour (outer first); default: outer + cavity
     explained: np.ndarray = field(init=False)
 
     def __post_init__(self):
         total = self.variance.sum()
         self.explained = self.variance / total if total > 0 else np.zeros_like(self.variance)
+        if not self.sizes:
+            self.sizes = (self.n_outer, len(self.mean) - self.n_outer)
+
+    def contours(self, pts: np.ndarray) -> list[np.ndarray]:
+        """Points split into the separate curves (outer, then cavity / holes)."""
+        return [c for c in np.split(pts, np.cumsum(self.sizes)[:-1]) if len(c)]
 
     def shape(self, b: np.ndarray) -> np.ndarray:
         """Shape for mode weights b (mm along each component)."""
@@ -112,7 +119,7 @@ class ShapeModel:
         return pts[: self.n_outer], pts[self.n_outer:]
 
 
-def fit_pca(aligned: np.ndarray, n_outer: int, closed: bool, variance_keep: float) -> ShapeModel:
+def fit_pca(aligned: np.ndarray, n_outer: int, closed: bool, variance_keep: float, sizes: tuple = ()) -> ShapeModel:
     """aligned: (n, P, 2). Keeps the fewest modes explaining `variance_keep` of the variance."""
     n = len(aligned)
     x = aligned.reshape(n, -1)
@@ -128,7 +135,7 @@ def fit_pca(aligned: np.ndarray, n_outer: int, closed: bool, variance_keep: floa
     scores = xc @ comps.T
     cum = np.cumsum(var) / var.sum() if var.sum() > 0 else np.ones(m)
     n_keep = int(np.searchsorted(cum, variance_keep - 1e-12) + 1)
-    return ShapeModel(mean.reshape(-1, 2), comps, var, scores, n_outer, closed, min(n_keep, m))
+    return ShapeModel(mean.reshape(-1, 2), comps, var, scores, n_outer, closed, min(n_keep, m), tuple(sizes))
 
 
 def bootstrap_stability(aligned: np.ndarray, model: ShapeModel, n_boot: int, seed: int = 0) -> dict:

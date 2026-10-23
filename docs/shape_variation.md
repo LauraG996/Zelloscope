@@ -29,6 +29,34 @@ lie outside the window. It also adds 12 × 12 mm close-ups of the base and a leg
 * `modes.json` – mode descriptions, explained variance and bootstrap stability.
 * `model.npz` – the shape model, used by `score`.
 
+## Other shapes: `kind: generic`
+
+The U-profile mode knows the U: it finds one cavity, puts the base at the bottom, compares a window measured up
+from the base and names the modes in U terms (inner width, base, leg lean). `kind: generic` drops all of that
+and works for any foam cross-section with any number of holes, including none. Start from
+`config/generic_profile.yaml`:
+
+```
+python -m shape_variation analyze data/square/2026-10-23 --config config/generic_profile.yaml -o results/square --cells
+```
+
+| Step | Generic mode | Where |
+|---|---|---|
+| Segmentation | Foam mask as above; holes are background regions completely enclosed by the foam (larger than `max_pore_area_mm2`). The whole cross-section must be in the image; a part touching the frame is skipped. Parts whose number of holes differs from most parts are skipped. | `generic.py` |
+| Canonical frame | mm, origin at the area centroid, long axis turned horizontal by the smallest rotation | `generic.py` |
+| Correspondence + alignment | Outer outline and every hole resampled to 200 points each. Each part is tried at `shape_model.orientations` starting poses (4 = every 90°) and mirrored; for each, the start point of every contour is searched (±1/8 of its length) for the best rigid fit of all points. Holes are matched to the mean's holes by position. | `generic.py` |
+| Measurements | Foam area, width, height, perimeter, convexity; per hole its width, height, offset from the outer centre and the wall left / right / above / below it. Measured in each part's own principal axes. Limits can be set on any of them under `spec:`. | `generic.py` |
+| Modes | Named by the two measurements that change most, plus where the outline moves most (e.g. "outer outline moves out most at the top right (0.4 mm)"). | `generic.py` |
+| Wall thickness | At each point of the outer outline: the diameter of the largest circle that touches the outline there and fits in the foam. At rounded outside corners this is limited by the rounding. | `generic.py` |
+| Cells, drift, anomalies, links | Unchanged; every hole edge counts as a cavity surface. | |
+
+Same part imaged at 6 rotations, two of them mirrored (real square-foam image): aligned outlines within 0.02 mm
+RMS of each other, dimensions within 0.02 mm, wall thickness within 0.15 mm at every point.
+
+Symmetric parts: if the outline looks the same rotated or mirrored (a rectangle), only details such as where the
+hole sits tell left from right, so "hole further left" in one part can be matched with "hole further right" in
+another. If the parts are always imaged the same way up, set `orientations: 1` and `allow_mirror: false`.
+
 ## Data and scale
 
 Put images under `data/<product>/<session>/` (Git LFS, see `data/README.md`). The scale is never guessed. It

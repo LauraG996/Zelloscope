@@ -94,6 +94,7 @@ def cmd_overlay(args) -> int:
     import cv2
 
     from .cells import overlay_panel
+    from .generic import prepare_generic
     from .segment import prepare
     cfg = load_config(args.config)
     out = Path(args.output)
@@ -103,12 +104,13 @@ def cmd_overlay(args) -> int:
         if r.mm_per_px is None:
             print(f"{r.path.name}: skipped - scale unknown ({r.scale_source})")
             continue
+        generic = cfg["kind"] == "generic"
         try:
-            prep = prepare(r, cfg)
+            prep = prepare_generic(r, cfg) if generic else prepare(r, cfg)
         except SegmentationError as e:
             print(f"{r.path.name}: skipped - {e}")
             continue
-        if window == "full" or (window == "auto" and prep.full_view):
+        if generic or window == "full" or (window == "auto" and prep.full_view):
             depth = None
         elif window == "auto":
             depth = prep.visible_depth_mm - cfg["window"]["auto_margin_mm"]
@@ -116,7 +118,7 @@ def cmd_overlay(args) -> int:
             depth = float(window)
         img = cv2.imread(str(r.path), cv2.IMREAD_COLOR)
         title = f"{r.path.name}  -  {'full outline' if depth is None else f'window {depth:.1f} mm from the base'}"
-        cv2.imwrite(str(out / f"{r.path.stem}_segmentation.jpg"), overlay_panel(img, prep, cfg["cells"], depth, title),
+        cv2.imwrite(str(out / f"{r.path.stem}_segmentation.jpg"), overlay_panel(img, prep, cfg["cells"], depth, title, generic=generic),
                     [cv2.IMWRITE_JPEG_QUALITY, 90])
         print(f"{r.path.name} -> {out / (r.path.stem + '_segmentation.jpg')}")
     return 0

@@ -54,6 +54,7 @@ class Shape:
     depth_mm: float | None      # window depth used (None = full outline)
     record: ImageRecord = field(repr=False)
     prepared: Prepared = field(repr=False)
+    holes: list = field(default_factory=list, repr=False)   # generic mode: every hole (dense, mm), largest first
 
 
 def _odd(n: float) -> int:

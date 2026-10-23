@@ -9,6 +9,7 @@ import numpy as np
 import pandas as pd
 
 from . import cells as cellmod
+from . import generic as gen
 from .config import AnalysisConfig
 from .correlate import forest_importance, spearman_table
 from .io import ImageRecord, discover
@@ -21,6 +22,8 @@ from .thickness import common_grid, on_grid, thickness_profile
 
 KEY_DIMS = ["inner_width_max", "base_thickness", "outer_width_max", "wall_left", "wall_right",
             "cavity_width_mid", "lean_left_deg", "lean_right_deg"]
+GENERIC_KEY_DIMS = ["area_mm2", "outer_width", "outer_height", "hole_width", "hole_height", "hole_x", "hole_y",
+                    "hole1_width", "hole1_height", "hole1_x", "hole1_y"]
 MAX_CHART_MODES = 3
 
 
@@ -47,6 +50,9 @@ class Analysis:
     correlations: dict | str = "not run"
     not_done: list[str] = field(default_factory=list)
     collect_next: list[str] = field(default_factory=list)
+    kind: str = "u_profile"
+    key_dims: list[str] = field(default_factory=lambda: list(KEY_DIMS))
+    shape_features: list[str] = field(default_factory=list)     # columns that describe the shape itself
 
 
 def _window(ts: dt.datetime | None, cfg) -> dict | None:
@@ -94,11 +100,33 @@ def choose_depth(preps, cfg) -> tuple[float | None, list]:
     return float(d), []
 
 
-def _aligned_polygons(shape: Shape, al) -> tuple[np.ndarray, np.ndarray]:
+def _aligned_polygons(shape: Shape, al):
+    """Outer and cavity polygons in the aligned frame; in the generic mode the cavity is the list of holes."""
+    if shape.holes:
+        return al.apply(shape.outer), [al.apply(h) for h in shape.holes]
     return al.apply(shape.outer), al.apply(shape.cavity)
 
 
+def _generic_shapes(preps, skipped) -> list[Shape]:
+    """Generic mode: outlines of every part; parts whose number of holes differs from most parts are skipped."""
+    from collections import Counter
+    shapes = []
+    for p in preps:
+        try:
+            shapes.append(gen.extract_generic(p))
+        except SegmentationError as e:
+            skipped.append((p.record.path.name, str(e)))
+    if not shapes:
+        return shapes
+    n_holes = Counter(len(s.holes) for s in shapes).most_common(1)[0][0]
+    for s in [s for s in shapes if len(s.holes) != n_holes]:
+        skipped.append((s.record.path.name, f"{len(s.holes)} hole(s); most parts have {n_holes}"))
+        shapes.remove(s)
+    return shapes
+
+
 def run(inputs, cfg: AnalysisConfig, with_cells: bool = False, reference_names=None, progress=print) -> Analysis:
+    generic = cfg["kind"] == "generic"
     records = discover(inputs, tuple(cfg["exclude"]))
     skipped, preps = [], []
     for r in records:
@@ -106,46 +134,61 @@ def run(inputs, cfg: AnalysisConfig, with_cells: bool = False, reference_names=N
             skipped.append((r.path.name, f"scale unknown - {r.scale_source}"))
             continue
         try:
-            preps.append(prepare(r, cfg))
-            progress(f"  segmented {r.path.name} (visible {preps[-1].visible_depth_mm:.1f} mm from the base)")
+            preps.append(gen.prepare_generic(r, cfg) if generic else prepare(r, cfg))
+            progress(f"  segmented {r.path.name}" + ("" if generic else
+                     f" (visible {preps[-1].visible_depth_mm:.1f} mm from the base)"))
         except SegmentationError as e:
             skipped.append((r.path.name, str(e)))
     if len(preps) < 3:
         raise SegmentationError(f"need at least 3 usable images, have {len(preps)}; skipped: {skipped}")
 
-    depth, short = choose_depth(preps, cfg)
-    for p, reason in short:
-        skipped.append((p.record.path.name, reason))
-        preps.remove(p)
     sm = cfg["shape_model"]
-    shapes = []
-    for p in preps:
-        try:
-            shapes.append(extract(p, depth, sm["n_outer"], sm["n_cavity"]))
-        except SegmentationError as e:
-            skipped.append((p.record.path.name, str(e)))
+    if generic:
+        depth, shapes = None, _generic_shapes(preps, skipped)
+        sizes = (sm["n_outer"],) + (sm["n_cavity"],) * (len(shapes[0].holes) if shapes else 0)
+    else:
+        depth, short = choose_depth(preps, cfg)
+        for p, reason in short:
+            skipped.append((p.record.path.name, reason))
+            preps.remove(p)
+        shapes = []
+        for p in preps:
+            try:
+                shapes.append(extract(p, depth, sm["n_outer"], sm["n_cavity"]))
+            except SegmentationError as e:
+                skipped.append((p.record.path.name, str(e)))
+        sizes = (sm["n_outer"], sm["n_cavity"])
+    if len(shapes) < 3:
+        raise SegmentationError(f"need at least 3 usable parts, have {len(shapes)}; skipped: {skipped}")
     closed = depth is None
-    a = Analysis(cfg, records, skipped, shapes, depth, closed)
+    a = Analysis(cfg, records, skipped, shapes, depth, closed, kind=cfg["kind"])
 
     # --- shape model
-    mean, aligned = generalized_procrustes([(s.outer_curve, s.cavity_curve) for s in shapes], closed,
-                                           sm["allow_mirror"])
+    if generic:
+        mean, aligned = gen.generalized_procrustes_generic([[s.outer] + s.holes for s in shapes], sizes,
+                                                           sm["orientations"], sm["allow_mirror"])
+    else:
+        mean, aligned = generalized_procrustes([(s.outer_curve, s.cavity_curve) for s in shapes], closed,
+                                               sm["allow_mirror"])
     pts = np.array([al.points for al in aligned])
-    model = fit_pca(pts, sm["n_outer"], closed, sm["variance_keep"])
+    model = fit_pca(pts, sm["n_outer"], closed, sm["variance_keep"], sizes)
     a.aligned, a.model = aligned, model
     mp = cfg.spec.measurement
-    a.modes = [describe_mode(model, i, sm["mode_sigma"], mp) for i in range(min(model.n_keep, len(model.variance)))]
+    n_modes = min(model.n_keep, len(model.variance))
+    a.modes = [gen.describe_mode_generic(model, i, sm["mode_sigma"], sizes) if generic else
+               describe_mode(model, i, sm["mode_sigma"], mp) for i in range(n_modes)]
     a.stability = bootstrap_stability(pts, model, sm["bootstrap"]) if len(shapes) >= 4 else {}
 
     # --- per-part table: time, dims, spec, scores
     rows = []
     for s, al, sc in zip(shapes, aligned, model.scores):
         o, c = _aligned_polygons(s, al)
-        feats = describe(al.points, sm["n_outer"], mp, closed)
+        feats = gen.describe_generic(al.points, sizes) if generic else describe(al.points, sm["n_outer"], mp, closed)
+        a.shape_features = list(feats)
         row = dict(name=s.name, image=str(s.record.path), timestamp=s.record.timestamp,
                    process_window=process_window(s.record.timestamp, cfg), mirrored=al.mirrored,
                    visible_depth_mm=round(s.prepared.visible_depth_mm, 2), **feats)
-        if closed:
+        if closed and not generic:
             row["length"] = round(float(o[:, 1].max() - o[:, 1].min()), 3)
         for k, lim in cfg.spec.spec.items():
             if k in row:
@@ -177,20 +220,33 @@ def run(inputs, cfg: AnalysisConfig, with_cells: bool = False, reference_names=N
 
     # --- wall thickness
     th = cfg["thickness"]
-    profiles = []
-    for s, al in zip(shapes, aligned):
-        o, c = _aligned_polygons(s, al)
-        profiles.append(thickness_profile(o, c, th["raster_px_per_mm"], closed))
-    grid = common_grid(profiles, th["grid_step_mm"], th["end_trim_mm"])
-    a.thickness_grid = grid
-    a.thickness = np.array([on_grid(p, grid, th["end_trim_mm"]) for p in profiles])
-    if len(grid):
-        i0 = int(np.argmin(np.abs(grid)))
-        table["thickness_base_centre"] = a.thickness[:, i0].round(3)
+    if generic:
+        # along the outer outline: position = mm along the mean outline from its start point
+        a.thickness = np.array([gen.thickness_on_outline(al.points, sizes)
+                                for al in aligned])
+        o = model.mean[: sizes[0]]
+        a.thickness_grid = np.concatenate([[0.0], np.cumsum(np.hypot(*np.diff(o, axis=0).T))])
+        with np.errstate(all="ignore"):
+            table["thickness_min"] = np.nanmin(a.thickness, axis=1).round(3)
+            table["thickness_median"] = np.nanmedian(a.thickness, axis=1).round(3)
+            table["thickness_max"] = np.nanmax(a.thickness, axis=1).round(3)
+        a.shape_features += ["thickness_min", "thickness_median", "thickness_max"]
+        a.key_dims = [k for k in GENERIC_KEY_DIMS if k in table] + ["thickness_min"]
+    else:
+        profiles = []
+        for s, al in zip(shapes, aligned):
+            o, c = _aligned_polygons(s, al)
+            profiles.append(thickness_profile(o, c, th["raster_px_per_mm"], closed))
+        grid = common_grid(profiles, th["grid_step_mm"], th["end_trim_mm"])
+        a.thickness_grid = grid
+        a.thickness = np.array([on_grid(p, grid, th["end_trim_mm"]) for p in profiles])
+        if len(grid):
+            i0 = int(np.argmin(np.abs(grid)))
+            table["thickness_base_centre"] = a.thickness[:, i0].round(3)
 
     # --- control charts (time order = table order)
     series = {f"PC{i + 1}": table[f"PC{i + 1}"] for i in range(min(MAX_CHART_MODES, model.n_keep))}
-    series.update({k: table[k] for k in KEY_DIMS if k in table})
+    series.update({k: table[k] for k in a.key_dims if k in table})
     a.charts = {k: dict(values=v.to_numpy(float), **i_chart(v.to_numpy(float), mon["spc_sigma"], mon["run_length"],
                                                              mon["trend_length"]))
                 for k, v in series.items()}
@@ -267,7 +323,7 @@ def _cells(a: Analysis) -> dict | str:
         flat_samples.append(cellmod.flattening_samples(img, s.prepared, p, a.depth_mm, si["sensitivity"]))
     if not any(features):
         return "no cells detected"
-    pts = np.vstack([np.vstack(_aligned_polygons(s, al)) for s, al in zip(a.shapes, a.aligned)])
+    pts = np.vstack([al.apply(s.outer) for s, al in zip(a.shapes, a.aligned)])     # the outline holds every hole
     extent = (pts[:, 0].min(), pts[:, 0].max(), pts[:, 1].min(), pts[:, 1].max())
     foam_polys = [_aligned_polygons(s, al) for s, al in zip(a.shapes, a.aligned)]
     maps = {key: cellmod.binned_map(per_part, key, p["map_bin_mm"], extent, foam_polys)
@@ -279,9 +335,10 @@ def _cells(a: Analysis) -> dict | str:
 
 def _correlations(a: Analysis) -> dict | str:
     t = a.table
-    targets = t[[c for c in t.columns if c.startswith("PC")][:MAX_CHART_MODES] +
-                [k for k in ("inner_width_max", "base_thickness", "outer_width_max") if k in t] + ["T2"]]
-    known = set(targets.columns) | set(KEY_DIMS) | {"name", "image", "timestamp", "mirrored", "visible_depth_mm",
+    dims = ("area_mm2", "outer_width", "outer_height") if a.kind == "generic" else \
+        ("inner_width_max", "base_thickness", "outer_width_max")
+    targets = t[[c for c in t.columns if c.startswith("PC")][:MAX_CHART_MODES] + [k for k in dims if k in t] + ["T2"]]
+    known = set(targets.columns) | set(a.key_dims) | set(a.shape_features) | {"name", "image", "timestamp", "mirrored", "visible_depth_mm",
                                                     "spec_ok", "T2_limit", "shape_abnormal", "residual_rms_mm",
                                                     "SPE", "SPE_limit", "new_deformation", "main_mode", "part_id",
                                                     "notes", "length", "wall_asym", "cavity_width_top",
@@ -341,10 +398,15 @@ def _what_is_missing(a: Analysis, with_cells: bool) -> None:
         a.collect_next.append("At least 30 parts spread over several days/batches for stable control limits, "
                               "and NMC's list of approved (good) parts to use as the reference set.")
     spec_fail = int((~a.table["spec_ok"]).sum())
-    if spec_fail:
+    if spec_fail and a.kind == "u_profile":
         a.not_done.append(f"{spec_fail} of {n} parts are outside the drawing limits as measured here. "
                           "TODO(NMC): confirm where the 24 mm width and 12 mm thickness are measured before "
                           "treating these as rejects.")
+    elif spec_fail:
+        a.not_done.append(f"{spec_fail} of {n} parts are outside the limits in the config (spec).")
+    if a.kind == "generic" and not a.cfg.spec.spec:
+        a.not_done.append("No spec limits configured: parts are only compared with each other (add 'spec:' with "
+                          "limits on the measured features, e.g. hole_width, to check against a drawing).")
 
 
 # ---------------- saved model for scoring new parts -----------------
@@ -355,6 +417,7 @@ def save_model(a: Analysis, path: str | Path) -> None:
     np.savez_compressed(
         path, mean=m.mean, components=m.components, variance=m.variance, n_outer=m.n_outer, closed=m.closed,
         n_keep=m.n_keep, ref_scores=m.scores[:, :k], t2_k=k, spe_ref=a.spe["values"],  # leave-one-out SPEs
+        sizes=np.array(m.sizes), kind=a.kind,
         depth_mm=np.nan if a.depth_mm is None else a.depth_mm,
         meta=json.dumps(dict(created=dt.datetime.now().isoformat(timespec="seconds"), config=a.cfg.source,
                              parts=a.table["name"].tolist(), modes=[md["name"] for md in a.modes])))
@@ -365,8 +428,12 @@ def score_images(model_path: str | Path, inputs, cfg: AnalysisConfig) -> pd.Data
     z = np.load(model_path, allow_pickle=False)
     closed = bool(z["closed"])
     depth = None if np.isnan(float(z["depth_mm"])) else float(z["depth_mm"])
+    kind = str(z["kind"]) if "kind" in z else "u_profile"
+    if kind != cfg["kind"]:
+        raise ValueError(f"the model was built with kind '{kind}', the config says '{cfg['kind']}'")
+    sizes = tuple(int(v) for v in z["sizes"]) if "sizes" in z else ()
     model = ShapeModel(z["mean"], z["components"], z["variance"], np.zeros((0, len(z["variance"]))),
-                       int(z["n_outer"]), closed, int(z["n_keep"]))
+                       int(z["n_outer"]), closed, int(z["n_keep"]), sizes)
     ref, k = z["ref_scores"], int(z["t2_k"])
     mu, inv = ref.mean(axis=0), np.linalg.pinv(np.atleast_2d(np.cov(ref, rowvar=False)))
     alpha = cfg["monitoring"]["t2_alpha"]
@@ -374,19 +441,26 @@ def score_images(model_path: str | Path, inputs, cfg: AnalysisConfig) -> pd.Data
     rows = []
     for r in discover(inputs, tuple(cfg["exclude"])):
         row = dict(name=r.name, timestamp=r.timestamp)
+        sm = cfg["shape_model"]
         try:
             if r.mm_per_px is None:
                 raise SegmentationError(f"scale unknown - {r.scale_source}")
-            s = extract(prepare(r, cfg), depth, int(z["n_outer"]), len(z["mean"]) - int(z["n_outer"]))
+            if kind == "generic":
+                s = gen.extract_generic(gen.prepare_generic(r, cfg))
+                al = gen.align_generic([s.outer] + s.holes, model.mean, model.sizes, sm["orientations"],
+                                       sm["allow_mirror"])
+            else:
+                s = extract(prepare(r, cfg), depth, int(z["n_outer"]), len(z["mean"]) - int(z["n_outer"]))
+                al = align_to(s.outer_curve, s.cavity_curve, model.mean, closed, sm["allow_mirror"])
         except SegmentationError as e:
             rows.append(dict(row, error=str(e)))
             continue
-        al = align_to(s.outer_curve, s.cavity_curve, model.mean, closed, cfg["shape_model"]["allow_mirror"])
         b = model.project(al.points, max(k, model.n_keep))
         d = b[:k] - mu
         t2 = float(d @ inv @ d)
         spe = float(((al.points - model.shape(model.project(al.points, k))) ** 2).sum())
-        feats = describe(al.points, model.n_outer, cfg.spec.measurement, closed)
+        feats = gen.describe_generic(al.points, model.sizes) if kind == "generic" else \
+            describe(al.points, model.n_outer, cfg.spec.measurement, closed)
         row.update(feats, mirrored=al.mirrored, T2=round(t2, 3), T2_limit=round(limit, 3), shape_abnormal=t2 > limit,
                    SPE=round(spe, 3), SPE_limit=round(s_lim, 3), new_deformation=spe > s_lim)
         for i, v in enumerate(b[: model.n_keep]):
