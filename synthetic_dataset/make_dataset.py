@@ -47,11 +47,11 @@ BASE_SIZE = 1536          # square working canvas the originals are fitted into
 OUT_SIZE = 768            # size of the output images
 SS = 2                    # supersampling factor of the single resampling step
 EDGE_MARGIN = 5           # key points must lie at least this many px inside the output image
-N_DIST = 3
 STRENGTH = 0.3            # global distortion knob: scales the magnitude of every warp (1.0 = very strong)
 VARY_EXPOSURE = False     # True (--vary-exposure): random gamma/colour cast/contrast/vignette/brightness per image
 MIN_P95, MIN_SPREAD = 45, 30   # visibility guard: 95th-percentile grey level / (p95 - p5) of the output
-COLORS = [(60, 60, 235), (80, 200, 60), (40, 215, 245)]     # BGR: D1 red, D2 green, D3 yellow
+COLORS = [(60, 60, 235), (80, 200, 60), (40, 215, 245), (235, 140, 40), (220, 80, 220),   # BGR: D1 red, D2 green,
+          (230, 230, 60), (40, 140, 255), (160, 160, 255), (150, 255, 150), (255, 255, 255)]  # D3 yellow, ... (cycled)
 MM_PER_PX = 0.014019      # scale of the original images in shapes/ (raw Zelloscope frame, 3800x3804 px)
 
 
@@ -137,7 +137,7 @@ class Base:
         fill = np.random.default_rng(0).normal(0, 2 * self.bg_std, (BASE_SIZE, BASE_SIZE, 3)) + self.bg
         self.canvas = np.clip(fill, 0, 255).astype(np.uint8)       # padding looks like the real background
         self.canvas[self.oy:self.oy + nh, self.ox:self.ox + nw] = cv2.resize(im, (nw, nh), interpolation=cv2.INTER_AREA)
-        self.kp = None                                        # (N_DIST, 2, 2) full-res coordinates
+        self.kp = None                                        # (n_distances, 2, 2) full-res coordinates
         self.source, self.reg = None, {}
 
     def to_base(self, P):
@@ -211,14 +211,16 @@ def assign_keypoints(groups, manual, src):
             sub = None if is_ref else int(stem.split('_')[1])
             if (n, sub) in manual or (is_ref and (n, 1) in manual):
                 pairs = manual.get((n, sub)) or manual[(n, 1)]
-                b.kp, b.source = np.array(pairs, float).reshape(N_DIST, 2, 2), 'manual'
+                b.kp, b.source = np.array(pairs, float).reshape(-1, 2, 2), 'manual'
             if is_ref:
                 ref = b
-                assert b.kp is not None, f'no key distances for reference of shape {n}'
+                assert b.kp is not None and len(b.kp), f'no key distances for reference of shape {n} in distance.txt'
             bases.setdefault(n, []).append(b)
         for b in bases[n]:
             if b.kp is None:
-                b.kp, b.source = register(ref, b)(ref.kp.reshape(-1, 2)).reshape(N_DIST, 2, 2), 'registered'
+                b.kp, b.source = register(ref, b)(ref.kp.reshape(-1, 2)).reshape(-1, 2, 2), 'registered'
+            assert len(b.kp) == len(ref.kp), \
+                f'{b.stem}: {len(b.kp)} distances in distance.txt, but its reference has {len(ref.kp)}'
     return bases
 
 
@@ -525,7 +527,7 @@ def draw_distances(img, kp, scale=1.0, label=True):
     out = img.copy()
     for i, (a, b) in enumerate(kp):
         pa, pb = tuple(int(round(v * scale)) for v in a), tuple(int(round(v * scale)) for v in b)
-        cv2.line(out, pa, pb, COLORS[i], 2, cv2.LINE_AA)
+        cv2.line(out, pa, pb, COLORS[i % len(COLORS)], 2, cv2.LINE_AA)
         for p in (pa, pb):
             cv2.circle(out, p, 5, (255, 255, 255), -1, cv2.LINE_AA)
             cv2.circle(out, p, 5, (0, 0, 0), 1, cv2.LINE_AA)
@@ -533,7 +535,7 @@ def draw_distances(img, kp, scale=1.0, label=True):
             m = ((pa[0] + pb[0]) // 2, (pa[1] + pb[1]) // 2)
             txt = f'D{i + 1} {np.linalg.norm(np.asarray(a) - np.asarray(b)):.0f}px'
             cv2.putText(out, txt, m, cv2.FONT_HERSHEY_SIMPLEX, .5, (0, 0, 0), 3, cv2.LINE_AA)
-            cv2.putText(out, txt, m, cv2.FONT_HERSHEY_SIMPLEX, .5, COLORS[i], 1, cv2.LINE_AA)
+            cv2.putText(out, txt, m, cv2.FONT_HERSHEY_SIMPLEX, .5, COLORS[i % len(COLORS)], 1, cv2.LINE_AA)
     return out
 
 
@@ -561,14 +563,16 @@ def main():
     bases = assign_keypoints(groups, manual, src)
 
     # reference csv + visual check of every base
+    n_dist = max(len(b.kp) for bl in bases.values() for b in bl)   # shapes with fewer distances get empty cells
+
     def kp_cols(prefix=''):
-        return [f'{prefix}D{i}_{c}' for i in range(1, N_DIST + 1) for c in ('x1', 'y1', 'x2', 'y2', 'len')]
+        return [f'{prefix}D{i}_{c}' for i in range(1, n_dist + 1) for c in ('x1', 'y1', 'x2', 'y2', 'len')]
 
     def kp_row(kp):
         row = []
         for p, q in kp:
             row += [round(p[0], 2), round(p[1], 2), round(q[0], 2), round(q[1], 2), round(float(np.linalg.norm(p - q)), 2)]
-        return row
+        return row + [''] * 5 * (n_dist - len(kp))
 
     tiles = []
     with open(os.path.join(a.out, 'reference_points.csv'), 'w', newline='') as f:
@@ -620,12 +624,13 @@ def main():
                         [cv2.IMWRITE_JPEG_QUALITY, 92])
             desc = ';'.join([o.desc for o in ops if o.desc] + plog)
             rows.append([name, n, b.stem + '.png', b.source, f'{a.seed}-{n}-{i}', desc] + kp_row(kp_out)
-                        + [f'{p2mm:.6g}'] + [x for t, pr in zip(true_mm, pred_mm) for x in (round(t, 4), round(pr, 4))])
+                        + [f'{p2mm:.6g}'] + [x for t, pr in zip(true_mm, pred_mm) for x in (round(t, 4), round(pr, 4))]
+                        + [''] * 2 * (n_dist - len(true_mm)))
         print(f'shape{n}: {a.n} images, bases {[x.stem for x in bl]}')
     with open(os.path.join(a.out, 'transformed_points.csv'), 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['image', 'shape', 'base_image', 'keypoint_source', 'seed', 'ops'] + kp_cols()
-                   + ['p2mm'] + [f'D{d}_{c}' for d in range(1, N_DIST + 1) for c in ('mm', 'mm_p2mm')])
+                   + ['p2mm'] + [f'D{d}_{c}' for d in range(1, n_dist + 1) for c in ('mm', 'mm_p2mm')])
         w.writerows(rows)
     print(f'done: {len(rows)} images in {a.out}; max |g(f(p))-p| = {max_err:.2e} px')
 
