@@ -15,6 +15,9 @@ How the key points stay exact
   iteration.  All geometry of an image is chained and the pixels are resampled ONCE; the script
   asserts g(f(p)) == p for every key point.  Photometric operations (hue, gamma, colour cast, contrast, blur, then
   vignette, brightness, noise, salt&pepper, JPEG - in that order) are applied afterwards and do not move anything.
+  By default the exposure-changing ones (gamma, colour cast, contrast, vignette, brightness) are switched off so
+  every image keeps the exposure of its original; --vary-exposure turns them back on.  Their random numbers are
+  drawn either way, so geometry and the remaining effects are identical with and without the flag.
 
 Scale (mm per pixel)
   The originals are taken to be MM_PER_PX (--mm-per-px, default 0.014019 = raw Zelloscope frame).
@@ -46,6 +49,7 @@ SS = 2                    # supersampling factor of the single resampling step
 EDGE_MARGIN = 5           # key points must lie at least this many px inside the output image
 N_DIST = 3
 STRENGTH = 0.3            # global distortion knob: scales the magnitude of every warp (1.0 = very strong)
+VARY_EXPOSURE = False     # True (--vary-exposure): random gamma/colour cast/contrast/vignette/brightness per image
 MIN_P95, MIN_SPREAD = 45, 30   # visibility guard: 95th-percentile grey level / (p95 - p5) of the output
 COLORS = [(60, 60, 235), (80, 200, 60), (40, 215, 245)]     # BGR: D1 red, D2 green, D3 yellow
 MM_PER_PX = 0.014019      # scale of the original images in shapes/ (raw Zelloscope frame, 3800x3804 px)
@@ -460,16 +464,19 @@ def photometric(img, rng):
     x = img.astype(np.float32)
     if rng.random() < .4:
         gm = np.exp(rng.uniform(np.log(.6), np.log(1.7)))
-        x = 255 * (x / 255) ** gm
-        log.append(f'gamma({gm:.2f})')
+        if VARY_EXPOSURE:
+            x = 255 * (x / 255) ** gm
+            log.append(f'gamma({gm:.2f})')
     if rng.random() < .4:
         gain = rng.uniform(.75, 1.25, 3).astype(np.float32)
-        x = x * gain
-        log.append('colorcast(' + ','.join(f'{v:.2f}' for v in gain) + ')')
+        if VARY_EXPOSURE:
+            x = x * gain
+            log.append('colorcast(' + ','.join(f'{v:.2f}' for v in gain) + ')')
     if rng.random() < .8:
         ct = rng.uniform(.7, 1.5)
-        x = (x - 128) * ct + 128
-        log.append(f'contrast({ct:.2f})')
+        if VARY_EXPOSURE:
+            x = (x - 128) * ct + 128
+            log.append(f'contrast({ct:.2f})')
     if rng.random() < .4:
         sg = rng.uniform(.6, 2.5)
         x = cv2.GaussianBlur(x, (0, 0), sg)
@@ -484,14 +491,16 @@ def photometric(img, rng):
         log.append(f'motionblur({n},{a:.0f})')
     if rng.random() < .35:
         s = rng.uniform(.3, .6)
-        yy, xx = np.mgrid[:S, :S].astype(np.float32)
-        r2 = ((xx - S / 2) ** 2 + (yy - S / 2) ** 2) / (S / 2) ** 2 / 2
-        x = x * (1 - s * r2)[..., None]
-        log.append(f'vignette({s:.2f})')
+        if VARY_EXPOSURE:
+            yy, xx = np.mgrid[:S, :S].astype(np.float32)
+            r2 = ((xx - S / 2) ** 2 + (yy - S / 2) ** 2) / (S / 2) ** 2 / 2
+            x = x * (1 - s * r2)[..., None]
+            log.append(f'vignette({s:.2f})')
     if rng.random() < .8:
         br = rng.uniform(-40, 45)
-        x = x + br
-        log.append(f'brightness({br:+.0f})')
+        if VARY_EXPOSURE:
+            x = x + br
+            log.append(f'brightness({br:+.0f})')
     if rng.random() < .7:
         sg = rng.uniform(4, 22)
         x = x + rng.normal(0, sg, x.shape).astype(np.float32)
@@ -530,17 +539,19 @@ def draw_distances(img, kp, scale=1.0, label=True):
 
 # ----------------------------------------------------------------------------- main
 def main():
-    global STRENGTH
+    global STRENGTH, VARY_EXPOSURE
     ap = argparse.ArgumentParser()
     ap.add_argument('--n', type=int, default=100, help='images per shape')
     ap.add_argument('--seed', type=int, default=SEED)
     ap.add_argument('--strength', type=float, default=STRENGTH, help='distortion strength (default %(default)s)')
+    ap.add_argument('--vary-exposure', action='store_true',
+                    help='random gamma / colour cast / contrast / vignette / brightness per image (off by default)')
     ap.add_argument('--out', default=os.path.join(HERE, 'dataset_out'))
     ap.add_argument('--shapes', type=int, nargs='*', help='only these shape numbers')
     ap.add_argument('--mm-per-px', type=float, default=MM_PER_PX,
                     help='scale of the original images in shapes/ (default %(default)s)')
     a = ap.parse_args()
-    STRENGTH = a.strength
+    STRENGTH, VARY_EXPOSURE = a.strength, a.vary_exposure
     src = os.path.join(HERE, 'shapes')
     raw_dir, plot_dir = os.path.join(a.out, 'raw'), os.path.join(a.out, 'plotted')
     os.makedirs(raw_dir, exist_ok=True); os.makedirs(plot_dir, exist_ok=True)
