@@ -19,6 +19,13 @@ How the key points stay exact
   every image keeps the exposure of its original; --vary-exposure turns them back on.  Their random numbers are
   drawn either way, so geometry and the remaining effects are identical with and without the flag.
 
+Key points on the outline
+  By default every key point (hand-picked or registered) is moved onto the nearest point of the piece's
+  edge - outer outline or the edge of a real hole - found by brightness at half resolution (~1 px accurate).
+  base_keypoints_check.jpg draws that outline in cyan; reference_points.csv (snap_max_px) and the console
+  say how far points moved; dataset_out/distance_used.txt holds the points actually used, in distance.txt
+  format.  --no-snap uses distance.txt as is.
+
 Scale (mm per pixel)
   The originals are taken to be MM_PER_PX (--mm-per-px, default 0.014019 = raw Zelloscope frame).
   Every output PNG gets that image's own scale written into it as a `ZelloscopeData` iTXt chunk
@@ -47,6 +54,8 @@ BASE_SIZE = 1536          # square working canvas the originals are fitted into
 OUT_SIZE = 768            # size of the output images
 SS = 2                    # supersampling factor of the single resampling step
 EDGE_MARGIN = 5           # key points must lie at least this many px inside the output image
+SNAP = True               # move every reference key point onto the nearest point of the piece's outline (--no-snap: off)
+SNAP_WARN_PX = 25         # report points that had to move further than this (full-res px): probably misplaced
 STRENGTH = 0.3            # global distortion knob: scales the magnitude of every warp (1.0 = very strong)
 VARY_EXPOSURE = False     # True (--vary-exposure): random gamma/colour cast/contrast/vignette/brightness per image
 MIN_P95, MIN_SPREAD = 45, 30   # visibility guard: 95th-percentile grey level / (p95 - p5) of the output
@@ -98,7 +107,7 @@ def parse_distances(path):
     """-> {(shape_no, sub or None): [(p1, p2), ...]}   (header 'N:' / 'N.' / 'N_k:')"""
     out, cur = {}, None
     for line in open(path):
-        line = line.strip()
+        line = line.split('#')[0].strip()                       # '#' starts a comment
         h = re.fullmatch(r'(\d+)(?:_(\d+))?\s*[:.]', line)
         if h:
             cur = (int(h.group(1)), int(h.group(2)) if h.group(2) else None)
@@ -134,11 +143,13 @@ class Base:
         self.sx, self.sy = nw / w, nh / h
         self.ox, self.oy = (BASE_SIZE - nw) // 2, (BASE_SIZE - nh) // 2
         self.contour, self.valid, self.bg, self.bg_std = outer_contour(im)   # full-res coords, bg colour/noise
+        self.boundary = piece_boundary(im)                    # outline incl. hole edges, full-res, ~0.5 px spacing
         fill = np.random.default_rng(0).normal(0, 2 * self.bg_std, (BASE_SIZE, BASE_SIZE, 3)) + self.bg
         self.canvas = np.clip(fill, 0, 255).astype(np.uint8)       # padding looks like the real background
         self.canvas[self.oy:self.oy + nh, self.ox:self.ox + nw] = cv2.resize(im, (nw, nh), interpolation=cv2.INTER_AREA)
         self.kp = None                                        # (n_distances, 2, 2) full-res coordinates
         self.source, self.reg = None, {}
+        self.snap_px = None                                   # how far each key point was moved onto the outline
 
     def to_base(self, P):
         P = np.asarray(P, float)
@@ -163,6 +174,46 @@ def outer_contour(im, scale=0.25):
     far = ~ndi.binary_dilation(m, iterations=12)                 # background pixels away from the piece
     bgpix = sm[far].astype(float) if far.sum() > 100 else sm.reshape(-1, 3).astype(float)
     return (c + .5) / scale - .5, bad == 0, np.median(bgpix, 0), float(max(bgpix.std(0).mean(), 1.0))
+
+
+def piece_boundary(im, scale=0.5):
+    """Every edge of the foam piece - outer outline and the edges of real holes - as dense
+    full-res points (~0.5 px apart).  Same brightness rule as outer_contour, at finer scale;
+    dark pores (< 0.2 % of the piece area) are filled, stretches along the image frame dropped."""
+    sm = cv2.resize(im, None, fx=scale, fy=scale, interpolation=cv2.INTER_AREA)
+    g = cv2.GaussianBlur(cv2.cvtColor(sm, cv2.COLOR_BGR2GRAY), (0, 0), 2)
+    t, _ = cv2.threshold(g, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    m = ndi.binary_opening(g > 0.6 * t, structure=cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (7, 7)).astype(bool))
+    lab, n = ndi.label(m)
+    m = lab == 1 + int(np.argmax(ndi.sum(m, lab, range(1, n + 1))))
+    holes, nh = ndi.label(ndi.binary_fill_holes(m) & ~m)
+    if nh:
+        small = np.r_[False, ndi.sum(np.ones_like(m), holes, range(1, nh + 1)) < 0.002 * m.sum()]
+        m |= small[holes]
+    cs, _ = cv2.findContours(m.astype(np.uint8), cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    h, w = m.shape
+    pts = []
+    for c in cs:
+        c = c[:, 0, :].astype(float)
+        if len(c) < 3:
+            continue
+        a, b = c, np.roll(c, -1, 0)
+        k = np.maximum(1, np.ceil(np.linalg.norm(b - a, axis=1) / (scale * 0.5))).astype(int)
+        seg = np.repeat(np.arange(len(a)), k)
+        u = (np.arange(k.sum()) - np.repeat(np.cumsum(k) - k, k)) / np.repeat(k, k)
+        d = a[seg] + (b[seg] - a[seg]) * u[:, None]
+        keep = (d[:, 0] > 1) & (d[:, 0] < w - 2) & (d[:, 1] > 1) & (d[:, 1] < h - 2)
+        pts.append(d[keep])
+    return (np.concatenate(pts) + .5) / scale - .5
+
+
+def snap_to_boundary(b):
+    """Move b.kp onto the nearest outline point; returns the distance each point moved (full-res px)."""
+    P = b.kp.reshape(-1, 2)
+    d, j = cKDTree(b.boundary).query(P)
+    b.kp = b.boundary[j].reshape(b.kp.shape)
+    b.snap_px = d.reshape(-1, 2)
+    return b.snap_px
 
 
 # ----------------------------------------------------------------------------- key-point transfer
@@ -221,6 +272,14 @@ def assign_keypoints(groups, manual, src):
                 b.kp, b.source = register(ref, b)(ref.kp.reshape(-1, 2)).reshape(-1, 2, 2), 'registered'
             assert len(b.kp) == len(ref.kp), \
                 f'{b.stem}: {len(b.kp)} distances in distance.txt, but its reference has {len(ref.kp)}'
+        if SNAP:                                       # after registration, so variants use the original reference
+            for b in bases[n]:
+                moved = snap_to_boundary(b)
+                for k, (m1, m2) in enumerate(moved):
+                    for e, m in ((1, m1), (2, m2)):
+                        if m > SNAP_WARN_PX:
+                            print(f'  note: {b.stem} D{k + 1} point {e} moved {m:.0f} px onto the outline - '
+                                  'check it in base_keypoints_check.jpg')
     return bases
 
 
@@ -541,11 +600,13 @@ def draw_distances(img, kp, scale=1.0, label=True):
 
 # ----------------------------------------------------------------------------- main
 def main():
-    global STRENGTH, VARY_EXPOSURE
+    global STRENGTH, VARY_EXPOSURE, SNAP
     ap = argparse.ArgumentParser()
     ap.add_argument('--n', type=int, default=100, help='images per shape')
     ap.add_argument('--seed', type=int, default=SEED)
     ap.add_argument('--strength', type=float, default=STRENGTH, help='distortion strength (default %(default)s)')
+    ap.add_argument('--no-snap', action='store_true',
+                    help='use the points from distance.txt as they are (default: move them onto the outline)')
     ap.add_argument('--vary-exposure', action='store_true',
                     help='random gamma / colour cast / contrast / vignette / brightness per image (off by default)')
     ap.add_argument('--out', default=os.path.join(HERE, 'dataset_out'))
@@ -553,7 +614,7 @@ def main():
     ap.add_argument('--mm-per-px', type=float, default=MM_PER_PX,
                     help='scale of the original images in shapes/ (default %(default)s)')
     a = ap.parse_args()
-    STRENGTH, VARY_EXPOSURE = a.strength, a.vary_exposure
+    STRENGTH, VARY_EXPOSURE, SNAP = a.strength, a.vary_exposure, not a.no_snap
     src = os.path.join(HERE, 'shapes')
     raw_dir, plot_dir = os.path.join(a.out, 'raw'), os.path.join(a.out, 'plotted')
     os.makedirs(raw_dir, exist_ok=True); os.makedirs(plot_dir, exist_ok=True)
@@ -578,15 +639,27 @@ def main():
     with open(os.path.join(a.out, 'reference_points.csv'), 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['shape', 'base_image', 'keypoint_source', 'orig_width', 'orig_height'] + kp_cols()
-                   + ['reg_residual_px', 'reg_scale', 'reg_rot_deg'])
+                   + ['reg_residual_px', 'reg_scale', 'reg_rot_deg', 'snap_max_px'])
         for n, bl in bases.items():
             for b in bl:
                 w.writerow([n, b.stem + '.png', b.source, *b.orig_wh] + kp_row(b.kp)
-                           + [round(b.reg.get(k, np.nan), 3) for k in ('reg_residual_px', 'reg_scale', 'reg_rot_deg')])
-                t = draw_distances(b.canvas, b.to_base(b.kp), label=False)
+                           + [round(b.reg.get(k, np.nan), 3) for k in ('reg_residual_px', 'reg_scale', 'reg_rot_deg')]
+                           + [round(float(b.snap_px.max()), 2) if b.snap_px is not None else ''])
+                t = b.canvas.copy()
+                q = np.round(b.to_base(b.boundary)).astype(int)
+                q = q[(q >= 0).all(1) & (q < BASE_SIZE).all(1)]
+                t[q[:, 1], q[:, 0]] = (255, 255, 0)                 # outline the points were snapped to (cyan)
+                t = draw_distances(t, b.to_base(b.kp), label=False)
                 t = cv2.resize(t, (384, 384), interpolation=cv2.INTER_AREA)
                 cv2.putText(t, f'{b.stem} [{b.source}]', (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1, cv2.LINE_AA)
                 tiles.append(t)
+    with open(os.path.join(a.out, 'distance_used.txt'), 'w') as f:    # same format as shapes/distance.txt
+        for n, bl in bases.items():
+            for b in bl:
+                sub = b.stem.split('_')[1] if '_' in b.stem else None
+                f.write(f'{n}{"_" + sub if sub else ""}:  # {b.source}{", snapped to outline" if SNAP else ""}\n')
+                for p, q in b.kp:
+                    f.write(f'({p[0]:.0f}, {p[1]:.0f}) ({q[0]:.0f}, {q[1]:.0f})\n')
     while len(tiles) % 6:
         tiles.append(np.zeros_like(tiles[0]))
     cv2.imwrite(os.path.join(a.out, 'base_keypoints_check.jpg'),
