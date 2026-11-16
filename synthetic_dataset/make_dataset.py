@@ -42,7 +42,7 @@ Bases: shapes with sub-images (shape6, shape6_2 / shape8_1..8_7) use every base 
 (image i uses base i % n_bases).  Key points of bases without hand-picked points are transferred
 from the reference by similarity-ICP on the outer contours (approximate, flagged in the CSVs).
 """
-import argparse, base64, csv, glob, json, os, re, struct, zlib
+import argparse, base64, csv, glob, json, multiprocessing, os, re, struct, time, zlib
 import cv2
 import numpy as np
 from scipy import ndimage as ndi
@@ -293,8 +293,9 @@ class Op:
 
 
 def _hom(H, P):
-    X = np.c_[P.reshape(-1, 2), np.ones(P.size // 2)] @ H.T
-    return (X[:, :2] / X[:, 2:3]).reshape(P.shape)
+    x, y = P[..., 0], P[..., 1]
+    w = H[2, 0] * x + H[2, 1] * y + H[2, 2]
+    return np.stack([(H[0, 0] * x + H[0, 1] * y + H[0, 2]) / w, (H[1, 0] * x + H[1, 1] * y + H[1, 2]) / w], -1)
 
 
 def hom_op(name, desc, H):
@@ -611,6 +612,8 @@ def main():
                     help='random gamma / colour cast / contrast / vignette / brightness per image (off by default)')
     ap.add_argument('--out', default=os.path.join(HERE, 'dataset_out'))
     ap.add_argument('--shapes', type=int, nargs='*', help='only these shape numbers')
+    ap.add_argument('--workers', type=int, default=0,
+                    help='parallel processes (default: one per CPU core; 1 = no parallelism)')
     ap.add_argument('--mm-per-px', type=float, default=MM_PER_PX,
                     help='scale of the original images in shapes/ (default %(default)s)')
     a = ap.parse_args()
@@ -630,10 +633,7 @@ def main():
         return [f'{prefix}D{i}_{c}' for i in range(1, n_dist + 1) for c in ('x1', 'y1', 'x2', 'y2', 'len')]
 
     def kp_row(kp):
-        row = []
-        for p, q in kp:
-            row += [round(p[0], 2), round(p[1], 2), round(q[0], 2), round(q[1], 2), round(float(np.linalg.norm(p - q)), 2)]
-        return row + [''] * 5 * (n_dist - len(kp))
+        return _kp_row(kp, n_dist)
 
     tiles = []
     with open(os.path.join(a.out, 'reference_points.csv'), 'w', newline='') as f:
@@ -665,40 +665,29 @@ def main():
     cv2.imwrite(os.path.join(a.out, 'base_keypoints_check.jpg'),
                 np.vstack([np.hstack(tiles[i:i + 6]) for i in range(0, len(tiles), 6)]), [cv2.IMWRITE_JPEG_QUALITY, 90])
 
-    # transformed set
-    rows, max_err = [], 0.0
-    for n, bl in bases.items():
-        for i in range(a.n):
-            b = bl[i % len(bl)]
-            rng = np.random.default_rng([a.seed, n, i])
-            kp_base = b.to_base(b.kp)
-            ops, kp_out = geometry(rng, kp_base, b.to_base(b.contour[b.valid][::6]))
-            img, g = warp(b, ops, rng)
-            err = float(np.abs(g(kp_out.reshape(-1, 2)) - kp_base.reshape(-1, 2)).max())   # g(f(p)) == p
-            assert err < 0.05, (n, i, err)
+    # transformed set: every image is independent (own seed), so they are made in parallel
+    tasks = [(n, i) for n in bases for i in range(a.n)]
+    cfg = dict(seed=a.seed, mm_per_px=a.mm_per_px, raw_dir=raw_dir, plot_dir=plot_dir, n_dist=n_dist)
+    workers = max(1, min(a.workers or os.cpu_count() or 1, len(tasks)))
+    print(f'making {len(tasks)} images with {workers} worker process{"es" if workers > 1 else ""} ...')
+    t0, rows, max_err = time.time(), [], 0.0
+    if workers == 1:
+        _init_worker(bases, cfg, STRENGTH, VARY_EXPOSURE)
+        results = map(_make_image, tasks)
+    else:
+        pool = multiprocessing.get_context('spawn').Pool(workers, _init_worker, (bases, cfg, STRENGTH, VARY_EXPOSURE))
+        results = pool.imap(_make_image, tasks, chunksize=2)
+    try:
+        for k, (row, err) in enumerate(results, 1):
+            rows.append(row)
             max_err = max(max_err, err)
-            warped = img
-            for _ in range(25):                          # redraw (seeded) until the piece is still visible
-                img, plog = photometric(warped, rng)
-                g = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-                p5, p95 = np.percentile(g[::4, ::4], [5, 95])
-                if p95 >= MIN_P95 and p95 - p5 >= MIN_SPREAD:
-                    break
-            name = f'shape{n}_{i:03d}.png'
-            if not cv2.imwrite(os.path.join(raw_dir, name), img):
-                raise IOError(f'could not write {os.path.join(raw_dir, name)} (file locked?)')
-            mm_base = a.mm_per_px / b.sx                        # mm per base-canvas px
-            p2mm = mm_base / float(np.mean(local_scale(ops, kp_base.reshape(-1, 2))))
-            write_png_scale(os.path.join(raw_dir, name), p2mm)
-            assert abs(read_png_scale(os.path.join(raw_dir, name)) - p2mm) < 1e-12
-            true_mm = [float(np.linalg.norm(p - q)) * a.mm_per_px for p, q in b.kp]
-            pred_mm = [float(np.linalg.norm(p - q)) * p2mm for p, q in kp_out]
-            cv2.imwrite(os.path.join(plot_dir, name.replace('.png', '.jpg')), draw_distances(img, kp_out),
-                        [cv2.IMWRITE_JPEG_QUALITY, 92])
-            desc = ';'.join([o.desc for o in ops if o.desc] + plog)
-            rows.append([name, n, b.stem + '.png', b.source, f'{a.seed}-{n}-{i}', desc] + kp_row(kp_out)
-                        + [f'{p2mm:.6g}'] + [x for t, pr in zip(true_mm, pred_mm) for x in (round(t, 4), round(pr, 4))]
-                        + [''] * 2 * (n_dist - len(true_mm)))
+            if k % 25 == 0 or k == len(tasks):
+                el = time.time() - t0
+                print(f'  {k}/{len(tasks)} images, {el:.0f} s, about {el / k * (len(tasks) - k):.0f} s left', flush=True)
+    finally:
+        if workers > 1:
+            pool.close(); pool.join()
+    for n, bl in bases.items():
         print(f'shape{n}: {a.n} images, bases {[x.stem for x in bl]}')
     with open(os.path.join(a.out, 'transformed_points.csv'), 'w', newline='') as f:
         w = csv.writer(f)
@@ -707,6 +696,60 @@ def main():
         w.writerows(rows)
     print(f'done: {len(rows)} images in {a.out}; max |g(f(p))-p| = {max_err:.2e} px')
 
+
+def _kp_row(kp, n_dist):
+    row = []
+    for p, q in kp:
+        row += [round(p[0], 2), round(p[1], 2), round(q[0], 2), round(q[1], 2), round(float(np.linalg.norm(p - q)), 2)]
+    return row + [''] * 5 * (n_dist - len(kp))
+
+
+_W = {}
+
+
+def _init_worker(bases, cfg, strength, vary_exposure):
+    """Runs once in every worker process (and in-process for --workers 1)."""
+    global STRENGTH, VARY_EXPOSURE
+    STRENGTH, VARY_EXPOSURE = strength, vary_exposure
+    cv2.setNumThreads(1)                                  # the processes already use every core
+    _W.update(cfg, bases=bases)
+
+
+def _make_image(task):
+    """Image i of shape n: warp, photometric effects, write raw + plotted, return (csv row, |g(f(p))-p|)."""
+    n, i = task
+    bl = _W['bases'][n]
+    b = bl[i % len(bl)]
+    rng = np.random.default_rng([_W['seed'], n, i])
+    kp_base = b.to_base(b.kp)
+    ops, kp_out = geometry(rng, kp_base, b.to_base(b.contour[b.valid][::6]))
+    img, g = warp(b, ops, rng)
+    err = float(np.abs(g(kp_out.reshape(-1, 2)) - kp_base.reshape(-1, 2)).max())   # g(f(p)) == p
+    assert err < 0.05, (n, i, err)
+    warped = img
+    for _ in range(25):                                  # redraw (seeded) until the piece is still visible
+        img, plog = photometric(warped, rng)
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        p5, p95 = np.percentile(gray[::4, ::4], [5, 95])
+        if p95 >= MIN_P95 and p95 - p5 >= MIN_SPREAD:
+            break
+    name = f'shape{n}_{i:03d}.png'
+    raw = os.path.join(_W['raw_dir'], name)
+    if not cv2.imwrite(raw, img):
+        raise IOError(f'could not write {raw} (file locked?)')
+    mm_base = _W['mm_per_px'] / b.sx                     # mm per base-canvas px
+    p2mm = mm_base / float(np.mean(local_scale(ops, kp_base.reshape(-1, 2))))
+    write_png_scale(raw, p2mm)
+    assert abs(read_png_scale(raw) - p2mm) < 1e-12
+    true_mm = [float(np.linalg.norm(p - q)) * _W['mm_per_px'] for p, q in b.kp]
+    pred_mm = [float(np.linalg.norm(p - q)) * p2mm for p, q in kp_out]
+    cv2.imwrite(os.path.join(_W['plot_dir'], name.replace('.png', '.jpg')), draw_distances(img, kp_out),
+                [cv2.IMWRITE_JPEG_QUALITY, 92])
+    desc = ';'.join([o.desc for o in ops if o.desc] + plog)
+    row = ([name, n, b.stem + '.png', b.source, f'{_W["seed"]}-{n}-{i}', desc] + _kp_row(kp_out, _W['n_dist'])
+           + [f'{p2mm:.6g}'] + [x for t, pr in zip(true_mm, pred_mm) for x in (round(t, 4), round(pr, 4))]
+           + [''] * 2 * (_W['n_dist'] - len(true_mm)))
+    return row, err
 
 if __name__ == '__main__':
     main()
