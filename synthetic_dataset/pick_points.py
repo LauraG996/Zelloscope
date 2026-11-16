@@ -135,7 +135,11 @@ def main():
         elif ev == cv2.EVENT_RBUTTONDOWN and pts:
             pts.pop()
         elif ev == cv2.EVENT_MOUSEWHEEL:
-            f = 1.25 if cv2.getMouseWheelDelta(flags) > 0 else 0.8
+            # wheel direction is the sign of the high 16 bits of `flags` (cv2.getMouseWheelDelta is
+            # missing from some OpenCV builds); flags arrives as a signed 32-bit int, so its sign is that sign
+            if flags >= 2 ** 31:                         # some builds pass it unsigned
+                flags -= 2 ** 32
+            f = 1.25 if flags > 0 else 0.8
             z = min(max(st['zoom'] * f, 0.05), 16)
             st['ox'], st['oy'] = p[0] + .5 - (x + .5) / z, p[1] + .5 - (y + .5) / z   # keep p under the cursor
             st['zoom'] = z
