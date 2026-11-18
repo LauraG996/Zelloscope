@@ -15,9 +15,11 @@ How the key points stay exact
   iteration.  All geometry of an image is chained and the pixels are resampled ONCE; the script
   asserts g(f(p)) == p for every key point.  Photometric operations (hue, gamma, colour cast, contrast, blur, then
   vignette, brightness, noise, salt&pepper, JPEG - in that order) are applied afterwards and do not move anything.
-  By default the exposure-changing ones (gamma, colour cast, contrast, vignette, brightness) are switched off so
-  every image keeps the exposure of its original; --vary-exposure turns them back on.  Their random numbers are
-  drawn either way, so geometry and the remaining effects are identical with and without the flag.
+  Two switches:  --brightness on|off  gamma, contrast, vignette, brightness   (default off: every image keeps
+                                      the exposure of its original)
+                 --color on|off       hue shift, colour cast                   (default on)
+  Blur, noise, salt&pepper and JPEG are always applied.  The random numbers of switched-off effects are still
+  drawn, so geometry and every other effect are identical whichever way the switches are set.
 
 Key points on the outline
   By default every key point (hand-picked or registered) is moved onto the nearest point of the piece's
@@ -57,7 +59,8 @@ EDGE_MARGIN = 5           # key points must lie at least this many px inside the
 SNAP = True               # move every reference key point onto the nearest point of the piece's outline (--no-snap: off)
 SNAP_WARN_PX = 25         # report points that had to move further than this (full-res px): probably misplaced
 STRENGTH = 0.3            # global distortion knob: scales the magnitude of every warp (1.0 = very strong)
-VARY_EXPOSURE = False     # True (--vary-exposure): random gamma/colour cast/contrast/vignette/brightness per image
+BRIGHTNESS_FX = False     # --brightness on: random gamma / contrast / vignette / brightness per image
+COLOR_FX = True           # --color off: no hue shift and no colour cast
 MIN_P95, MIN_SPREAD = 45, 30   # visibility guard: 95th-percentile grey level / (p95 - p5) of the output
 COLORS = [(60, 60, 235), (80, 200, 60), (40, 215, 245), (235, 140, 40), (220, 80, 220),   # BGR: D1 red, D2 green,
           (230, 230, 60), (40, 140, 255), (160, 160, 255), (150, 255, 150), (255, 255, 255)]  # D3 yellow, ... (cycled)
@@ -519,24 +522,25 @@ def photometric(img, rng):
     S = img.shape[0]
     if rng.random() < .7:
         d = int(rng.integers(-35, 36))
-        hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-        hsv[..., 0] = (hsv[..., 0].astype(int) + d) % 180
-        img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
-        log.append(f'hue({2 * d:+d}deg)')
+        if COLOR_FX:
+            hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+            hsv[..., 0] = (hsv[..., 0].astype(int) + d) % 180
+            img = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
+            log.append(f'hue({2 * d:+d}deg)')
     x = img.astype(np.float32)
     if rng.random() < .4:
         gm = np.exp(rng.uniform(np.log(.6), np.log(1.7)))
-        if VARY_EXPOSURE:
+        if BRIGHTNESS_FX:
             x = 255 * (x / 255) ** gm
             log.append(f'gamma({gm:.2f})')
     if rng.random() < .4:
         gain = rng.uniform(.75, 1.25, 3).astype(np.float32)
-        if VARY_EXPOSURE:
+        if COLOR_FX:
             x = x * gain
             log.append('colorcast(' + ','.join(f'{v:.2f}' for v in gain) + ')')
     if rng.random() < .8:
         ct = rng.uniform(.7, 1.5)
-        if VARY_EXPOSURE:
+        if BRIGHTNESS_FX:
             x = (x - 128) * ct + 128
             log.append(f'contrast({ct:.2f})')
     if rng.random() < .4:
@@ -553,14 +557,14 @@ def photometric(img, rng):
         log.append(f'motionblur({n},{a:.0f})')
     if rng.random() < .35:
         s = rng.uniform(.3, .6)
-        if VARY_EXPOSURE:
+        if BRIGHTNESS_FX:
             yy, xx = np.mgrid[:S, :S].astype(np.float32)
             r2 = ((xx - S / 2) ** 2 + (yy - S / 2) ** 2) / (S / 2) ** 2 / 2
             x = x * (1 - s * r2)[..., None]
             log.append(f'vignette({s:.2f})')
     if rng.random() < .8:
         br = rng.uniform(-40, 45)
-        if VARY_EXPOSURE:
+        if BRIGHTNESS_FX:
             x = x + br
             log.append(f'brightness({br:+.0f})')
     if rng.random() < .7:
@@ -601,15 +605,18 @@ def draw_distances(img, kp, scale=1.0, label=True):
 
 # ----------------------------------------------------------------------------- main
 def main():
-    global STRENGTH, VARY_EXPOSURE, SNAP
+    global STRENGTH, BRIGHTNESS_FX, COLOR_FX, SNAP
     ap = argparse.ArgumentParser()
     ap.add_argument('--n', type=int, default=100, help='images per shape')
     ap.add_argument('--seed', type=int, default=SEED)
     ap.add_argument('--strength', type=float, default=STRENGTH, help='distortion strength (default %(default)s)')
     ap.add_argument('--no-snap', action='store_true',
                     help='use the points from distance.txt as they are (default: move them onto the outline)')
-    ap.add_argument('--vary-exposure', action='store_true',
-                    help='random gamma / colour cast / contrast / vignette / brightness per image (off by default)')
+    ap.add_argument('--brightness', choices=['on', 'off'], default='off',
+                    help='random gamma / contrast / vignette / brightness per image (default %(default)s)')
+    ap.add_argument('--color', choices=['on', 'off'], default='on',
+                    help='random hue shift / colour cast per image (default %(default)s)')
+    ap.add_argument('--vary-exposure', action='store_true', help=argparse.SUPPRESS)   # old name of --brightness on
     ap.add_argument('--out', default=os.path.join(HERE, 'dataset_out'))
     ap.add_argument('--shapes', type=int, nargs='*', help='only these shape numbers')
     ap.add_argument('--workers', type=int, default=0,
@@ -617,7 +624,10 @@ def main():
     ap.add_argument('--mm-per-px', type=float, default=MM_PER_PX,
                     help='scale of the original images in shapes/ (default %(default)s)')
     a = ap.parse_args()
-    STRENGTH, VARY_EXPOSURE, SNAP = a.strength, a.vary_exposure, not a.no_snap
+    STRENGTH, SNAP = a.strength, not a.no_snap
+    BRIGHTNESS_FX, COLOR_FX = a.brightness == 'on' or a.vary_exposure, a.color == 'on'
+    print(f'effects: brightness {"on" if BRIGHTNESS_FX else "off"}, color {"on" if COLOR_FX else "off"}, '
+          f'strength {STRENGTH}')
     src = os.path.join(HERE, 'shapes')
     raw_dir, plot_dir = os.path.join(a.out, 'raw'), os.path.join(a.out, 'plotted')
     os.makedirs(raw_dir, exist_ok=True); os.makedirs(plot_dir, exist_ok=True)
@@ -672,10 +682,10 @@ def main():
     print(f'making {len(tasks)} images with {workers} worker process{"es" if workers > 1 else ""} ...')
     t0, rows, max_err = time.time(), [], 0.0
     if workers == 1:
-        _init_worker(bases, cfg, STRENGTH, VARY_EXPOSURE)
+        _init_worker(bases, cfg, STRENGTH, BRIGHTNESS_FX, COLOR_FX)
         results = map(_make_image, tasks)
     else:
-        pool = multiprocessing.get_context('spawn').Pool(workers, _init_worker, (bases, cfg, STRENGTH, VARY_EXPOSURE))
+        pool = multiprocessing.get_context('spawn').Pool(workers, _init_worker, (bases, cfg, STRENGTH, BRIGHTNESS_FX, COLOR_FX))
         results = pool.imap(_make_image, tasks, chunksize=2)
     try:
         for k, (row, err) in enumerate(results, 1):
@@ -707,10 +717,10 @@ def _kp_row(kp, n_dist):
 _W = {}
 
 
-def _init_worker(bases, cfg, strength, vary_exposure):
+def _init_worker(bases, cfg, strength, brightness_fx, color_fx):
     """Runs once in every worker process (and in-process for --workers 1)."""
-    global STRENGTH, VARY_EXPOSURE
-    STRENGTH, VARY_EXPOSURE = strength, vary_exposure
+    global STRENGTH, BRIGHTNESS_FX, COLOR_FX
+    STRENGTH, BRIGHTNESS_FX, COLOR_FX = strength, brightness_fx, color_fx
     cv2.setNumThreads(1)                                  # the processes already use every core
     _W.update(cfg, bases=bases)
 
