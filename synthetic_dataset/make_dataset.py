@@ -7,6 +7,9 @@ Output   dataset_out/raw/            transformed images (PNG, lossless)
          dataset_out/reference_points.csv     key points/distances on the (un-transformed) base images
          dataset_out/transformed_points.csv   key points/distances of every transformed image
          dataset_out/base_keypoints_check.jpg overview of the base images with their key distances
+         dataset_out/base_check/<image>.jpg   one check picture per base image: your points, where they
+                                              were snapped to, the outline and a coordinate table
+         (--check-only writes the reference files above and stops, without making the dataset)
 
 How the key points stay exact
   Every geometric operation is a coordinate mapping with a forward function f (input -> output
@@ -163,6 +166,7 @@ class Base:
         self.kp = None                                        # (n_distances, 2, 2) full-res coordinates
         self.source, self.reg = None, {}
         self.snap_px = None                                   # how far each key point was moved onto the outline
+        self.kp_input = None                                  # key points before snapping (distance.txt / registered)
 
     def to_base(self, P):
         P = np.asarray(P, float)
@@ -222,6 +226,7 @@ def piece_boundary(im, scale=0.5):
 
 def snap_to_boundary(b):
     """Move b.kp onto the nearest outline point; returns the distance each point moved (full-res px)."""
+    b.kp_input = b.kp.copy()
     P = b.kp.reshape(-1, 2)
     d, j = cKDTree(b.boundary).query(P)
     b.kp = b.boundary[j].reshape(b.kp.shape)
@@ -619,6 +624,51 @@ def draw_distances(img, kp, scale=1.0, label=True):
     return out
 
 
+def draw_base_check(b, mm_per_px):
+    """One check picture of a base image: outline (cyan), your points (hollow rings), the points used
+    (filled dots, joined to your point by a thin white line when they were snapped), the distances,
+    and a table with the coordinates in original-image pixels."""
+    nw, nh = round(b.orig_wh[0] * b.sx), round(b.orig_wh[1] * b.sy)
+    k = 1400 / max(nw, nh)                                   # picture size: 1400 px on the long side
+    def at(P):                                               # original px -> picture px
+        Q = (b.to_base(P) - [b.ox, b.oy] + .5) * k - .5
+        return [tuple(int(round(v)) for v in q) for q in np.asarray(Q).reshape(-1, 2)]
+    img = cv2.resize(b.canvas[b.oy:b.oy + nh, b.ox:b.ox + nw], (round(nw * k), round(nh * k)),
+                     interpolation=cv2.INTER_AREA)
+    q = np.array(at(b.boundary))
+    q = q[(q >= 0).all(1) & (q[:, 0] < img.shape[1]) & (q[:, 1] < img.shape[0])]
+    img[q[:, 1], q[:, 0]] = (255, 255, 0)
+    inp = b.kp_input if b.kp_input is not None else b.kp
+    rows = []
+    for i, ((p1, p2), (u1, u2)) in enumerate(zip(b.kp, inp)):
+        c = COLORS[i % len(COLORS)]
+        (a1, a2), (v1, v2) = at([p1, p2]), at([u1, u2])
+        cv2.line(img, a1, a2, c, 2, cv2.LINE_AA)
+        for a_, v_ in ((a1, v1), (a2, v2)):
+            if a_ != v_:
+                cv2.line(img, v_, a_, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.circle(img, v_, 9, (0, 0, 0), 3, cv2.LINE_AA)          # your point: ring
+            cv2.circle(img, v_, 9, c, 2, cv2.LINE_AA)
+            cv2.circle(img, a_, 4, (255, 255, 255), -1, cv2.LINE_AA)   # used point: dot
+            cv2.circle(img, a_, 4, (0, 0, 0), 1, cv2.LINE_AA)
+        m = ((a1[0] + a2[0]) // 2 + 6, (a1[1] + a2[1]) // 2 - 6)
+        L = float(np.linalg.norm(p1 - p2))
+        for col, th in (((0, 0, 0), 4), (c, 2)):
+            cv2.putText(img, f'D{i + 1}', m, cv2.FONT_HERSHEY_SIMPLEX, .8, col, th, cv2.LINE_AA)
+        mv = [float(np.linalg.norm(p - u)) for p, u in ((p1, u1), (p2, u2))]
+        rows.append((c, f'D{i + 1}  yours ({u1[0]:.0f}, {u1[1]:.0f}) ({u2[0]:.0f}, {u2[1]:.0f})   used ({p1[0]:.0f}, '
+                        f'{p1[1]:.0f}) ({p2[0]:.0f}, {p2[1]:.0f})   moved {mv[0]:.0f} / {mv[1]:.0f} px   '
+                        f'length {L:.0f} px = {L * mm_per_px:.2f} mm' + ('   <- check' if max(mv) > SNAP_WARN_PX else '')))
+    head = [((255, 255, 255), f'{b.stem}.png  [{b.source}]   {b.orig_wh[0]}x{b.orig_wh[1]} px, coordinates in '
+                              f'original-image px   ring = your point, dot = point used'
+                              + (', cyan = outline it was snapped to' if b.kp_input is not None else ''))]
+    lines = head + rows
+    panel = np.zeros((14 + 26 * len(lines), img.shape[1], 3), np.uint8)
+    for r, (c, t) in enumerate(lines):
+        cv2.putText(panel, t, (10, 30 + 26 * r - 8), cv2.FONT_HERSHEY_SIMPLEX, .55, c, 1, cv2.LINE_AA)
+    return np.vstack([img, panel])
+
+
 # ----------------------------------------------------------------------------- main
 def main():
     global STRENGTH, SNAP
@@ -636,6 +686,8 @@ def main():
                     help='random Gaussian / motion blur per image (default %(default)s)')
     ap.add_argument('--jpeg', choices=['on', 'off'], default='on',
                     help='random JPEG compression artefacts per image (default %(default)s)')
+    ap.add_argument('--check-only', action='store_true',
+                    help='only write the reference CSV and check pictures, do not make the dataset')
     ap.add_argument('--inside', choices=['on', 'off'], default='off',
                     help='keep the whole piece inside the frame (default %(default)s)')
     ap.add_argument('--vary-exposure', action='store_true', help=argparse.SUPPRESS)   # old name of --brightness on
@@ -704,6 +756,15 @@ def main():
         tiles.append(np.zeros_like(tiles[0]))
     cv2.imwrite(os.path.join(a.out, 'base_keypoints_check.jpg'),
                 np.vstack([np.hstack(tiles[i:i + 6]) for i in range(0, len(tiles), 6)]), [cv2.IMWRITE_JPEG_QUALITY, 90])
+    check_dir = os.path.join(a.out, 'base_check')
+    os.makedirs(check_dir, exist_ok=True)
+    for bl in bases.values():
+        for b in bl:
+            cv2.imwrite(os.path.join(check_dir, b.stem + '.jpg'), draw_base_check(b, a.mm_per_px),
+                        [cv2.IMWRITE_JPEG_QUALITY, 92])
+    print(f'check pictures of the base images: {check_dir}')
+    if a.check_only:
+        return
 
     # transformed set: every image is independent (own seed), so they are made in parallel
     tasks = [(n, i) for n in bases for i in range(a.n)]
