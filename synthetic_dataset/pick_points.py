@@ -1,6 +1,6 @@
-"""Click the key distances on a reference image and save them to shapes/distance.txt.
+"""Click the key distances on a reference image and save them to the distance.txt next to it.
 
-python pick_points.py shapes/shape9.png [--distances shapes/distance.txt]
+python pick_points.py <folder>/shape9.png [--distances <file>]   (default: <folder>/distance.txt)
 
   left click        place the next point (two clicks = one distance: D1, D2, ...)
   right click / u   undo the last point
@@ -108,11 +108,11 @@ def render(img, pts, zoom, ox, oy, cursor):
 
 
 def main():
-    here = os.path.dirname(os.path.abspath(__file__))
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument('image')
-    ap.add_argument('--distances', default=os.path.join(here, 'shapes', 'distance.txt'))
+    ap.add_argument('--distances', help='distance.txt to read and save (default: the one in the image folder)')
     a = ap.parse_args()
+    a.distances = a.distances or os.path.join(os.path.dirname(os.path.abspath(a.image)), 'distance.txt')
     img = cv2.imread(a.image)
     if img is None:
         raise SystemExit(f'could not read {a.image}')

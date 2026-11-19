@@ -1,7 +1,8 @@
 """Synthetic key-point / key-distance test set generated from the reference shapes.
 
 Inputs   shapes/shape*.png   and   shapes/distance.txt (hand-picked point pairs per shape,
-         full-resolution pixel coordinates; header "6:" = reference, "6_2:" = that sub-image).
+         full-resolution pixel coordinates; header "6:" = reference, "6_2:" = that sub-image),
+         optional shapes/scale.txt.  shapes/ is the folder next to this script unless --input names another.
 Output   dataset_out/raw/            transformed images (PNG, lossless)
          dataset_out/plotted/        same images with the transformed key distances drawn
          dataset_out/reference_points.csv     key points/distances on the (un-transformed) base images
@@ -178,14 +179,14 @@ def scale_for(stem, path, scales, cli_mm_per_px):
     """(mm per px of an original image, where the value came from) - see 'Scale' at the top."""
     name = stem + '.png'
     if name in scales:
-        return scales[name], 'shapes/scale.txt'
+        return scales[name], 'scale.txt'
     if cli_mm_per_px is not None:
         return cli_mm_per_px, '--mm-per-px'
     meta = png_meta_scale(path)
     if meta:
         return meta, 'PNG metadata'
     if 'default' in scales:
-        return scales['default'], 'shapes/scale.txt default'
+        return scales['default'], 'scale.txt default'
     return MM_PER_PX, 'built-in default (raw Zelloscope frame)'
 
 
@@ -766,6 +767,9 @@ def main():
     ap.add_argument('--inside', choices=['on', 'off'], default='off',
                     help='keep the whole piece inside the frame (default %(default)s)')
     ap.add_argument('--vary-exposure', action='store_true', help=argparse.SUPPRESS)   # old name of --brightness on
+    ap.add_argument('--input', default=os.path.join(HERE, 'shapes'),
+                    help='folder with shape*.png, distance.txt and optional scale.txt (default: shapes/ next to '
+                         'this script)')
     ap.add_argument('--out', default=os.path.join(HERE, 'dataset_out'))
     ap.add_argument('--shapes', type=int, nargs='*', help='only these shape numbers')
     ap.add_argument('--workers', type=int, default=0,
@@ -780,7 +784,13 @@ def main():
     globals().update(fx)
     print('effects: ' + ', '.join(f'{k[:-3].lower()} {"on" if v else "off"}' for k, v in fx.items())
           + f', strength {STRENGTH}, snap {"on" if SNAP else "off"}')
-    src = os.path.join(HERE, 'shapes')
+    src = os.path.abspath(a.input)
+    for need in ('', 'distance.txt'):
+        if not os.path.exists(os.path.join(src, need)):
+            raise SystemExit(f'not found: {os.path.join(src, need)}')
+    if not glob.glob(os.path.join(src, 'shape*.png')):
+        raise SystemExit(f'no shape*.png images in {src}')
+    print(f'input: {src}')
     raw_dir, plot_dir = os.path.join(a.out, 'raw'), os.path.join(a.out, 'plotted')
     os.makedirs(raw_dir, exist_ok=True); os.makedirs(plot_dir, exist_ok=True)
 
