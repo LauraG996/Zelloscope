@@ -20,6 +20,10 @@ How the key points stay exact
              --color on|off       hue shift, colour cast                   (default on)
              --blur on|off        Gaussian blur, motion blur               (default on)
              --jpeg on|off        JPEG compression artefacts               (default on)
+             --inside on|off      whole piece inside the frame (>= INSIDE_MARGIN px from the edge, checked
+                                  on the fine outline; default off: up to 0.5 % of the outline, or 4 % with a
+                                  crop, may leave the frame).  Changes which transforms are accepted, so
+                                  images differ from the default run.
   Noise and salt&pepper are always applied.  The random numbers of switched-off effects are still drawn, so
   geometry and every other effect are identical whichever way the switches are set.
 
@@ -65,6 +69,8 @@ BRIGHTNESS_FX = False     # --brightness on: random gamma / contrast / vignette 
 COLOR_FX = True           # --color off: no hue shift and no colour cast
 BLUR_FX = True            # --blur off: no Gaussian / motion blur
 JPEG_FX = True            # --jpeg off: no JPEG compression artefacts
+INSIDE_FX = False         # --inside on: the whole piece must stay inside the frame
+INSIDE_MARGIN = 3         # ... at least this many output px from the edge
 MIN_P95, MIN_SPREAD = 45, 30   # visibility guard: 95th-percentile grey level / (p95 - p5) of the output
 COLORS = [(60, 60, 235), (80, 200, 60), (40, 215, 245), (235, 140, 40), (220, 80, 220),   # BGR: D1 red, D2 green,
           (230, 230, 60), (40, 140, 255), (160, 160, 255), (150, 255, 150), (255, 255, 255)]  # D3 yellow, ... (cycled)
@@ -482,8 +488,11 @@ def sample_geometry(rng, kp_base, contour_base):
         C = contour_base
         for op in ops:
             C = op.f(C)
-        inside = ((C >= 0) & (C <= S - 1)).all(1).mean()
-        ok = bool(np.isfinite(C).all() and inside >= (.96 if cropped else .995))
+        if INSIDE_FX:
+            ok = bool(np.isfinite(C).all() and C.min() >= INSIDE_MARGIN and C.max() <= S - 1 - INSIDE_MARGIN)
+        else:
+            inside = ((C >= 0) & (C <= S - 1)).all(1).mean()
+            ok = bool(np.isfinite(C).all() and inside >= (.96 if cropped else .995))
     if ok:                                               # reject chains whose inverse does not reproduce the points
         ok = float(np.abs(compile_g(ops)(P) - kp_base.reshape(-1, 2)).max()) < 1e-3
     return (ops, P.reshape(-1, 2, 2)) if ok and len(ops) > 1 else None
@@ -627,6 +636,8 @@ def main():
                     help='random Gaussian / motion blur per image (default %(default)s)')
     ap.add_argument('--jpeg', choices=['on', 'off'], default='on',
                     help='random JPEG compression artefacts per image (default %(default)s)')
+    ap.add_argument('--inside', choices=['on', 'off'], default='off',
+                    help='keep the whole piece inside the frame (default %(default)s)')
     ap.add_argument('--vary-exposure', action='store_true', help=argparse.SUPPRESS)   # old name of --brightness on
     ap.add_argument('--out', default=os.path.join(HERE, 'dataset_out'))
     ap.add_argument('--shapes', type=int, nargs='*', help='only these shape numbers')
@@ -637,7 +648,7 @@ def main():
     a = ap.parse_args()
     STRENGTH, SNAP = a.strength, not a.no_snap
     fx = dict(BRIGHTNESS_FX=a.brightness == 'on' or a.vary_exposure, COLOR_FX=a.color == 'on',
-              BLUR_FX=a.blur == 'on', JPEG_FX=a.jpeg == 'on')
+              BLUR_FX=a.blur == 'on', JPEG_FX=a.jpeg == 'on', INSIDE_FX=a.inside == 'on')
     globals().update(fx)
     print('effects: ' + ', '.join(f'{k[:-3].lower()} {"on" if v else "off"}' for k, v in fx.items())
           + f', strength {STRENGTH}')
@@ -648,6 +659,12 @@ def main():
     manual = parse_distances(os.path.join(src, 'distance.txt'))
     groups = {n: v for n, v in discover(src).items() if not a.shapes or n in a.shapes}
     bases = assign_keypoints(groups, manual, src)
+    if INSIDE_FX:
+        for bl in bases.values():
+            for b in bl:
+                if not b.valid.all():
+                    print(f'  note: in {b.stem}.png the foam already touches the edge of the photo; that part is '
+                          'missing from the original, so it stays cut off in the generated images too')
 
     # reference csv + visual check of every base
     n_dist = max(len(b.kp) for bl in bases.values() for b in bl)   # shapes with fewer distances get empty cells
@@ -746,7 +763,8 @@ def _make_image(task):
     b = bl[i % len(bl)]
     rng = np.random.default_rng([_W['seed'], n, i])
     kp_base = b.to_base(b.kp)
-    ops, kp_out = geometry(rng, kp_base, b.to_base(b.contour[b.valid][::6]))
+    outline = b.boundary[::8] if INSIDE_FX else b.contour[b.valid][::6]   # fine outline (~4 px steps) for --inside
+    ops, kp_out = geometry(rng, kp_base, b.to_base(outline))
     img, g = warp(b, ops, rng)
     err = float(np.abs(g(kp_out.reshape(-1, 2)) - kp_base.reshape(-1, 2)).max())   # g(f(p)) == p
     assert err < 0.05, (n, i, err)
