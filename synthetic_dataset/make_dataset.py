@@ -37,7 +37,14 @@ Key points on the outline (--snap on; off by default: the points of distance.txt
   dataset_out/distance_used.txt holds the points actually used, in distance.txt format.
 
 Scale (mm per pixel)
-  The originals are taken to be MM_PER_PX (--mm-per-px, default 0.014019 = raw Zelloscope frame).
+  Each original image gets its own scale, the first of:
+    1. its line in shapes/scale.txt          ("shape9.png 0.0191"; '#' starts a comment)
+    2. --mm-per-px, if given on the command line (then it is used for every image without a line in 1.)
+    3. the scale Zelloscope stored in the PNG  (ZelloscopeData "p2mm")
+    4. the "default" line of shapes/scale.txt  ("default 0.014019")
+    5. 0.014019 (raw 3800x3804 Zelloscope frame)
+  The value used and where it came from are printed, written to reference_points.csv and shown on the
+  check pictures.
   Every output PNG gets that image's own scale written into it as a `ZelloscopeData` iTXt chunk
   (base64 JSON {"p2mm": ...}, the format Zelloscope itself writes), so zs_auto_measure picks it up
   as "image metadata".  The value is the mean local scale at the key points: sqrt|det J| of the
@@ -117,6 +124,71 @@ def read_png_scale(path):
     return None
 
 
+def png_meta_scale(path):
+    """p2mm Zelloscope stored in a PNG (ZelloscopeData text chunk, base64 or plain JSON), or None."""
+    try:
+        with open(path, 'rb') as f:
+            if f.read(8) != b'\x89PNG\r\n\x1a\n':
+                return None
+            while True:
+                head = f.read(8)
+                if len(head) < 8:
+                    return None
+                n, kind = struct.unpack('>I4s', head)
+                if kind in (b'IDAT', b'IEND'):
+                    return None                              # text chunks of interest come before the image data
+                data = f.read(n)
+                f.seek(4, 1)
+                key, _, rest = data.partition(b'\0')
+                if key != b'ZelloscopeData':
+                    continue
+                if kind == b'tEXt':
+                    text = rest
+                elif kind == b'zTXt':
+                    text = zlib.decompress(rest[1:])
+                elif kind == b'iTXt':
+                    comp, rest = rest[0], rest[2:]
+                    text = rest.split(b'\0', 2)[-1]
+                    text = zlib.decompress(text) if comp else text
+                else:
+                    continue
+                for dec in (lambda t: json.loads(base64.b64decode(t)), json.loads):
+                    try:
+                        v = dec(text).get('p2mm')
+                        return float(v) if v else None
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                return None
+    except OSError:
+        return None
+
+
+def read_scale_file(path):
+    """shapes/scale.txt -> {file name or 'default': mm per px}"""
+    out = {}
+    if os.path.exists(path):
+        for line in open(path):
+            parts = line.split('#')[0].split()
+            if len(parts) == 2:
+                out[parts[0]] = float(parts[1])
+    return out
+
+
+def scale_for(stem, path, scales, cli_mm_per_px):
+    """(mm per px of an original image, where the value came from) - see 'Scale' at the top."""
+    name = stem + '.png'
+    if name in scales:
+        return scales[name], 'shapes/scale.txt'
+    if cli_mm_per_px is not None:
+        return cli_mm_per_px, '--mm-per-px'
+    meta = png_meta_scale(path)
+    if meta:
+        return meta, 'PNG metadata'
+    if 'default' in scales:
+        return scales['default'], 'shapes/scale.txt default'
+    return MM_PER_PX, 'built-in default (raw Zelloscope frame)'
+
+
 # ----------------------------------------------------------------------------- input handling
 def parse_distances(path):
     """-> {(shape_no, sub or None): [(p1, p2), ...]}   (header 'N:' / 'N.' / 'N_k:')"""
@@ -166,6 +238,8 @@ class Base:
         self.source, self.reg = None, {}
         self.snap_px = None                                   # how far each key point was moved onto the outline
         self.kp_input = None                                  # key points before snapping (distance.txt / registered)
+        self.path = path
+        self.mm_per_px, self.scale_source = MM_PER_PX, 'built-in default'   # set in main()
 
     def to_base(self, P):
         P = np.asarray(P, float)
@@ -623,7 +697,7 @@ def draw_distances(img, kp, scale=1.0, label=True):
     return out
 
 
-def draw_base_check(b, mm_per_px):
+def draw_base_check(b):
     """One check picture of a base image: your points (hollow rings), the points used
     (filled dots, joined to your point by a thin white line when they were snapped), the distances,
     and a table with the coordinates in original-image pixels."""
@@ -652,7 +726,7 @@ def draw_base_check(b, mm_per_px):
         for col, th in (((0, 0, 0), 4), (c, 2)):
             cv2.putText(img, f'D{i + 1}', m, cv2.FONT_HERSHEY_SIMPLEX, .8, col, th, cv2.LINE_AA)
         mv = [float(np.linalg.norm(p - u)) for p, u in ((p1, u1), (p2, u2))]
-        length = f'length {L:.0f} px = {L * mm_per_px:.2f} mm'
+        length = f'length {L:.0f} px = {L * b.mm_per_px:.2f} mm'
         if b.kp_input is None:                               # not snapped: your points are the points used
             rows.append((c, f'D{i + 1}  ({p1[0]:.0f}, {p1[1]:.0f}) ({p2[0]:.0f}, {p2[1]:.0f})   {length}'))
         else:
@@ -660,7 +734,7 @@ def draw_base_check(b, mm_per_px):
                             f'{p1[1]:.0f}) ({p2[0]:.0f}, {p2[1]:.0f})   moved {mv[0]:.0f} / {mv[1]:.0f} px   {length}'
                             + ('   <- check' if max(mv) > SNAP_WARN_PX else '')))
     head = [((255, 255, 255), f'{b.stem}.png  [{b.source}]   {b.orig_wh[0]}x{b.orig_wh[1]} px, coordinates in '
-                              f'original-image px' + ('   ring = your point, dot = point used' if b.kp_input is not None else '')
+                              f'original-image px, {b.mm_per_px:g} mm/px ({b.scale_source})' + ('   ring = your point, dot = point used' if b.kp_input is not None else '')
                               + (' (snapped onto the outline)' if b.kp_input is not None else ''))]
     lines = head + rows
     panel = np.zeros((14 + 26 * len(lines), img.shape[1], 3), np.uint8)
@@ -696,8 +770,9 @@ def main():
     ap.add_argument('--shapes', type=int, nargs='*', help='only these shape numbers')
     ap.add_argument('--workers', type=int, default=0,
                     help='parallel processes (default: one per CPU core; 1 = no parallelism)')
-    ap.add_argument('--mm-per-px', type=float, default=MM_PER_PX,
-                    help='scale of the original images in shapes/ (default %(default)s)')
+    ap.add_argument('--mm-per-px', type=float, default=None,
+                    help='scale of the original images in shapes/ (default: shapes/scale.txt, the PNG metadata, '
+                         f'then {MM_PER_PX})')
     a = ap.parse_args()
     STRENGTH, SNAP = a.strength, a.snap == 'on' and not a.no_snap
     fx = dict(BRIGHTNESS_FX=a.brightness == 'on' or a.vary_exposure, COLOR_FX=a.color == 'on',
@@ -712,6 +787,11 @@ def main():
     manual = parse_distances(os.path.join(src, 'distance.txt'))
     groups = {n: v for n, v in discover(src).items() if not a.shapes or n in a.shapes}
     bases = assign_keypoints(groups, manual, src)
+    scales = read_scale_file(os.path.join(src, 'scale.txt'))
+    for bl in bases.values():
+        for b in bl:
+            b.mm_per_px, b.scale_source = scale_for(b.stem, b.path, scales, a.mm_per_px)
+            print(f'  {b.stem}.png: {b.mm_per_px:g} mm/px ({b.scale_source})')
     if INSIDE_FX:
         for bl in bases.values():
             for b in bl:
@@ -732,12 +812,13 @@ def main():
     with open(os.path.join(a.out, 'reference_points.csv'), 'w', newline='') as f:
         w = csv.writer(f)
         w.writerow(['shape', 'base_image', 'keypoint_source', 'orig_width', 'orig_height'] + kp_cols()
-                   + ['reg_residual_px', 'reg_scale', 'reg_rot_deg', 'snap_max_px'])
+                   + ['reg_residual_px', 'reg_scale', 'reg_rot_deg', 'snap_max_px', 'mm_per_px', 'scale_source'])
         for n, bl in bases.items():
             for b in bl:
                 w.writerow([n, b.stem + '.png', b.source, *b.orig_wh] + kp_row(b.kp)
                            + [round(b.reg.get(k, np.nan), 3) for k in ('reg_residual_px', 'reg_scale', 'reg_rot_deg')]
-                           + [round(float(b.snap_px.max()), 2) if b.snap_px is not None else ''])
+                           + [round(float(b.snap_px.max()), 2) if b.snap_px is not None else '']
+                           + [f'{b.mm_per_px:g}', b.scale_source])
                 t = draw_distances(b.canvas, b.to_base(b.kp), label=False)
                 t = cv2.resize(t, (384, 384), interpolation=cv2.INTER_AREA)
                 cv2.putText(t, f'{b.stem} [{b.source}]', (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1, cv2.LINE_AA)
@@ -757,7 +838,7 @@ def main():
     os.makedirs(check_dir, exist_ok=True)
     for bl in bases.values():
         for b in bl:
-            cv2.imwrite(os.path.join(check_dir, b.stem + '.jpg'), draw_base_check(b, a.mm_per_px),
+            cv2.imwrite(os.path.join(check_dir, b.stem + '.jpg'), draw_base_check(b),
                         [cv2.IMWRITE_JPEG_QUALITY, 92])
     print(f'check pictures of the base images: {check_dir}')
     if a.check_only:
@@ -765,7 +846,7 @@ def main():
 
     # transformed set: every image is independent (own seed), so they are made in parallel
     tasks = [(n, i) for n in bases for i in range(a.n)]
-    cfg = dict(seed=a.seed, mm_per_px=a.mm_per_px, raw_dir=raw_dir, plot_dir=plot_dir, n_dist=n_dist)
+    cfg = dict(seed=a.seed, raw_dir=raw_dir, plot_dir=plot_dir, n_dist=n_dist)
     workers = max(1, min(a.workers or os.cpu_count() or 1, len(tasks)))
     print(f'making {len(tasks)} images with {workers} worker process{"es" if workers > 1 else ""} ...')
     t0, rows, max_err = time.time(), [], 0.0
@@ -837,11 +918,11 @@ def _make_image(task):
     raw = os.path.join(_W['raw_dir'], name)
     if not cv2.imwrite(raw, img):
         raise IOError(f'could not write {raw} (file locked?)')
-    mm_base = _W['mm_per_px'] / b.sx                     # mm per base-canvas px
+    mm_base = b.mm_per_px / b.sx                     # mm per base-canvas px
     p2mm = mm_base / float(np.mean(local_scale(ops, kp_base.reshape(-1, 2))))
     write_png_scale(raw, p2mm)
     assert abs(read_png_scale(raw) - p2mm) < 1e-12
-    true_mm = [float(np.linalg.norm(p - q)) * _W['mm_per_px'] for p, q in b.kp]
+    true_mm = [float(np.linalg.norm(p - q)) * b.mm_per_px for p, q in b.kp]
     pred_mm = [float(np.linalg.norm(p - q)) * p2mm for p, q in kp_out]
     cv2.imwrite(os.path.join(_W['plot_dir'], name.replace('.png', '.jpg')), draw_distances(img, kp_out),
                 [cv2.IMWRITE_JPEG_QUALITY, 92])
