@@ -7,8 +7,8 @@ Output   dataset_out/raw/            transformed images (PNG, lossless)
          dataset_out/reference_points.csv     key points/distances on the (un-transformed) base images
          dataset_out/transformed_points.csv   key points/distances of every transformed image
          dataset_out/base_keypoints_check.jpg overview of the base images with their key distances
-         dataset_out/base_check/<image>.jpg   one check picture per base image: your points, where they
-                                              were snapped to, the outline and a coordinate table
+         dataset_out/base_check/<image>.jpg   one check picture per base image: your points (and, with
+                                              --snap on, where they were moved to) and a coordinate table
          (--check-only writes the reference files above and stops, without making the dataset)
 
 How the key points stay exact
@@ -30,12 +30,11 @@ How the key points stay exact
   Noise and salt&pepper are always applied.  The random numbers of switched-off effects are still drawn, so
   geometry and every other effect are identical whichever way the switches are set.
 
-Key points on the outline
-  By default every key point (hand-picked or registered) is moved onto the nearest point of the piece's
+Key points on the outline (--snap on; off by default: the points of distance.txt are used as they are)
+  With --snap on every key point (hand-picked or registered) is moved onto the nearest point of the piece's
   edge - outer outline or the edge of a real hole - found by brightness at half resolution (~1 px accurate).
-  base_keypoints_check.jpg draws that outline in cyan; reference_points.csv (snap_max_px) and the console
-  say how far points moved; dataset_out/distance_used.txt holds the points actually used, in distance.txt
-  format.  --no-snap uses distance.txt as is.
+  reference_points.csv (snap_max_px), the check pictures and the console say how far points moved;
+  dataset_out/distance_used.txt holds the points actually used, in distance.txt format.
 
 Scale (mm per pixel)
   The originals are taken to be MM_PER_PX (--mm-per-px, default 0.014019 = raw Zelloscope frame).
@@ -65,7 +64,7 @@ BASE_SIZE = 1536          # square working canvas the originals are fitted into
 OUT_SIZE = 768            # size of the output images
 SS = 2                    # supersampling factor of the single resampling step
 EDGE_MARGIN = 5           # key points must lie at least this many px inside the output image
-SNAP = True               # move every reference key point onto the nearest point of the piece's outline (--no-snap: off)
+SNAP = False              # --snap on: move every reference key point onto the nearest point of the piece's outline
 SNAP_WARN_PX = 25         # report points that had to move further than this (full-res px): probably misplaced
 STRENGTH = 0.3            # global distortion knob: scales the magnitude of every warp (1.0 = very strong)
 BRIGHTNESS_FX = False     # --brightness on: random gamma / contrast / vignette / brightness per image
@@ -625,7 +624,7 @@ def draw_distances(img, kp, scale=1.0, label=True):
 
 
 def draw_base_check(b, mm_per_px):
-    """One check picture of a base image: outline (cyan), your points (hollow rings), the points used
+    """One check picture of a base image: your points (hollow rings), the points used
     (filled dots, joined to your point by a thin white line when they were snapped), the distances,
     and a table with the coordinates in original-image pixels."""
     nw, nh = round(b.orig_wh[0] * b.sx), round(b.orig_wh[1] * b.sy)
@@ -635,9 +634,6 @@ def draw_base_check(b, mm_per_px):
         return [tuple(int(round(v)) for v in q) for q in np.asarray(Q).reshape(-1, 2)]
     img = cv2.resize(b.canvas[b.oy:b.oy + nh, b.ox:b.ox + nw], (round(nw * k), round(nh * k)),
                      interpolation=cv2.INTER_AREA)
-    q = np.array(at(b.boundary))
-    q = q[(q >= 0).all(1) & (q[:, 0] < img.shape[1]) & (q[:, 1] < img.shape[0])]
-    img[q[:, 1], q[:, 0]] = (255, 255, 0)
     inp = b.kp_input if b.kp_input is not None else b.kp
     rows = []
     for i, ((p1, p2), (u1, u2)) in enumerate(zip(b.kp, inp)):
@@ -656,12 +652,16 @@ def draw_base_check(b, mm_per_px):
         for col, th in (((0, 0, 0), 4), (c, 2)):
             cv2.putText(img, f'D{i + 1}', m, cv2.FONT_HERSHEY_SIMPLEX, .8, col, th, cv2.LINE_AA)
         mv = [float(np.linalg.norm(p - u)) for p, u in ((p1, u1), (p2, u2))]
-        rows.append((c, f'D{i + 1}  yours ({u1[0]:.0f}, {u1[1]:.0f}) ({u2[0]:.0f}, {u2[1]:.0f})   used ({p1[0]:.0f}, '
-                        f'{p1[1]:.0f}) ({p2[0]:.0f}, {p2[1]:.0f})   moved {mv[0]:.0f} / {mv[1]:.0f} px   '
-                        f'length {L:.0f} px = {L * mm_per_px:.2f} mm' + ('   <- check' if max(mv) > SNAP_WARN_PX else '')))
+        length = f'length {L:.0f} px = {L * mm_per_px:.2f} mm'
+        if b.kp_input is None:                               # not snapped: your points are the points used
+            rows.append((c, f'D{i + 1}  ({p1[0]:.0f}, {p1[1]:.0f}) ({p2[0]:.0f}, {p2[1]:.0f})   {length}'))
+        else:
+            rows.append((c, f'D{i + 1}  yours ({u1[0]:.0f}, {u1[1]:.0f}) ({u2[0]:.0f}, {u2[1]:.0f})   used ({p1[0]:.0f}, '
+                            f'{p1[1]:.0f}) ({p2[0]:.0f}, {p2[1]:.0f})   moved {mv[0]:.0f} / {mv[1]:.0f} px   {length}'
+                            + ('   <- check' if max(mv) > SNAP_WARN_PX else '')))
     head = [((255, 255, 255), f'{b.stem}.png  [{b.source}]   {b.orig_wh[0]}x{b.orig_wh[1]} px, coordinates in '
-                              f'original-image px   ring = your point, dot = point used'
-                              + (', cyan = outline it was snapped to' if b.kp_input is not None else ''))]
+                              f'original-image px' + ('   ring = your point, dot = point used' if b.kp_input is not None else '')
+                              + (' (snapped onto the outline)' if b.kp_input is not None else ''))]
     lines = head + rows
     panel = np.zeros((14 + 26 * len(lines), img.shape[1], 3), np.uint8)
     for r, (c, t) in enumerate(lines):
@@ -676,8 +676,9 @@ def main():
     ap.add_argument('--n', type=int, default=100, help='images per shape')
     ap.add_argument('--seed', type=int, default=SEED)
     ap.add_argument('--strength', type=float, default=STRENGTH, help='distortion strength (default %(default)s)')
-    ap.add_argument('--no-snap', action='store_true',
-                    help='use the points from distance.txt as they are (default: move them onto the outline)')
+    ap.add_argument('--snap', choices=['on', 'off'], default='off',
+                    help='move the points of distance.txt onto the nearest outline point (default %(default)s)')
+    ap.add_argument('--no-snap', action='store_true', help=argparse.SUPPRESS)   # old switch, now the default
     ap.add_argument('--brightness', choices=['on', 'off'], default='off',
                     help='random gamma / contrast / vignette / brightness per image (default %(default)s)')
     ap.add_argument('--color', choices=['on', 'off'], default='on',
@@ -698,12 +699,12 @@ def main():
     ap.add_argument('--mm-per-px', type=float, default=MM_PER_PX,
                     help='scale of the original images in shapes/ (default %(default)s)')
     a = ap.parse_args()
-    STRENGTH, SNAP = a.strength, not a.no_snap
+    STRENGTH, SNAP = a.strength, a.snap == 'on' and not a.no_snap
     fx = dict(BRIGHTNESS_FX=a.brightness == 'on' or a.vary_exposure, COLOR_FX=a.color == 'on',
               BLUR_FX=a.blur == 'on', JPEG_FX=a.jpeg == 'on', INSIDE_FX=a.inside == 'on')
     globals().update(fx)
     print('effects: ' + ', '.join(f'{k[:-3].lower()} {"on" if v else "off"}' for k, v in fx.items())
-          + f', strength {STRENGTH}')
+          + f', strength {STRENGTH}, snap {"on" if SNAP else "off"}')
     src = os.path.join(HERE, 'shapes')
     raw_dir, plot_dir = os.path.join(a.out, 'raw'), os.path.join(a.out, 'plotted')
     os.makedirs(raw_dir, exist_ok=True); os.makedirs(plot_dir, exist_ok=True)
@@ -737,11 +738,7 @@ def main():
                 w.writerow([n, b.stem + '.png', b.source, *b.orig_wh] + kp_row(b.kp)
                            + [round(b.reg.get(k, np.nan), 3) for k in ('reg_residual_px', 'reg_scale', 'reg_rot_deg')]
                            + [round(float(b.snap_px.max()), 2) if b.snap_px is not None else ''])
-                t = b.canvas.copy()
-                q = np.round(b.to_base(b.boundary)).astype(int)
-                q = q[(q >= 0).all(1) & (q < BASE_SIZE).all(1)]
-                t[q[:, 1], q[:, 0]] = (255, 255, 0)                 # outline the points were snapped to (cyan)
-                t = draw_distances(t, b.to_base(b.kp), label=False)
+                t = draw_distances(b.canvas, b.to_base(b.kp), label=False)
                 t = cv2.resize(t, (384, 384), interpolation=cv2.INTER_AREA)
                 cv2.putText(t, f'{b.stem} [{b.source}]', (6, 18), cv2.FONT_HERSHEY_SIMPLEX, .5, (255, 255, 255), 1, cv2.LINE_AA)
                 tiles.append(t)
