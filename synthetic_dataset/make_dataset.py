@@ -15,11 +15,13 @@ How the key points stay exact
   iteration.  All geometry of an image is chained and the pixels are resampled ONCE; the script
   asserts g(f(p)) == p for every key point.  Photometric operations (hue, gamma, colour cast, contrast, blur, then
   vignette, brightness, noise, salt&pepper, JPEG - in that order) are applied afterwards and do not move anything.
-  Two switches:  --brightness on|off  gamma, contrast, vignette, brightness   (default off: every image keeps
-                                      the exposure of its original)
-                 --color on|off       hue shift, colour cast                   (default on)
-  Blur, noise, salt&pepper and JPEG are always applied.  The random numbers of switched-off effects are still
-  drawn, so geometry and every other effect are identical whichever way the switches are set.
+  Switches:  --brightness on|off  gamma, contrast, vignette, brightness   (default off: every image keeps
+                                  the exposure of its original)
+             --color on|off       hue shift, colour cast                   (default on)
+             --blur on|off        Gaussian blur, motion blur               (default on)
+             --jpeg on|off        JPEG compression artefacts               (default on)
+  Noise and salt&pepper are always applied.  The random numbers of switched-off effects are still drawn, so
+  geometry and every other effect are identical whichever way the switches are set.
 
 Key points on the outline
   By default every key point (hand-picked or registered) is moved onto the nearest point of the piece's
@@ -61,6 +63,8 @@ SNAP_WARN_PX = 25         # report points that had to move further than this (fu
 STRENGTH = 0.3            # global distortion knob: scales the magnitude of every warp (1.0 = very strong)
 BRIGHTNESS_FX = False     # --brightness on: random gamma / contrast / vignette / brightness per image
 COLOR_FX = True           # --color off: no hue shift and no colour cast
+BLUR_FX = True            # --blur off: no Gaussian / motion blur
+JPEG_FX = True            # --jpeg off: no JPEG compression artefacts
 MIN_P95, MIN_SPREAD = 45, 30   # visibility guard: 95th-percentile grey level / (p95 - p5) of the output
 COLORS = [(60, 60, 235), (80, 200, 60), (40, 215, 245), (235, 140, 40), (220, 80, 220),   # BGR: D1 red, D2 green,
           (230, 230, 60), (40, 140, 255), (160, 160, 255), (150, 255, 150), (255, 255, 255)]  # D3 yellow, ... (cycled)
@@ -545,16 +549,18 @@ def photometric(img, rng):
             log.append(f'contrast({ct:.2f})')
     if rng.random() < .4:
         sg = rng.uniform(.6, 2.5)
-        x = cv2.GaussianBlur(x, (0, 0), sg)
-        log.append(f'blur({sg:.1f})')
+        if BLUR_FX:
+            x = cv2.GaussianBlur(x, (0, 0), sg)
+            log.append(f'blur({sg:.1f})')
     elif rng.random() < .15:
         n, a = int(rng.integers(5, 22)) | 1, rng.uniform(0, 180)
-        ker = np.zeros((n, n), np.float32)
-        cv2.line(ker, (0, n // 2), (n - 1, n // 2), 1, 1)
-        M = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), a, 1)
-        ker = cv2.warpAffine(ker, M, (n, n))
-        x = cv2.filter2D(x, -1, ker / ker.sum())
-        log.append(f'motionblur({n},{a:.0f})')
+        if BLUR_FX:
+            ker = np.zeros((n, n), np.float32)
+            cv2.line(ker, (0, n // 2), (n - 1, n // 2), 1, 1)
+            M = cv2.getRotationMatrix2D(((n - 1) / 2, (n - 1) / 2), a, 1)
+            ker = cv2.warpAffine(ker, M, (n, n))
+            x = cv2.filter2D(x, -1, ker / ker.sum())
+            log.append(f'motionblur({n},{a:.0f})')
     if rng.random() < .35:
         s = rng.uniform(.3, .6)
         if BRIGHTNESS_FX:
@@ -581,8 +587,9 @@ def photometric(img, rng):
     img = x.astype(np.uint8)
     if rng.random() < .35:
         q = int(rng.integers(15, 56))
-        img = cv2.imdecode(cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, q])[1], cv2.IMREAD_COLOR)
-        log.append(f'jpeg({q})')
+        if JPEG_FX:
+            img = cv2.imdecode(cv2.imencode('.jpg', img, [cv2.IMWRITE_JPEG_QUALITY, q])[1], cv2.IMREAD_COLOR)
+            log.append(f'jpeg({q})')
     return img, log
 
 
@@ -605,7 +612,7 @@ def draw_distances(img, kp, scale=1.0, label=True):
 
 # ----------------------------------------------------------------------------- main
 def main():
-    global STRENGTH, BRIGHTNESS_FX, COLOR_FX, SNAP
+    global STRENGTH, SNAP
     ap = argparse.ArgumentParser()
     ap.add_argument('--n', type=int, default=100, help='images per shape')
     ap.add_argument('--seed', type=int, default=SEED)
@@ -616,6 +623,10 @@ def main():
                     help='random gamma / contrast / vignette / brightness per image (default %(default)s)')
     ap.add_argument('--color', choices=['on', 'off'], default='on',
                     help='random hue shift / colour cast per image (default %(default)s)')
+    ap.add_argument('--blur', choices=['on', 'off'], default='on',
+                    help='random Gaussian / motion blur per image (default %(default)s)')
+    ap.add_argument('--jpeg', choices=['on', 'off'], default='on',
+                    help='random JPEG compression artefacts per image (default %(default)s)')
     ap.add_argument('--vary-exposure', action='store_true', help=argparse.SUPPRESS)   # old name of --brightness on
     ap.add_argument('--out', default=os.path.join(HERE, 'dataset_out'))
     ap.add_argument('--shapes', type=int, nargs='*', help='only these shape numbers')
@@ -625,9 +636,11 @@ def main():
                     help='scale of the original images in shapes/ (default %(default)s)')
     a = ap.parse_args()
     STRENGTH, SNAP = a.strength, not a.no_snap
-    BRIGHTNESS_FX, COLOR_FX = a.brightness == 'on' or a.vary_exposure, a.color == 'on'
-    print(f'effects: brightness {"on" if BRIGHTNESS_FX else "off"}, color {"on" if COLOR_FX else "off"}, '
-          f'strength {STRENGTH}')
+    fx = dict(BRIGHTNESS_FX=a.brightness == 'on' or a.vary_exposure, COLOR_FX=a.color == 'on',
+              BLUR_FX=a.blur == 'on', JPEG_FX=a.jpeg == 'on')
+    globals().update(fx)
+    print('effects: ' + ', '.join(f'{k[:-3].lower()} {"on" if v else "off"}' for k, v in fx.items())
+          + f', strength {STRENGTH}')
     src = os.path.join(HERE, 'shapes')
     raw_dir, plot_dir = os.path.join(a.out, 'raw'), os.path.join(a.out, 'plotted')
     os.makedirs(raw_dir, exist_ok=True); os.makedirs(plot_dir, exist_ok=True)
@@ -682,10 +695,10 @@ def main():
     print(f'making {len(tasks)} images with {workers} worker process{"es" if workers > 1 else ""} ...')
     t0, rows, max_err = time.time(), [], 0.0
     if workers == 1:
-        _init_worker(bases, cfg, STRENGTH, BRIGHTNESS_FX, COLOR_FX)
+        _init_worker(bases, cfg, STRENGTH, fx)
         results = map(_make_image, tasks)
     else:
-        pool = multiprocessing.get_context('spawn').Pool(workers, _init_worker, (bases, cfg, STRENGTH, BRIGHTNESS_FX, COLOR_FX))
+        pool = multiprocessing.get_context('spawn').Pool(workers, _init_worker, (bases, cfg, STRENGTH, fx))
         results = pool.imap(_make_image, tasks, chunksize=2)
     try:
         for k, (row, err) in enumerate(results, 1):
@@ -717,10 +730,11 @@ def _kp_row(kp, n_dist):
 _W = {}
 
 
-def _init_worker(bases, cfg, strength, brightness_fx, color_fx):
+def _init_worker(bases, cfg, strength, fx):
     """Runs once in every worker process (and in-process for --workers 1)."""
-    global STRENGTH, BRIGHTNESS_FX, COLOR_FX
-    STRENGTH, BRIGHTNESS_FX, COLOR_FX = strength, brightness_fx, color_fx
+    global STRENGTH
+    STRENGTH = strength
+    globals().update(fx)                                  # BRIGHTNESS_FX, COLOR_FX, BLUR_FX, JPEG_FX
     cv2.setNumThreads(1)                                  # the processes already use every core
     _W.update(cfg, bases=bases)
 
