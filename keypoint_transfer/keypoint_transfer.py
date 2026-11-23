@@ -510,20 +510,108 @@ def map_points_oriented(ref, new, ref_pts, verbose=True, **kw):
 
 
 # ---------------------------------------------------------------- visual check
-def draw_overlay(ref, new, ref_pts, res, max_side=1400):
-    """Side-by-side image: reference points on the left, inferred points on the right."""
+_COLORS = [(60, 60, 255), (60, 200, 255), (255, 160, 40), (230, 80, 230), (80, 220, 80), (255, 255, 80),
+           (40, 120, 255), (200, 120, 255)]                           # BGR, one per distance / point
+PRED_COLOR, GT_COLOR = (0, 0, 255), (0, 220, 0)                       # red = placed by the pipeline, green = ground truth
+
+
+def _text(im, s, org, scale=0.6, color=(255, 255, 255)):
+    """Text on a dark box, readable on any background (an outline drawn with thicker text misaligns on OpenCV 5)."""
+    x, y = int(org[0]), int(org[1])
+    t = 2 if scale >= 0.6 else 1
+    (w, h), base = cv2.getTextSize(s, cv2.FONT_HERSHEY_SIMPLEX, scale, t)
+    x0, y0, x1, y1 = max(x - 3, 0), max(y - h - 4, 0), min(x + int(w * 1.1) + 4, im.shape[1]), min(y + base + 2, im.shape[0])
+    if x1 > x0 and y1 > y0:
+        im[y0:y1, x0:x1] = (im[y0:y1, x0:x1] * 0.3).astype(im.dtype)
+    cv2.putText(im, s, (x, y), cv2.FONT_HERSHEY_SIMPLEX, scale, color, t, cv2.LINE_AA)
+
+
+def _cross(im, p, color, r=7, t=2):
+    x, y = int(round(p[0])), int(round(p[1]))
+    cv2.line(im, (x - r, y), (x + r, y), color, t, cv2.LINE_AA)
+    cv2.line(im, (x, y - r), (x, y + r), color, t, cv2.LINE_AA)
+
+
+def _zoom(img, c, half, tile):
+    """tile x tile px view of img around c (full-res px), half = half window in full-res px. Returns (tile, map)."""
+    k = tile / (2.0 * half)
+    M = np.array([[k, 0, tile / 2 - k * c[0]], [0, k, tile / 2 - k * c[1]]])
+    t = cv2.warpAffine(img, M, (tile, tile), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+    return cv2.cvtColor(t, cv2.COLOR_GRAY2BGR), (lambda p: (np.asarray(p, float) * k + M[:, 2]))
+
+
+def draw_points(ref, new, ref_pts, new_pts, gt=None, pairs=None, names=None, title=None,
+                panel_height=900, zoom_half=40, tile=220):
+    """Picture of a transfer result.
+
+    Top:    reference image with the reference points | new image with the placed points (red) and, if `gt` is given,
+            the ground-truth points (green crosses, joined to the placed point by a yellow line).
+    Bottom: zoomed full-resolution tiles around every point (reference row, new-image row), +-zoom_half px,
+            so sub-pixel to ~40 px errors are visible. Tile captions give the error in px when `gt` is given.
+    pairs:  list of (i, j) point indices joined by a line (e.g. the D1..D3 distances).
+    Returns a BGR image (save with cv2.imwrite)."""
     ref_pts = np.atleast_2d(np.asarray(ref_pts, float))
-    s = max_side / max(ref.shape + new.shape)
-    def panel(img, pts, color):
+    new_pts = np.atleast_2d(np.asarray(new_pts, float))
+    gt = None if gt is None else np.atleast_2d(np.asarray(gt, float))
+    n = len(ref_pts)
+    names = names or [str(i) for i in range(n)]
+    col = [_COLORS[(i // 2 if pairs else i) % len(_COLORS)] for i in range(n)]
+
+    def panel(img, pts, is_new):
+        s = panel_height / img.shape[0]
         im = cv2.cvtColor(cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA), cv2.COLOR_GRAY2BGR)
-        for i, p in enumerate(pts * s):
-            cv2.circle(im, tuple(int(v) for v in p), 9, color, 2)
-            cv2.putText(im, str(i), (int(p[0]) + 12, int(p[1]) - 6), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+        P = pts * s
+        for i, j in (pairs or []):
+            cv2.line(im, tuple(np.round(P[i]).astype(int)), tuple(np.round(P[j]).astype(int)), col[i], 1, cv2.LINE_AA)
+        if is_new and gt is not None:
+            G = gt * s
+            for i in range(n):
+                cv2.line(im, tuple(np.round(G[i]).astype(int)), tuple(np.round(P[i]).astype(int)), (0, 255, 255), 1, cv2.LINE_AA)
+                _cross(im, G[i], GT_COLOR, 9, 2)
+        for i in range(n):
+            cv2.circle(im, tuple(np.round(P[i]).astype(int)), 8, PRED_COLOR if is_new else col[i], 2, cv2.LINE_AA)
+            _text(im, names[i], P[i] + (11, -8), 0.6, col[i])
+        _text(im, "new image (red = placed" + (", green = truth)" if gt is not None else ")") if is_new else "reference",
+              (10, 28), 0.8)
         return im
-    a, b = panel(ref, ref_pts, (0, 0, 255)), panel(new, res["new_pts"], (0, 0, 255))
-    h = max(a.shape[0], b.shape[0])
-    pad = lambda im: cv2.copyMakeBorder(im, 0, h - im.shape[0], 0, 0, cv2.BORDER_CONSTANT)
-    return np.hstack([pad(a), pad(b)])
+
+    top = [panel(ref, ref_pts, False), panel(new, new_pts, True)]
+    top = np.hstack([top[0], np.zeros((panel_height, 6, 3), np.uint8), top[1]])
+
+    rows = []
+    for which in ("ref", "new"):
+        tiles = []
+        for i in range(n):
+            if which == "ref":
+                t, f = _zoom(ref, ref_pts[i], zoom_half, tile)
+                cv2.circle(t, tuple(np.round(f(ref_pts[i])).astype(int)), 6, col[i], 2, cv2.LINE_AA)
+                cap = f"{names[i]} reference"
+            else:
+                c = gt[i] if gt is not None else new_pts[i]
+                t, f = _zoom(new, c, zoom_half, tile)
+                if gt is not None:
+                    _cross(t, f(gt[i]), GT_COLOR, 10, 2)
+                cv2.circle(t, tuple(np.round(f(new_pts[i])).astype(int)), 6, PRED_COLOR, 2, cv2.LINE_AA)
+                cap = f"{names[i]} err {np.linalg.norm(new_pts[i] - gt[i]):.1f}px" if gt is not None else f"{names[i]} placed"
+            cv2.rectangle(t, (0, 0), (tile - 1, tile - 1), col[i], 2)
+            _text(t, cap, (6, 20), 0.5)
+            tiles.append(t)
+        rows.append(np.hstack(tiles))
+    _text(rows[0], f"zoom +-{zoom_half}px", (6, tile - 8), 0.45, (200, 200, 200))
+
+    W = max(top.shape[1], rows[0].shape[1])
+    padw = lambda im: cv2.copyMakeBorder(im, 0, 0, 0, W - im.shape[1], cv2.BORDER_CONSTANT, value=(40, 40, 40))
+    parts = [padw(top), padw(rows[0]), padw(rows[1])]
+    if title:
+        bar = np.full((36, W, 3), 40, np.uint8)
+        _text(bar, title, (10, 25), 0.7)
+        parts.insert(0, bar)
+    return np.vstack(parts)
+
+
+def draw_overlay(ref, new, ref_pts, res, gt=None, **kw):
+    """draw_points for a result dict of map_points / map_points_oriented."""
+    return draw_points(ref, new, ref_pts, res["new_pts"], gt=gt, **kw)
 
 
 def parse_points(text):

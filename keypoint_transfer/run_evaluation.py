@@ -3,6 +3,7 @@
   python run_evaluation.py                      all shapes, all images
   python run_evaluation.py --shapes 8 3         only these shapes
   python run_evaluation.py --limit 10           first 10 images per run (smoke test)
+  python run_evaluation.py --plot               also save a picture of the placed points per image (<out>/plots)
 
 Images are processed grouped by reference image, so each reference's RoMa encoder features are computed once and
 reused for all of its images. The run is resumable: finished images in <out>/per_image.csv are skipped.
@@ -30,6 +31,7 @@ ap.add_argument("--data", default=os.path.dirname(HERE), help="folder holding da
 ap.add_argument("--out", default=os.path.join(HERE, "results"), help="output folder")
 ap.add_argument("--shapes", nargs="*", default=None, help="shape numbers to run (default: all)")
 ap.add_argument("--limit", type=int, default=None, help="process at most this many images (smoke test)")
+ap.add_argument("--plot", action="store_true", help="also save a picture of the placed points per image to <out>/plots (not timed)")
 a = ap.parse_args()
 
 if os.name == "nt":                                         # no idle sleep while this process runs (a sleeping laptop stalls the run)
@@ -39,6 +41,9 @@ if kt.BACKEND == "onnx":
     roma_onnx.CACHE_MAX = 64                                # keep the features of every reference for the whole run
 
 os.makedirs(a.out, exist_ok=True)
+if a.plot:
+    import cv2
+    os.makedirs(os.path.join(a.out, "plots"), exist_ok=True)
 PER = os.path.join(a.out, "per_image.csv")
 refs = {r["base_image"]: r for r in csv.DictReader(open(os.path.join(a.data, "dataset_out", "reference_points.csv")))}
 rows = list(csv.DictReader(open(os.path.join(a.data, "dataset_out", "transformed_points.csv"))))
@@ -83,6 +88,11 @@ for i, r in enumerate(rows):
         L = ln(gt)
         w.writerow([r["image"], r["shape"], b, r["keypoint_source"], int(first), f"{res['seconds']:.2f}", res["orientation"], 0]
                    + [f"{v:.3f}" for v in 100 * e / np.repeat(L, 2)] + [f"{v:.3f}" for v in 100 * np.abs(ln(res["new_pts"]) - L) / L] + [f"{e.mean():.2f}"])
+        if a.plot:
+            title = f"{r['image']}  shape {r['shape']}  |  error mean {e.mean():.2f}px  max {e.max():.2f}px  |  {res['orientation']}"
+            img = kt.draw_overlay(ref, new, pts(refs[b]), res, gt=gt, pairs=[(0, 1), (2, 3), (4, 5)],
+                                  names=[f"D{d}{x}" for d in (1, 2, 3) for x in "ab"], title=title)
+            cv2.imwrite(os.path.join(a.out, "plots", os.path.splitext(r["image"])[0] + ".jpg"), img, [cv2.IMWRITE_JPEG_QUALITY, 90])
     except Exception as ex:
         print(r["image"], "FAILED:", ex, flush=True)
         w.writerow([r["image"], r["shape"], b, r["keypoint_source"], int(first), "", "", 1] + [""] * 10)

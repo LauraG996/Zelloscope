@@ -55,6 +55,7 @@ python -c "import onnxruntime; print(onnxruntime.__version__)"     # must print 
 | `keypoint_transfer.py` | the method (also a CLI: `python keypoint_transfer.py REF NEW --points "x,y;x,y" --out overlay.png`) |
 | `roma_onnx.py` | ONNX Runtime fp32 backend for RoMa; caches the reference's encoder features |
 | `run_evaluation.py` | evaluates on the dataset, grouped by reference, resumable, writes `results/per_image.csv` + `percentiles.csv` |
+| `show_points.py` | runs chosen dataset images and saves a picture of the placed points vs. the truth to `plots/` |
 | `export_models.py` | creates / repairs the ONNX models in `onnx_models/` (7 files); `--verify` compares them with PyTorch |
 | `requirements.txt` | pinned packages |
 
@@ -63,9 +64,11 @@ python -c "import onnxruntime; print(onnxruntime.__version__)"     # must print 
 python export_models.py --verify       # once (about 30 s - 1 min): exports the ONNX models, checks them against PyTorch
 python run_evaluation.py               # all 800 images, results in ./results
 python run_evaluation.py --shapes 8 --limit 10     # quick test
+python run_evaluation.py --plot        # also save a picture per image to results/plots (jpg)
+python show_points.py --shape 7 --limit 5 --open   # pictures of 5 images of shape 7 (also: image names, or --worst 10)
 ```
 Settings (env): `ROMA_COARSE` (224), `ROMA_UPSAMPLE` (0 = off), `ROMA_THREADS` (8), `ROMA_BACKEND` (`onnx` | `torch`),
-`ROMA_ONNX_DIR` (model folder). If you skip the export, the models are created during the first run.
+`ROMA_ONNX_DIR` (model folder). All scripts take `--data DIR` = the folder holding `dataset_out/` and `New folder/`. If you skip the export, the models are created during the first run.
 The first image of every new reference is slower (its encoder features are computed and cached); production use with a fixed
 reference pays this once.
 
@@ -79,3 +82,8 @@ reference pays this once.
 DINOv2 encoder about 0.6 s, decoder refiners about 0.5 s, TPS field fit (dense solves) about 1.3 s, GP/transformer about 0.3 s,
 SIFT orientation about 0.1 s, rest NCC / glue. Tried and rejected because they hurt accuracy: a coarser first TPS fit, striding the
 outline points, fewer grid cells (median error 0.76 -> 1.0 px or worse).
+
+## Pictures of the placed points
+`show_points.py` (or `run_evaluation.py --plot`) saves one picture per image: the reference with its points, the new image
+with the placed points (red circles) and the ground truth (green crosses, yellow line between them), and a row of zoomed
+full-resolution tiles (+-40 px) around every point with its error in px. In code: `kt.draw_points(ref, new, ref_pts, new_pts, gt=...)`.
