@@ -1,0 +1,16 @@
+# Environment this folder was developed and benchmarked in: Windows 10, Python 3.12, CPU only (i7-11850H, 8 cores).
+# pip install -r requirements.txt
+#
+# onnxruntime MUST be >= 1.27: the same models run ~2x slower on 1.19 - 1.23 (their CPU GridSample kernel is slow;
+# the decoder refiners spend most of their time in it).
+numpy==2.4.6
+scipy==1.17.0
+opencv-python-headless==5.0.0.93     # opencv-python 5.0.x works too (only used without GUI)
+pillow==10.4.0
+torch==2.14.1                        # CPU build: pip install torch==2.14.1 --index-url https://download.pytorch.org/whl/cpu
+onnx==1.23.2                         # export (first run only)
+onnxruntime==1.27.0                  # inference
+einops==0.8.2                        # RoMa dependencies
+timm==1.0.30
+loguru==0.7.3
+romatch @ git+https://github.com/Parskatt/RoMa.git     # tested with 0.1.2.post2

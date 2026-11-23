@@ -1,2 +1,7 @@
 __pycache__/
 *.pyc
+onnx_models/
+results/
+.venv/
+*.onnx
+*.onnx.tmp
