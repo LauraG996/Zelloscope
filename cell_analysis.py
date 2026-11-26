@@ -29,6 +29,14 @@ What it does
 Example
 -------
     python cell_analysis.py foam.jpg foam_seg.png --um-per-px 2.5 -o results/
+
+Folder mode: pass two folders instead of two files. Each image is matched to
+the segmentation with the same file name (extension and suffixes such as
+"_seg"/"_mask" ignored). Every pair gets its own subfolder, plus a combined
+all_images.xlsx (one summary row per image and every cell), all_cells.csv and
+trends.png (metrics per image, in file-name order):
+
+    python cell_analysis.py videocompressed/images videocompressed/Segmentation
 """
 from __future__ import annotations
 
@@ -458,12 +466,170 @@ def write_excel(path: Path, df: pd.DataFrame, summary: pd.DataFrame, profiles: d
                 ws.column_dimensions[col[0].column_letter].width = min(max(width + 2, 10), 55)
 
 
+# ---------------------------------------------------------------- per image
+IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp"}
+# Common suffixes/prefixes segmentation tools add to the original file name.
+SEG_AFFIXES = ("_seg", "-seg", "_segmentation", "-segmentation", "_mask", "-mask",
+               "_masks", "_labels", "_label", "_outlines", "_outline", "_cp_outlines",
+               "_lines", "_cells", "seg_", "mask_")
+
+
+def analyse_one(image_path: Path, seg_path: Path, out: Path, args) -> tuple[pd.DataFrame, pd.DataFrame]:
+    """Run the full analysis on one image/segmentation pair and write its outputs to `out`."""
+    out.mkdir(parents=True, exist_ok=True)
+    image, seg = load_images(image_path, seg_path)
+    labels = label_regions(seg, args.wall_threshold)
+
+    if args.all_regions:
+        counts = np.bincount(labels.ravel())
+        max_area = args.max_area or int(0.01 * labels.size)
+        is_foam = (counts >= args.min_area) & (counts <= max_area)
+        is_foam[0] = False
+    else:
+        is_foam = classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation,
+                                        args.min_area, args.max_area)
+    if not is_foam.any():
+        raise ValueError("No foam cells found. Check --hue / --min-saturation or try --all-regions.")
+
+    neighbours, is_edge = neighbour_info(labels, is_foam)
+    df = measure_cells(labels, image, is_foam, is_edge, neighbours, args.um_per_px)
+    is_edge_saved = df["is_edge_cell"].copy()
+    if args.include_edge:
+        df["is_edge_cell"] = False
+    summary = summarise(df, labels, is_foam, args.um_per_px)
+    profiles = spatial_profiles(df, args.um_per_px)
+    df["is_edge_cell"] = is_edge_saved
+
+    params = {k: (list(v) if isinstance(v, tuple) else str(v) if isinstance(v, Path) else v)
+              for k, v in vars(args).items()}
+    params.update(image=str(image_path), segmentation=str(seg_path))
+    write_excel(out / "cell_data.xlsx", df, summary, profiles, params)
+    df.to_csv(out / "cell_data.csv", index=False)
+    overlays = save_overlays(image, labels, df, args.um_per_px, out)
+    overview_figure(image, labels, df, overlays, profiles, summary, args.um_per_px,
+                    out / "overview.png", f"Foam cell analysis: {image_path.name}")
+    return df, summary
+
+
+# ---------------------------------------------------------------- folder mode
+def _normalise(stem: str) -> str:
+    s = stem.lower()
+    changed = True
+    while changed:
+        changed = False
+        for a in SEG_AFFIXES:
+            if s.endswith(a) and len(s) > len(a):
+                s, changed = s[: -len(a)], True
+            elif s.startswith(a) and len(s) > len(a):
+                s, changed = s[len(a):], True
+    return s
+
+
+def pair_files(image_dir: Path, seg_dir: Path) -> tuple[list[tuple[Path, Path]], list[Path]]:
+    """Match each image to a segmentation by file name.
+
+    Tries, in order: identical stem; stem after stripping common affixes such as
+    "_seg"/"_mask"; a unique segmentation whose name contains the image stem.
+    """
+    images = sorted(p for p in image_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+    segs = sorted(p for p in seg_dir.iterdir() if p.suffix.lower() in IMAGE_EXTS)
+    by_stem = {p.stem.lower(): p for p in segs}
+    by_norm: dict[str, list[Path]] = {}
+    for p in segs:
+        by_norm.setdefault(_normalise(p.stem), []).append(p)
+
+    pairs, unmatched = [], []
+    for img in images:
+        key = img.stem.lower()
+        match = by_stem.get(key)
+        if match is None and len(by_norm.get(_normalise(img.stem), [])) == 1:
+            match = by_norm[_normalise(img.stem)][0]
+        if match is None:
+            cands = [p for p in segs if key in p.stem.lower()]
+            match = cands[0] if len(cands) == 1 else None
+        if match is None:
+            unmatched.append(img)
+        else:
+            pairs.append((img, match))
+    return pairs, unmatched
+
+
+def run_folder(image_dir: Path, seg_dir: Path, out: Path, args) -> None:
+    pairs, unmatched = pair_files(image_dir, seg_dir)
+    print(f"Found {len(pairs)} image/segmentation pairs in {image_dir} and {seg_dir}")
+    for img in unmatched:
+        print(f"  no segmentation found for {img.name} (skipped)")
+    if not pairs:
+        raise SystemExit("Nothing to do: no image could be matched to a segmentation by file name.")
+
+    all_cells, summaries, failed = [], [], []
+    for i, (img, seg) in enumerate(pairs, 1):
+        print(f"[{i}/{len(pairs)}] {img.name}  <->  {seg.name}")
+        try:
+            df, summary = analyse_one(img, seg, out / img.stem, args)
+        except Exception as exc:  # keep going on bad frames
+            print(f"    FAILED: {exc}")
+            failed.append((img.name, seg.name, str(exc)))
+            continue
+        df.insert(0, "image", img.name)
+        all_cells.append(df)
+        row = {"image": img.name, "segmentation": seg.name}
+        row.update(dict(zip(summary["metric"], summary["value"])))
+        summaries.append(row)
+
+    if summaries:
+        per_image = pd.DataFrame(summaries)
+        cells = pd.concat(all_cells, ignore_index=True)
+        with pd.ExcelWriter(out / "all_images.xlsx", engine="openpyxl") as xw:
+            per_image.to_excel(xw, sheet_name="per_image_summary", index=False)
+            cells.round(4).to_excel(xw, sheet_name="all_cells", index=False)
+            if failed:
+                pd.DataFrame(failed, columns=["image", "segmentation", "error"]).to_excel(
+                    xw, sheet_name="failed", index=False)
+            for ws in xw.book.worksheets:
+                ws.freeze_panes = "B2"
+        cells.to_csv(out / "all_cells.csv", index=False)
+        trend_figure(per_image, args.um_per_px, out / "trends.png")
+    print(f"\nDone: {len(summaries)} analysed, {len(failed)} failed, {len(unmatched)} unmatched.")
+    print(f"Combined results in {out / 'all_images.xlsx'}")
+
+
+def trend_figure(per_image: pd.DataFrame, scale: float | None, path: Path) -> None:
+    """Key metrics per image, in file-name order (e.g. frames of a video)."""
+    unit = "µm" if scale else "px"
+    metrics = [
+        ("Interior cells (used for stats)", "Interior cells"),
+        (f"Equivalent diameter median [{unit}]", f"Median diameter [{unit}]"),
+        ("Aspect ratio median", "Median aspect ratio"),
+        ("Circularity median", "Median circularity"),
+        ("Neighbours mean", "Mean neighbours"),
+        ("Dominant orientation [deg from horizontal]", "Dominant orientation [°]"),
+    ]
+    metrics = [(c, t) for c, t in metrics if c in per_image]
+    fig, axes = plt.subplots(len(metrics), 1, figsize=(max(8, 0.25 * len(per_image)), 2.2 * len(metrics)),
+                             sharex=True, constrained_layout=True)
+    axes = np.atleast_1d(axes)
+    x = np.arange(len(per_image))
+    for ax, (col, title) in zip(axes, metrics):
+        ax.plot(x, per_image[col], "o-", color="#3b6fb6", ms=3)
+        ax.set_ylabel(title, fontsize=9)
+        ax.grid(alpha=0.3)
+    step = max(1, len(per_image) // 25)
+    axes[-1].set_xticks(x[::step])
+    axes[-1].set_xticklabels(per_image["image"].iloc[::step], rotation=60, ha="right", fontsize=7)
+    fig.suptitle("Foam cell metrics per image", fontweight="bold")
+    fig.savefig(path, dpi=110)
+    plt.close(fig)
+
+
 # ---------------------------------------------------------------- main
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("image", type=Path, help="original micrograph")
-    ap.add_argument("segmentation", type=Path, help="cell-wall line drawing (dark lines on white)")
-    ap.add_argument("-o", "--out", type=Path, default=None, help="output folder (default: <image>_cells/)")
+    ap.add_argument("image", type=Path, help="original micrograph, or a folder of them")
+    ap.add_argument("segmentation", type=Path,
+                    help="cell-wall line drawing (dark lines on white), or a folder of them")
+    ap.add_argument("-o", "--out", type=Path, default=None,
+                    help="output folder (default: <image>_cells/ next to the input)")
     ap.add_argument("--um-per-px", type=float, default=None, help="pixel size in µm to report physical units")
     ap.add_argument("--wall-threshold", type=int, default=DEFAULT_WALL_THRESHOLD)
     ap.add_argument("--min-area", type=int, default=DEFAULT_MIN_AREA_PX, help="min cell area [px]")
@@ -476,42 +642,18 @@ def main() -> None:
     ap.add_argument("--include-edge", action="store_true", help="keep edge cells in the statistics")
     args = ap.parse_args()
 
+    if args.image.is_dir():
+        if not args.segmentation.is_dir():
+            raise SystemExit("When IMAGE is a folder, SEGMENTATION must be a folder too.")
+        out = args.out or args.image.parent / "cell_results"
+        run_folder(args.image, args.segmentation, out, args)
+        return
+
     out = args.out or args.image.with_name(args.image.stem + "_cells")
-    out.mkdir(parents=True, exist_ok=True)
-
-    image, seg = load_images(args.image, args.segmentation)
-    labels = label_regions(seg, args.wall_threshold)
-
-    if args.all_regions:
-        counts = np.bincount(labels.ravel())
-        max_area = args.max_area or int(0.01 * labels.size)
-        is_foam = (counts >= args.min_area) & (counts <= max_area)
-        is_foam[0] = False
-    else:
-        is_foam = classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation,
-                                        args.min_area, args.max_area)
-    if not is_foam.any():
-        raise SystemExit("No foam cells found. Check --hue / --min-saturation or try --all-regions.")
-
-    neighbours, is_edge = neighbour_info(labels, is_foam)
-    df = measure_cells(labels, image, is_foam, is_edge, neighbours, args.um_per_px)
-    if args.include_edge:
-        is_edge_saved = df["is_edge_cell"].copy()
-        df["is_edge_cell"] = False
-
-    summary = summarise(df, labels, is_foam, args.um_per_px)
-    profiles = spatial_profiles(df, args.um_per_px)
-    if args.include_edge:
-        df["is_edge_cell"] = is_edge_saved
-
-    params = {k: (list(v) if isinstance(v, tuple) else str(v) if isinstance(v, Path) else v)
-              for k, v in vars(args).items()}
-    write_excel(out / "cell_data.xlsx", df, summary, profiles, params)
-    df.to_csv(out / "cell_data.csv", index=False)
-    overlays = save_overlays(image, labels, df, args.um_per_px, out)
-    overview_figure(image, labels, df, overlays, profiles, summary, args.um_per_px,
-                    out / "overview.png", f"Foam cell analysis: {args.image.name}")
-
+    try:
+        _, summary = analyse_one(args.image, args.segmentation, out, args)
+    except ValueError as exc:
+        raise SystemExit(str(exc))
     print(summary.to_string(index=False, float_format=lambda v: f"{v:,.4g}"))
     print(f"\nWrote results to {out}/")
 
