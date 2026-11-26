@@ -188,13 +188,13 @@ def foam_cells(image, seg, args, row: dict | None = None) -> tuple[np.ndarray, p
         info = {"source": f"cell_data.csv row {row['timestamp'].strip()}", "csv_points": len(ids),
                 "points_on_lines": int((ids == 0).sum()),
                 "mm_per_px": float(np.median(ratio)) if ok.any() else None}
+        if not args.no_colour_check:
+            # CSV points also land on the holder and background: keep only foam-coloured regions.
+            is_cell &= classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation, 0, None)
     else:
         is_cell = classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation,
                                         DEFAULT_MIN_AREA_PX, None)
         info = {"source": "colour (blue regions)"}
-        if not args.no_colour_check:
-            # CSV points also land on the holder and background: keep only foam-coloured regions.
-            is_cell &= classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation, 0, None)
     if not is_cell.any():
         raise ValueError("no cells found")
     is_cell, footprint = main_foam_body(labels, is_cell)
