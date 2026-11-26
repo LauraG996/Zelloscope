@@ -66,13 +66,37 @@ NEIGHBOUR_GROW_PX = 3
 
 
 # ---------------------------------------------------------------- loading
+def _read_on_white(path: Path) -> np.ndarray | None:
+    """Read any image as 8-bit BGR. Transparent pixels (PNG alpha) become white,
+    so a line drawing saved with a transparent background still reads as dark
+    lines on white. 16-bit images are scaled down to 8-bit."""
+    # np.fromfile + imdecode also works with non-ASCII Windows paths.
+    data = np.fromfile(str(path), dtype=np.uint8)
+    img = cv2.imdecode(data, cv2.IMREAD_UNCHANGED) if data.size else None
+    if img is None:
+        return None
+    if img.dtype != np.uint8:
+        img = cv2.normalize(img, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
+    if img.ndim == 2:
+        return cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    if img.shape[2] == 4:
+        alpha = img[..., 3:4].astype(float) / 255
+        return (img[..., :3] * alpha + 255 * (1 - alpha)).astype(np.uint8)
+    return img
+
+
 def load_images(image_path: Path, seg_path: Path) -> tuple[np.ndarray, np.ndarray]:
-    image = cv2.imread(str(image_path), cv2.IMREAD_COLOR)
+    image = _read_on_white(image_path)
     if image is None:
-        raise SystemExit(f"Could not read image: {image_path}")
-    seg = cv2.imread(str(seg_path), cv2.IMREAD_GRAYSCALE)
-    if seg is None:
-        raise SystemExit(f"Could not read segmentation: {seg_path}")
+        raise ValueError(f"Could not read image: {image_path}")
+    seg_bgr = _read_on_white(seg_path)
+    if seg_bgr is None:
+        raise ValueError(f"Could not read segmentation: {seg_path}")
+    seg = cv2.cvtColor(seg_bgr, cv2.COLOR_BGR2GRAY)
+    if np.median(seg) < 128:
+        # Mostly dark: assume light lines on a black background and invert.
+        print(f"note: {seg_path.name} looks like light lines on dark; inverting it")
+        seg = 255 - seg
     if seg.shape != image.shape[:2]:
         print(f"note: resizing segmentation {seg.shape[::-1]} -> {image.shape[1::-1]}")
         seg = cv2.resize(seg, image.shape[1::-1], interpolation=cv2.INTER_NEAREST)
