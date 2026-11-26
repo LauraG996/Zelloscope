@@ -8,11 +8,13 @@ How the tracking works: between two consecutive steps the motion of the whole
 image is estimated (dense optical flow). The cell's pixels are moved along
 with it, and the cell in the next step that overlaps the moved outline most is
 taken as the same cell. The overlap (IoU, 0-1) is the match confidence:
-  >= 0.5   good match
-  0.25-0.5 uncertain (shown in orange)
-  < 0.25   lost at this step (shown in red); the predicted position is
-           carried on so the cell can be picked up again at the next step
-A big jump in area also flags a likely merge with a neighbour (or a split).
+  >= 0.5   good match (and about the same size): the matched cell is shown,
+           measured, and carried on to the next step
+  0.25-0.5 uncertain (orange), or a size jump of more than 40% (likely the
+           segmentation merged it with a neighbour or split it)
+  < 0.25   lost (red)
+On uncertain and lost steps the carried outline itself is shown, measured and
+carried on, so one bad step can't send the track onto a neighbouring cell.
 
 Which cells are foam cells comes from cell_data.csv, as in foam_anisotropy.py.
 
@@ -56,7 +58,7 @@ from cell_analysis import load_images, pair_files  # noqa: E402
 
 FLOW_SCALE = 0.25  # optical flow is computed on images shrunk by this factor
 GOOD_IOU, LOST_IOU = 0.5, 0.25
-MERGE_RATIO = 1.7  # matched area / predicted area above this (or below 1/this) = merge (split)
+MERGE_RATIO = 1.4  # matched area / carried area above this (or below 1/this) = merge (split)
 TILE = 300  # close-up size in the summary picture, px
 OUTLINE = (255, 220, 0)
 CONF_COLOURS = {"good": (40, 170, 60), "uncertain": (240, 150, 0), "lost": (220, 40, 40)}
@@ -163,24 +165,37 @@ def track(steps: list[dict], flows: list[np.ndarray], start_xy: tuple[float, flo
     rec = measure(ys, xs) | {"step": steps[0]["label"], "iou": 1.0, "status": "good", "note": "picked"}
     rows = [rec | {"_ys": ys, "_xs": xs}]
 
+    # The anchor is what gets carried to the next step. It is replaced by the
+    # matched cell only when the match is good (high overlap, similar size);
+    # otherwise the carried outline itself goes on, so a step where the
+    # segmentation splits or merges cells can't send the track onto a neighbour.
+    anchor_ys, anchor_xs = ys, xs
     for k in range(1, len(steps)):
         lab_img = steps[k]["labels"]
-        pys, pxs = move_mask(ys, xs, flows[k - 1], lab_img.shape)
-        match, iou, area = best_match(lab_img, steps[k]["areas"], pys, pxs) if len(pys) else (0, 0.0, 0)
+        pys, pxs = move_mask(anchor_ys, anchor_xs, flows[k - 1], lab_img.shape)
+        if len(pys) == 0:
+            break
+        match, iou, area = best_match(lab_img, steps[k]["areas"], pys, pxs)
         note = ""
         if match and iou >= LOST_IOU:
-            ys, xs = np.nonzero(lab_img == match)
             ratio = area / max(len(pys), 1)
             if ratio > MERGE_RATIO:
                 note = "merged with a neighbour?"
             elif ratio < 1 / MERGE_RATIO:
                 note = "split / partly lost?"
-            status = "good" if iou >= GOOD_IOU and not note else "uncertain"
+            if iou >= GOOD_IOU and not note:
+                status = "good"
+                ys, xs = np.nonzero(lab_img == match)
+                anchor_ys, anchor_xs = ys, xs
+            else:
+                status = "uncertain"
+                ys, xs = pys, pxs  # show and measure the carried outline, keep carrying it
+                anchor_ys, anchor_xs = pys, pxs
+                note = (note + "; " if note else "") + "carried outline shown"
         else:
-            ys, xs = pys, pxs  # carry the predicted outline on
-            status, note = "lost", "no matching cell; predicted position"
-            if len(ys) == 0:
-                break
+            ys, xs = pys, pxs
+            anchor_ys, anchor_xs = pys, pxs
+            status, note = "lost", "no matching cell; carried outline shown"
         rec = measure(ys, xs) | {"step": steps[k]["label"], "iou": iou, "status": status, "note": note}
         rows.append(rec | {"_ys": ys, "_xs": xs})
     return rows
@@ -306,6 +321,11 @@ def tile(step: dict, rec: dict, size: int, box=None, out: int = TILE, trail=None
     return t
 
 
+def short_note(note: str) -> str:
+    return ("merged?" if "merged" in note else "split?" if "split" in note else "lost" if "no matching" in note
+            else "") + (" (carried outline)" if "carried" in note else "")
+
+
 def summary_figure(steps, rec_list, n: int, size: int, mm_per_px, dst: Path) -> None:
     k = len(rec_list)
     cols = min(k, 6)
@@ -329,7 +349,7 @@ def summary_figure(steps, rec_list, n: int, size: int, mm_per_px, dst: Path) -> 
         dx, dy = rec["x"] - rec_list[0]["x"], rec["y"] - rec_list[0]["y"]
         moved = f"moved {dx * f:+.2f}, {dy * f:+.2f} {unit} from step 1" if i else "start position"
         ax.set_xlabel(f"AR {ar:.2f}   {ang:.0f}°   {rec['area_px'] * f * f:.3g} {unit}²\n{moved}"
-                      + (f"\n{rec['note']}" if rec["note"] and rec["note"] != "picked" else ""),
+                      + (f"\n{short_note(rec['note'])}" if rec["note"] and rec["note"] != "picked" else ""),
                       fontsize=8.5, color="#444444")
 
     x = np.arange(1, k + 1)
@@ -354,8 +374,9 @@ def summary_figure(steps, rec_list, n: int, size: int, mm_per_px, dst: Path) -> 
         ax.set_xlabel("step", fontsize=9)
         ax.grid(alpha=0.3)
     fig.suptitle(f"Cell {n}: picked at ({rec_list[0]['x']:.0f}, {rec_list[0]['y']:.0f}) in {steps[0]['path'].name}"
-                 "     close-ups follow the cell (see the video / overview for its path);"
-                 " outline: yellow = matched, red = lost; frame colour = match quality",
+                 "\nClose-ups follow the cell (the video and overview show its path). Frame colour = match quality: "
+                 "green = matched to a segmented cell; orange/red = no clean match (the segmentation split or merged "
+                 "it), so the outline carried along by the measured motion is shown and measured instead.",
                  fontsize=10, x=0.01, ha="left", color="#555555")
     fig.savefig(dst, bbox_inches="tight")
     plt.close(fig)
