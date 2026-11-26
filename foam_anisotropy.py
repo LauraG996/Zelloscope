@@ -17,7 +17,11 @@ Which regions are cells:
            Looked for (unless --csv is given) next to the images, one folder
            up, and in the current folder.
   colour (no CSV found, or --no-csv)  regions that are blue in the micrograph.
-  Either way, cells touching the foam's edge or the image border are left out.
+  With the CSV, regions that aren't foam-coloured (holder, background) are
+  dropped too (--no-colour-check to keep them). Either way only the main
+  piece of foam is used, cells touching its edge or the image border are left
+  out, the grid covers the foam only, and squares that are less than
+  --min-foam foam (default 25%) are left out.
 
 The anisotropy measures are the same as pinhole_overlay.py on the kingpin
 branch (used there for the insulation foams):
@@ -188,8 +192,12 @@ def foam_cells(image, seg, args, row: dict | None = None) -> tuple[np.ndarray, p
         is_cell = classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation,
                                         DEFAULT_MIN_AREA_PX, None)
         info = {"source": "colour (blue regions)"}
+        if not args.no_colour_check:
+            # CSV points also land on the holder and background: keep only foam-coloured regions.
+            is_cell &= classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation, 0, None)
     if not is_cell.any():
         raise ValueError("no cells found")
+    is_cell, footprint = main_foam_body(labels, is_cell)
     _, is_edge = neighbour_info(labels, is_cell)
     keep = is_cell & ~is_edge
     cell_labels = np.where(keep, np.arange(keep.size), 0)[labels]
@@ -211,7 +219,36 @@ def foam_cells(image, seg, args, row: dict | None = None) -> tuple[np.ndarray, p
             "angle_deg": angle,
             "area_px": int(mask.sum()),
         })
-    return cell_labels, pd.DataFrame(rows), info
+    return cell_labels, pd.DataFrame(rows), info, footprint
+
+
+def main_foam_body(labels: np.ndarray, is_cell: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Keep only the cells in the largest connected piece of foam.
+
+    The foam footprint is the cells plus the walls between them (a closing
+    bridges the walls), with holes filled; stray cell-like regions on the
+    holder or background fall outside its largest piece and are dropped.
+    Returns (is_cell restricted to the main body, footprint mask).
+    """
+    cell_px = is_cell[labels].astype(np.uint8)
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    closed = cv2.morphologyEx(cell_px, cv2.MORPH_CLOSE, kernel)
+    # An opening about two cells wide cuts thin necks (e.g. a strip of
+    # foam-coloured regions along the holder's edge) off the foam body.
+    area = np.bincount(labels.ravel(), minlength=is_cell.size)
+    cell_d = np.sqrt(4 * np.median(area[is_cell]) / np.pi)
+    k = int(np.clip(2 * cell_d, 9, 151)) | 1
+    opened = cv2.morphologyEx(closed, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k)))
+    if opened.any():
+        closed = opened
+    n, comp, stats, _ = cv2.connectedComponentsWithStats(closed, connectivity=8)
+    if n <= 1:
+        return is_cell, closed.astype(bool)
+    main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+    body = ndimage.binary_fill_holes(comp == main)
+    inside = np.bincount(labels[body], minlength=is_cell.size)
+    is_cell = is_cell & (inside > 0.5 * np.maximum(area, 1))
+    return is_cell, body
 
 
 # ---------------------------------------------------------------- anisotropy
@@ -251,15 +288,24 @@ def grid_shape(w: float, h: float, n: int) -> tuple[int, int]:
     return min(options, key=lambda rc: abs(math.log((w / rc[1]) / (h / rc[0]))))
 
 
-def by_square(cells: pd.DataFrame, box: tuple[int, int, int, int], rows: int, cols: int) -> list[dict]:
+def by_square(cells: pd.DataFrame, footprint: np.ndarray, box: tuple[int, int, int, int],
+              rows: int, cols: int, min_foam: float) -> list[dict]:
+    """Anisotropy per square. Squares that are less than min_foam foam are left out."""
     x0, y0, x1, y1 = box
+    xe, ye = np.linspace(x0, x1, cols + 1).round().astype(int), np.linspace(y0, y1, rows + 1).round().astype(int)
     r = np.clip(((cells["y"] - y0) / ((y1 - y0) / rows)).astype(int), 0, rows - 1)
     c = np.clip(((cells["x"] - x0) / ((x1 - x0) / cols)).astype(int), 0, cols - 1)
     squares = []
     for i in range(rows):
         for j in range(cols):
+            foam = footprint[ye[i]:ye[i + 1], xe[j]:xe[j + 1]]
             inside = cells[(r == i) & (c == j)]
-            squares.append({"grid_row": i, "grid_col": j, "count": len(inside), "anisotropy": summarise(inside)})
+            sq = {"grid_row": i, "grid_col": j, "count": len(inside), "foam_fraction": float(foam.mean()),
+                  "anisotropy": None, "centre": None}
+            if sq["foam_fraction"] >= min_foam and len(inside):
+                sq["anisotropy"] = summarise(inside)
+                sq["centre"] = (float(inside["x"].mean()), float(inside["y"].mean()))
+            squares.append(sq)
     return squares
 
 
@@ -284,9 +330,13 @@ def lean_rgb(angle) -> np.ndarray:
     return (cmap(norm(lean))[..., :3] * 255).astype(np.uint8)
 
 
-def orientation_map(image_rgb, cell_labels, cells, squares, box, rows, cols) -> np.ndarray:
-    """Cells coloured by lean, grid lines, and a direction bar per square (length = alignment)."""
+def orientation_map(image_rgb, cell_labels, cells, squares, box, rows, cols, footprint) -> np.ndarray:
+    """Cells coloured by lean, grid lines, and a direction bar per square (length = alignment).
+
+    Everything outside the foam is dimmed, and the grid is drawn only on the foam.
+    """
     out = (image_rgb * 0.45).astype(np.uint8)
+    out[~footprint] = (image_rgb[~footprint] * 0.2).astype(np.uint8)
     colours = np.zeros((cell_labels.max() + 1, 3), np.uint8)
     has = np.zeros(cell_labels.max() + 1, bool)
     colours[cells["cell_id"]] = lean_rgb(cells["angle_deg"].to_numpy())
@@ -298,19 +348,22 @@ def orientation_map(image_rgb, cell_labels, cells, squares, box, rows, cols) -> 
     cw, ch = (x1 - x0) / cols, (y1 - y0) / rows
     scale = max(out.shape[:2]) / 1500
     lt = max(1, int(round(2 * scale)))
-    for i in range(rows + 1):
+    grid = np.zeros(out.shape[:2], np.uint8)
+    for i in range(1, rows):  # inner lines only: the foam's own edge is the outer border
         y = int(round(y0 + i * ch))
-        cv2.line(out, (x0, y), (x1, y), MAP_GRID_COLOR, lt, cv2.LINE_AA)
-    for j in range(cols + 1):
+        cv2.line(grid, (x0, y), (x1, y), 255, lt)
+    for j in range(1, cols):
         x = int(round(x0 + j * cw))
-        cv2.line(out, (x, y0), (x, y1), MAP_GRID_COLOR, lt, cv2.LINE_AA)
+        cv2.line(grid, (x, y0), (x, y1), 255, lt)
+    on_foam = (grid > 0) & footprint
+    out[on_foam] = MAP_GRID_COLOR
 
     bt = max(2, int(round(5 * scale)))
     for sq in squares:
         a = sq["anisotropy"]
         if a is None:
             continue
-        cx, cy = x0 + (sq["grid_col"] + 0.5) * cw, y0 + (sq["grid_row"] + 0.5) * ch
+        cx, cy = sq["centre"]  # middle of the square's cells, so the bar sits on the foam
         half = 0.4 * min(cw, ch) * a["alignment"]
         t = math.radians(a["direction_deg"])
         dx, dy = half * math.cos(t), -half * math.sin(t)
@@ -318,7 +371,10 @@ def orientation_map(image_rgb, cell_labels, cells, squares, box, rows, cols) -> 
         cv2.line(out, p0, p1, (255, 255, 255), bt * 3, cv2.LINE_AA)
         cv2.line(out, p0, p1, DIRECTION_BAR_COLOR, bt, cv2.LINE_AA)
         label = f"{sq['grid_row'] * cols + sq['grid_col'] + 1}"
-        org = (int(x0 + sq["grid_col"] * cw + 10 * scale), int(y0 + sq["grid_row"] * ch + 30 * scale))
+        sx0, sy0 = int(x0 + sq["grid_col"] * cw), int(y0 + sq["grid_row"] * ch)
+        part = footprint[sy0:int(sy0 + ch), sx0:int(sx0 + cw)]
+        fy, fx = np.nonzero(part)  # top-left corner of the foam inside this square
+        org = (int(sx0 + fx.min() + 10 * scale), int(sy0 + fy.min() + 30 * scale))
         cv2.putText(out, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.9 * scale, (0, 0, 0), lt * 4, cv2.LINE_AA)
         cv2.putText(out, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.9 * scale, (255, 255, 255), lt, cv2.LINE_AA)
 
@@ -369,7 +425,8 @@ def save_plot(map_rgb, squares, whole, rows, cols, title, dst: Path) -> None:
         ax_tab.text(c + 0.9, r + 0.12, f"#{r * cols + c + 1}", fontsize=small, color=MUTED_INK, ha="right", va="center")
         s = sq["anisotropy"]
         if s is None:
-            ax_tab.text(c + 0.5, r + 0.5, "no cells", ha="center", va="center", fontsize=small, color=MUTED_INK)
+            ax_tab.text(c + 0.5, r + 0.5, f"outside the foam\n({100 * sq['foam_fraction']:.0f}% foam)",
+                        ha="center", va="center", fontsize=small, color=MUTED_INK)
             continue
         d = s["direction_deg"]
         t = math.radians(d)
@@ -415,7 +472,7 @@ def table_row(name, sq_id, row, col, count, s) -> dict:
 def analyse(image_path: Path, seg_path: Path, out: Path, args, csv_rows: list[dict] | None) -> pd.DataFrame:
     image, seg = load_images(image_path, seg_path)
     row = pick_row(csv_rows, image_path, args.row) if csv_rows is not None else None
-    cell_labels, cells, info = foam_cells(image, seg, args, row)
+    cell_labels, cells, info, footprint = foam_cells(image, seg, args, row)
     msg = f"    cells from {info['source']}"
     if "csv_points" in info:
         msg += f": {info['csv_points']} points ({info['points_on_lines']} on wall lines)"
@@ -425,20 +482,21 @@ def analyse(image_path: Path, seg_path: Path, out: Path, args, csv_rows: list[di
     if cells.empty:
         raise ValueError("no interior foam cells")
 
-    ys, xs = np.nonzero(cell_labels)
+    ys, xs = np.nonzero(footprint)
     box = (int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1)
     rows, cols = args.grid if args.grid else grid_shape(box[2] - box[0], box[3] - box[1], args.squares)
-    squares = by_square(cells, box, rows, cols)
+    squares = by_square(cells, footprint, box, rows, cols, args.min_foam)
     whole = summarise(cells)
 
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
-    fmap = orientation_map(rgb, cell_labels, cells, squares, box, rows, cols)
+    fmap = orientation_map(rgb, cell_labels, cells, squares, box, rows, cols, footprint)
     save_plot(fmap, squares, whole, rows, cols,
               f"{image_path.name}  ({len(cells)} cells from {info['source']}, {rows} x {cols} squares)",
               out / f"{image_path.stem}_anisotropy.png")
 
     table = [table_row(image_path.name, sq["grid_row"] * cols + sq["grid_col"] + 1, sq["grid_row"] + 1,
-                       sq["grid_col"] + 1, sq["count"], sq["anisotropy"]) for sq in squares]
+                       sq["grid_col"] + 1, sq["count"], sq["anisotropy"]) | {"foam_fraction": sq["foam_fraction"]}
+             for sq in squares]
     table.append(table_row(image_path.name, "whole foam", "", "", len(cells), whole))
     df = pd.DataFrame(table)
     if args.tables:
@@ -465,6 +523,10 @@ def main() -> None:
                          "default: the row timestamped like the image file name")
     ap.add_argument("--min-mm", type=float, default=None, help="only CSV cells at least this diameter (mm)")
     ap.add_argument("--max-mm", type=float, default=None, help="only CSV cells at most this diameter (mm)")
+    ap.add_argument("--no-colour-check", action="store_true",
+                    help="with the CSV, don't drop regions that aren't foam-coloured")
+    ap.add_argument("--min-foam", type=float, default=0.25,
+                    help="leave out squares that are less than this fraction foam (default 0.25)")
     ap.add_argument("--tables", action="store_true",
                     help="also write a CSV per image and anisotropy.xlsx (default: pictures only)")
     args = ap.parse_args()
