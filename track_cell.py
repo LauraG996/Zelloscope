@@ -260,9 +260,22 @@ def crop_box(rec: dict, size: int, shape) -> tuple[int, int, int, int]:
     return x0, y0, x0 + size, y0 + size
 
 
-def tile(step: dict, rec: dict, size: int) -> np.ndarray:
-    """Close-up centred on the cell: neighbours' walls faint, the cell outlined."""
-    x0, y0, x1, y1 = crop_box(rec, size, step["labels"].shape)
+def path_box(rec_list: list[dict], size: int, shape) -> tuple[int, int, int, int]:
+    """One square view that holds the cell's whole path (plus half a close-up around it)."""
+    xs = [r["x"] for r in rec_list]; ys = [r["y"] for r in rec_list]
+    side = int(max(max(xs) - min(xs), max(ys) - min(ys)) + size)
+    side = min(side, min(shape))
+    cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+    return crop_box({"x": cx, "y": cy}, side, shape)
+
+
+def tile(step: dict, rec: dict, size: int, box=None, out: int = TILE, trail=None) -> np.ndarray:
+    """Close-up centred on the cell (or the fixed view box): neighbours' walls faint, the cell outlined.
+
+    trail: the cell's earlier positions [(x, y), ...], drawn as a path of dots.
+    """
+    x0, y0, x1, y1 = box if box is not None else crop_box(rec, size, step["labels"].shape)
+    size = x1 - x0
     rgb = step["rgb"][y0:y1, x0:x1].copy()
     lab = step["labels"][y0:y1, x0:x1]
     walls = (lab != np.roll(lab, 1, 0)) | (lab != np.roll(lab, 1, 1))
@@ -272,8 +285,16 @@ def tile(step: dict, rec: dict, size: int) -> np.ndarray:
     ok = (ys >= 0) & (xs >= 0) & (ys < size) & (xs < size)
     m[ys[ok], xs[ok]] = 1
     contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    t = cv2.resize(rgb, (TILE, TILE), interpolation=cv2.INTER_AREA)
-    s = TILE / size
+    t = cv2.resize(rgb, (out, out), interpolation=cv2.INTER_AREA)
+    s = out / size
+    if trail:
+        pts = [(int((x - x0) * s), int((y - y0) * s)) for x, y in trail] + [(int((rec["x"] - x0) * s),
+                                                                                int((rec["y"] - y0) * s))]
+        for a, b in zip(pts[:-1], pts[1:]):
+            cv2.line(t, a, b, (255, 255, 255), 2, cv2.LINE_AA)
+        for p in pts[:-1]:
+            cv2.circle(t, p, 5, (255, 255, 255), -1, cv2.LINE_AA)
+            cv2.circle(t, p, 5, (0, 0, 0), 1, cv2.LINE_AA)
     scaled = [(c * s).astype(np.int32) for c in contours]
     style = cv2.LINE_AA
     if rec["status"] == "lost":
@@ -305,7 +326,9 @@ def summary_figure(steps, rec_list, n: int, size: int, mm_per_px, dst: Path) -> 
         ang = rec.get("angle_deg", float("nan"))
         ax.set_title(f"{rec['step']}   match {rec['iou']:.2f}", fontsize=10, color=col if rec["status"] != "good"
                      else "#222222")
-        ax.set_xlabel(f"AR {ar:.2f}   {ang:.0f}°   {rec['area_px'] * f * f:.3g} {unit}²"
+        dx, dy = rec["x"] - rec_list[0]["x"], rec["y"] - rec_list[0]["y"]
+        moved = f"moved {dx * f:+.2f}, {dy * f:+.2f} {unit} from step 1" if i else "start position"
+        ax.set_xlabel(f"AR {ar:.2f}   {ang:.0f}°   {rec['area_px'] * f * f:.3g} {unit}²\n{moved}"
                       + (f"\n{rec['note']}" if rec["note"] and rec["note"] != "picked" else ""),
                       fontsize=8.5, color="#444444")
 
@@ -331,7 +354,8 @@ def summary_figure(steps, rec_list, n: int, size: int, mm_per_px, dst: Path) -> 
         ax.set_xlabel("step", fontsize=9)
         ax.grid(alpha=0.3)
     fig.suptitle(f"Cell {n}: picked at ({rec_list[0]['x']:.0f}, {rec_list[0]['y']:.0f}) in {steps[0]['path'].name}"
-                 "     outline: yellow = matched, red = lost (predicted position); frame colour = match quality",
+                 "     close-ups follow the cell (see the video / overview for its path);"
+                 " outline: yellow = matched, red = lost; frame colour = match quality",
                  fontsize=10, x=0.01, ha="left", color="#555555")
     fig.savefig(dst, bbox_inches="tight")
     plt.close(fig)
@@ -349,8 +373,10 @@ def write_video(steps, rec_list, size: int, dst: Path, fps: float = 25, hold: fl
         vw = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (side, side + 60))
         write, close = (lambda f: vw.write(cv2.cvtColor(f, cv2.COLOR_RGB2BGR))), vw.release
     frames = []
+    box = path_box(rec_list, size, steps[0]["labels"].shape)  # same view for every step: you see it move
     for i, rec in enumerate(rec_list):
-        t = cv2.resize(tile(steps[i], rec, size), (side, side), interpolation=cv2.INTER_CUBIC)
+        trail = [(r["x"], r["y"]) for r in rec_list[:i]]
+        t = tile(steps[i], rec, size, box=box, out=side, trail=trail)
         f = np.full((side + 60, side, 3), 255, np.uint8)
         f[60:] = t
         txt = f"{rec['step']}   AR {rec.get('aspect_ratio', float('nan')):.2f}   " \
@@ -373,6 +399,10 @@ def overview(step: dict, tracks: dict, dst: Path) -> None:
     th = max(2, img.shape[0] // 600)
     for n, recs in tracks.items():
         r = recs[0]
+        pts = np.array([(int(q["x"]), int(q["y"])) for q in recs], np.int32)
+        cv2.polylines(img, [pts], False, (255, 255, 255), th * 2, cv2.LINE_AA)
+        for q in pts[1:]:
+            cv2.circle(img, tuple(int(v) for v in q), th * 3, (255, 255, 255), -1, cv2.LINE_AA)
         m = np.zeros(img.shape[:2], np.uint8)
         m[r["_ys"], r["_xs"]] = 1
         contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
