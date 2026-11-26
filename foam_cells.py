@@ -44,7 +44,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-from straighten import IMAGE_EXTS
+from straighten import IMAGE_EXTS, colour_foreground_mask, largest_foreground_mask
 
 # --- Strip segmentation -----------------------------------------------------
 # A pixel belongs to the foam if its blue channel beats green by this much
@@ -78,6 +78,9 @@ MAX_CELL_DIAMETER = 80
 # Regions more elongated than this are watershed leaks along a strut gap,
 # not real cells.
 MAX_CELL_ASPECT = 5.0
+# Regions whose pixels fill less than this fraction of their equivalent
+# ellipse are scattered/fragmented watershed regions, not cells.
+MIN_CELL_FILL = 0.6
 
 # Bin width (px) for the cell profile along the strip (distance from plate).
 PROFILE_BIN = 100
@@ -92,25 +95,29 @@ ACF_HALF = 60
 # ----------------------------------------------------------------------------
 def foam_mask(image: np.ndarray) -> np.ndarray:
     """Binary mask (uint8 0/255) of the blue foam strip."""
-    blur = cv2.GaussianBlur(image.astype(np.int16), (0, 0), 5)
-    b, g, r = blur[..., 0], blur[..., 1], blur[..., 2]
-    raw = ((b - g > BLUE_DOMINANCE) & (b - r > BLUE_DOMINANCE)).astype(np.uint8) * 255
-
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (15, 15))
-    raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, k)
-    raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, k)
-
-    n, labels, stats, _ = cv2.connectedComponentsWithStats(raw, connectivity=8)
-    if n <= 1:
+    mask = colour_foreground_mask(image, channel=0, dominance=BLUE_DOMINANCE)
+    if not mask.any():
         raise ValueError("No foam strip found")
-    largest = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
-    mask = np.where(labels == largest, 255, 0).astype(np.uint8)
+    return mask
 
-    # Fill interior holes (dark folds, large pores).
-    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-    filled = np.zeros_like(mask)
-    cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
-    return filled
+
+def plate_face(image: np.ndarray, strip: np.ndarray) -> tuple[float, np.ndarray]:
+    """x position of the plate's pressing face, using the Zelloscope segmentation.
+
+    largest_foreground_mask (straighten.py) picks the brightest large object,
+    which in these images is the yellow plate. The face is the plate's
+    rightmost pixel in each row, taken as the median over the rows the foam
+    strip occupies (the contact zone), so the scalloped edge averages out.
+    Returns (face_x, plate_mask).
+    """
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    plate = largest_foreground_mask(gray)
+    rows = np.where(strip.any(axis=1) & plate.any(axis=1))[0]
+    if len(rows) == 0:
+        raise ValueError("Plate not found next to the foam strip")
+    flipped = plate[rows, ::-1] > 0
+    right_edge = plate.shape[1] - 1 - flipped.argmax(axis=1)
+    return float(np.median(right_edge)), plate
 
 
 def strip_geometry(mask: np.ndarray) -> dict:
@@ -190,7 +197,9 @@ def measure_cells(labels: np.ndarray) -> list[dict]:
         minor, major = 4 * np.sqrt(evals)  # full axis lengths of equivalent ellipse
         angle = np.degrees(np.arctan2(evecs[1, 1], evecs[0, 1])) % 180
         eq_d = 2 * np.sqrt(area / np.pi)
-        if not (MIN_CELL_DIAMETER <= eq_d <= MAX_CELL_DIAMETER) or major / max(minor, 1e-6) > MAX_CELL_ASPECT:
+        fill = area / (np.pi / 4 * major * minor)  # ~1 for a compact blob, small if scattered
+        if (not (MIN_CELL_DIAMETER <= eq_d <= MAX_CELL_DIAMETER)
+                or major / max(minor, 1e-6) > MAX_CELL_ASPECT or fill < MIN_CELL_FILL):
             continue
         cells.append({
             "cx": cx, "cy": cy, "area_px": float(area), "eq_diameter_px": eq_d,
@@ -304,6 +313,8 @@ def distance_profile(cells: list[dict], mask: np.ndarray, bin_px: int) -> list[d
 def analyse(image: np.ndarray) -> tuple[dict, list[dict], np.ndarray, np.ndarray, list[dict]]:
     mask = foam_mask(image)
     geom = strip_geometry(mask)
+    face_x, _ = plate_face(image, mask)
+    geom["plate_face_x_px"] = face_x
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * EDGE_MARGIN + 1, 2 * EDGE_MARGIN + 1))
     inner = cv2.erode(mask, k)
     if not inner.any():
@@ -358,6 +369,8 @@ def draw(image: np.ndarray, mask: np.ndarray, inner: np.ndarray, cells: list[dic
     for m, colour in ((mask, (255, 255, 255)), (inner, (200, 200, 0))):
         contours, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
         cv2.drawContours(out, contours, -1, colour, 2, cv2.LINE_AA)
+    fx = int(round(summary["plate_face_x_px"]))
+    cv2.line(out, (fx, 0), (fx, out.shape[0] - 1), (0, 0, 255), 3, cv2.LINE_AA)
     for c in cells:
         cv2.ellipse(
             out, (int(round(c["cx"])), int(round(c["cy"]))),
@@ -371,6 +384,7 @@ def draw(image: np.ndarray, mask: np.ndarray, inner: np.ndarray, cells: list[dic
         f"ACF cell size x: {fmt(summary['acf_size_x_px'], pix2mm)}  y: {fmt(summary['acf_size_y_px'], pix2mm)}",
         f"ACF y/x: {summary['acf_ratio_y_over_x']:.2f}",
         f"strip thickness: {fmt(summary['strip_thickness_px'], pix2mm)}",
+        f"plate face x (red line): {fmt(summary['plate_face_x_px'], pix2mm)}",
     ]
     scale = image.shape[1] / 2000
     y = int(50 * scale)
@@ -403,7 +417,7 @@ def add_relative_changes(rows: list[dict], ref_index: int) -> None:
         r["change_cell_aspect"] = rel("cell_aspect_median")
         r["change_acf_ratio_y_over_x"] = rel("acf_ratio_y_over_x")
         r["change_strip_thickness"] = rel("strip_thickness_px")
-        r["plate_displacement_px"] = r["strip_x0"] - ref["strip_x0"]
+        r["plate_displacement_px"] = r["plate_face_x_px"] - ref["plate_face_x_px"]
 
 
 SUMMARY_COLUMNS = [
@@ -413,7 +427,7 @@ SUMMARY_COLUMNS = [
     "cell_width_x_median_px", "cell_height_y_median_px", "cell_ratio_y_over_x",
     "acf_size_x_px", "acf_size_y_px", "acf_ratio_y_over_x", "acf_anisotropy", "acf_major_angle_deg",
     "strip_thickness_px", "strip_thickness_min_px", "strip_thickness_max_px", "strip_area_px",
-    "plate_displacement_px",
+    "plate_face_x_px", "plate_displacement_px",
     "strain_x_acf", "strain_y_acf", "strain_x_cells", "strain_y_cells",
     "change_cell_diameter", "change_cell_aspect", "change_acf_ratio_y_over_x", "change_strip_thickness",
 ]
@@ -586,7 +600,7 @@ def main() -> None:
                 f"y {r['strain_y_acf'] * 100:+.1f}% (ACF), "
                 f"aspect {r['change_cell_aspect'] * 100:+.1f}%, "
                 f"strip thickness {r['change_strip_thickness'] * 100:+.1f}%, "
-                f"plate moved {r['plate_displacement_px']:+d} px"
+                f"plate moved {fmt(r['plate_displacement_px'], args.pix2mm)}"
             )
     print(f"\nWrote results to {args.output}")
 

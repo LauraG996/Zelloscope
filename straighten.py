@@ -37,6 +37,38 @@ def largest_foreground_mask(gray: np.ndarray) -> np.ndarray:
     return np.where(labels == largest_label, 255, 0).astype(np.uint8)
 
 
+
+def colour_foreground_mask(image: np.ndarray, channel: int = 0, dominance: float = 12,
+                           blur_sigma: float = 5, kernel_size: int = 15) -> np.ndarray:
+    """Mask of the largest object whose colour is dominated by one BGR channel.
+
+    Use this instead of largest_foreground_mask when the object of interest
+    is not the brightest thing in the frame, e.g. a blue foam strip next to
+    a brighter yellow plate. A pixel is foreground if, after blurring, the
+    chosen channel (0=blue, 1=green, 2=red) exceeds both other channels by
+    `dominance` grey levels. Same clean-up as largest_foreground_mask (open,
+    close, keep the largest component), plus interior holes are filled.
+    """
+    blur = cv2.GaussianBlur(image.astype(np.int16), (0, 0), blur_sigma)
+    main = blur[..., channel]
+    others = [blur[..., c] for c in range(3) if c != channel]
+    raw = ((main - others[0] > dominance) & (main - others[1] > dominance)).astype(np.uint8) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    raw = cv2.morphologyEx(raw, cv2.MORPH_CLOSE, kernel)
+    raw = cv2.morphologyEx(raw, cv2.MORPH_OPEN, kernel)
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(raw, connectivity=8)
+    if num_labels <= 1:
+        return raw
+    largest_label = 1 + np.argmax(stats[1:, cv2.CC_STAT_AREA])
+    mask = np.where(labels == largest_label, 255, 0).astype(np.uint8)
+
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    filled = np.zeros_like(mask)
+    cv2.drawContours(filled, contours, -1, 255, cv2.FILLED)
+    return filled
+
 # Width (px) of the moving-average smoothing applied to the top profile,
 # to average out foam-cell texture noise before slope estimation.
 SMOOTH_WINDOW = 31
