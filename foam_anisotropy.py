@@ -330,7 +330,7 @@ def lean_rgb(angle) -> np.ndarray:
     return (cmap(norm(lean))[..., :3] * 255).astype(np.uint8)
 
 
-def orientation_map(image_rgb, cell_labels, cells, squares, box, rows, cols, footprint) -> np.ndarray:
+def orientation_map(image_rgb, cell_labels, cells, squares, box, rows, cols, footprint, crop=None) -> np.ndarray:
     """Cells coloured by lean, grid lines, and a direction bar per square (length = alignment).
 
     Everything outside the foam is dimmed, and the grid is drawn only on the foam.
@@ -378,6 +378,8 @@ def orientation_map(image_rgb, cell_labels, cells, squares, box, rows, cols, foo
         cv2.putText(out, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.9 * scale, (0, 0, 0), lt * 4, cv2.LINE_AA)
         cv2.putText(out, label, org, cv2.FONT_HERSHEY_SIMPLEX, 0.9 * scale, (255, 255, 255), lt, cv2.LINE_AA)
 
+    if crop is not None:  # (x0, y0, x1, y1), e.g. the same view for every frame of a video
+        return out[crop[1]:crop[3], crop[0]:crop[2]]
     pad = int(30 * scale)
     return out[max(y0 - pad, 0):y1 + pad, max(x0 - pad, 0):x1 + pad]
 
