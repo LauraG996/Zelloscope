@@ -2,10 +2,22 @@
 """Foam cell anisotropy in a grid of squares.
 
 Takes a micrograph and its cell segmentation (dark wall lines on white), finds
-the foam cells (same as cell_analysis.py: regions that are blue in the
-micrograph; cells cut by the foam's edge are left out), divides the foam into
-a grid of squares (8 by default, laid out to be as square as possible) and
-reports the anisotropy of the cells in each square and in the whole foam.
+the foam cells, divides the foam into a grid of squares (8 by default, laid
+out to be as square as possible) and reports the anisotropy of the cells in
+each square and in the whole foam.
+
+Which regions are cells:
+  cell_data.csv (default)  the measurement CSV, same format as on the kingpin
+           branch: one row per measurement (timestamp, label, diameters,
+           x_positions, y_positions). The row is the one whose timestamp
+           matches the image's file name (2026-06-04_09-16-15.png ->
+           "2026-06-04 09:16:15"), or pick one with --row. Every segmented
+           region with one of that row's (x, y) points in it is a cell. The
+           mm-per-pixel scale is worked out from the diameters.
+           Looked for (unless --csv is given) next to the images, one folder
+           up, and in the current folder.
+  colour (no CSV found, or --no-csv)  regions that are blue in the micrograph.
+  Either way, cells touching the foam's edge or the image border are left out.
 
 The anisotropy measures are the same as pinhole_overlay.py on the kingpin
 branch (used there for the insulation foams):
@@ -30,14 +42,17 @@ out like the grid. Pass --tables to also write a CSV per image and an
 anisotropy.xlsx with all images.
 
 Examples:
-  python foam_anisotropy.py foam.png foam_seg.png
+  python foam_anisotropy.py foam.png foam_seg.png --csv cell_data.csv --row -1
   python foam_anisotropy.py videocompressed\\images videocompressed\\Segmentation
   python foam_anisotropy.py videocompressed\\images videocompressed\\Segmentation --grid 2 4
 """
 from __future__ import annotations
 
 import argparse
+import csv
 import math
+import re
+import sys
 from pathlib import Path
 
 import cv2
@@ -88,15 +103,95 @@ def fit_edge_ellipse(mask: np.ndarray) -> tuple[float, ...] | None:
     return cx, cy, max(axis_1, axis_2), min(axis_1, axis_2), (-long_axis_rotation) % 180
 
 
-def foam_cells(image: np.ndarray, seg: np.ndarray, args) -> tuple[np.ndarray, pd.DataFrame]:
-    """Interior foam cells with their edge-fitted ellipses. Returns (cell label image, table)."""
+# Rows can hold tens of thousands of numbers; raise csv's field limit (capped
+# at INT32_MAX, which Windows needs).
+csv.field_size_limit(min(sys.maxsize, 2 ** 31 - 1))
+CSV_FILE = "cell_data.csv"
+NUMBER = re.compile(r"[-+]?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?|nan", re.I)
+
+
+def find_csv(image: Path) -> Path | None:
+    folder = image if image.is_dir() else image.parent
+    for d in (folder, folder.parent, Path.cwd()):
+        if (d / CSV_FILE).is_file():
+            return d / CSV_FILE
+    return None
+
+
+def read_csv_rows(path: Path) -> list[dict]:
+    with open(path, newline="") as f:
+        rows = list(csv.DictReader(f))
+    if not rows:
+        raise SystemExit(f"No rows in {path}")
+    return rows
+
+
+def image_timestamp(path: Path) -> str | None:
+    """'2026-06-04_09-16-15_whatever.png' -> '2026-06-04 09:16:15' (as written in the CSV)."""
+    parts = path.stem.split("_")
+    if len(parts) >= 2 and parts[0].count("-") == 2 and parts[1].count("-") == 2:
+        return f"{parts[0]} {parts[1].replace('-', ':')}"
+    return None
+
+
+def pick_row(rows: list[dict], image_path: Path, selector: str | None) -> dict:
+    """The row given by --row (index or part of a timestamp), else the one timestamped like the image."""
+    if selector is not None:
+        try:
+            return rows[int(selector)]
+        except ValueError:
+            hits = [r for r in rows if selector.strip() in r["timestamp"]]
+            if len(hits) == 1:
+                return hits[0]
+            raise ValueError(f"--row {selector!r} matches {len(hits)} rows")
+    ts = image_timestamp(image_path)
+    hits = [r for r in rows if ts and r["timestamp"].strip() == ts]
+    if not hits:
+        raise ValueError(f"no CSV row timestamped {ts or '(no timestamp in file name)'}; "
+                         f"use --row, or --no-csv to pick cells by colour")
+    return hits[-1]
+
+
+def parse_row(row: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    def parse(key: str) -> np.ndarray:
+        # Plain numbers, so lists written as "[np.float64(1.2), ...]" read too.
+        text = re.sub(r"np\.\w+\(([^()]*)\)", r"\1", row.get(key) or "")
+        return np.array([float(v) for v in NUMBER.findall(text)])
+    d, x, y = parse("diameters"), parse("x_positions"), parse("y_positions")
+    if not (len(d) == len(x) == len(y)):
+        raise ValueError(f"row {row['timestamp']}: diameters/x/y lengths differ")
+    return d, x, y
+
+
+def foam_cells(image, seg, args, row: dict | None = None) -> tuple[np.ndarray, pd.DataFrame, dict]:
+    """Interior cells with their edge-fitted ellipses. Returns (cell label image, table, info)."""
     labels = label_regions(seg, DEFAULT_WALL_THRESHOLD)
-    is_foam = classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation,
-                                    DEFAULT_MIN_AREA_PX, None)
-    if not is_foam.any():
-        raise ValueError("no foam cells found (check --hue)")
-    _, is_edge = neighbour_info(labels, is_foam)
-    keep = is_foam & ~is_edge
+    info = {}
+    if row is not None:
+        diam, x, y = parse_row(row)
+        h, w = labels.shape
+        ids = labels[np.clip(np.round(y).astype(int), 0, h - 1), np.clip(np.round(x).astype(int), 0, w - 1)]
+        if args.min_mm is not None:
+            ids = ids[diam >= args.min_mm]; diam = diam[diam >= args.min_mm]
+        if args.max_mm is not None:
+            ids = ids[diam <= args.max_mm]; diam = diam[diam <= args.max_mm]
+        is_cell = np.zeros(labels.max() + 1, bool)
+        is_cell[ids[ids > 0]] = True
+        # mm per px from the CSV diameters vs the regions' equivalent diameters
+        areas = np.bincount(labels.ravel(), minlength=labels.max() + 1)
+        ok = ids > 0
+        ratio = diam[ok] / np.sqrt(4 * areas[ids[ok]] / np.pi)
+        info = {"source": f"cell_data.csv row {row['timestamp'].strip()}", "csv_points": len(ids),
+                "points_on_lines": int((ids == 0).sum()),
+                "mm_per_px": float(np.median(ratio)) if ok.any() else None}
+    else:
+        is_cell = classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation,
+                                        DEFAULT_MIN_AREA_PX, None)
+        info = {"source": "colour (blue regions)"}
+    if not is_cell.any():
+        raise ValueError("no cells found")
+    _, is_edge = neighbour_info(labels, is_cell)
+    keep = is_cell & ~is_edge
     cell_labels = np.where(keep, np.arange(keep.size), 0)[labels]
 
     rows = []
@@ -116,7 +211,7 @@ def foam_cells(image: np.ndarray, seg: np.ndarray, args) -> tuple[np.ndarray, pd
             "angle_deg": angle,
             "area_px": int(mask.sum()),
         })
-    return cell_labels, pd.DataFrame(rows)
+    return cell_labels, pd.DataFrame(rows), info
 
 
 # ---------------------------------------------------------------- anisotropy
@@ -317,9 +412,16 @@ def table_row(name, sq_id, row, col, count, s) -> dict:
     return out
 
 
-def analyse(image_path: Path, seg_path: Path, out: Path, args) -> pd.DataFrame:
+def analyse(image_path: Path, seg_path: Path, out: Path, args, csv_rows: list[dict] | None) -> pd.DataFrame:
     image, seg = load_images(image_path, seg_path)
-    cell_labels, cells = foam_cells(image, seg, args)
+    row = pick_row(csv_rows, image_path, args.row) if csv_rows is not None else None
+    cell_labels, cells, info = foam_cells(image, seg, args, row)
+    msg = f"    cells from {info['source']}"
+    if "csv_points" in info:
+        msg += f": {info['csv_points']} points ({info['points_on_lines']} on wall lines)"
+        if info["mm_per_px"]:
+            msg += f", scale {info['mm_per_px'] * 1000:.2f} um/px"
+    print(msg)
     if cells.empty:
         raise ValueError("no interior foam cells")
 
@@ -331,7 +433,8 @@ def analyse(image_path: Path, seg_path: Path, out: Path, args) -> pd.DataFrame:
 
     rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
     fmap = orientation_map(rgb, cell_labels, cells, squares, box, rows, cols)
-    save_plot(fmap, squares, whole, rows, cols, f"{image_path.name}  ({len(cells)} cells, {rows} x {cols} squares)",
+    save_plot(fmap, squares, whole, rows, cols,
+              f"{image_path.name}  ({len(cells)} cells from {info['source']}, {rows} x {cols} squares)",
               out / f"{image_path.stem}_anisotropy.png")
 
     table = [table_row(image_path.name, sq["grid_row"] * cols + sq["grid_col"] + 1, sq["grid_row"] + 1,
@@ -354,6 +457,14 @@ def main() -> None:
     ap.add_argument("--hue", type=int, nargs=2, default=DEFAULT_HUE_RANGE, metavar=("MIN", "MAX"),
                     help="OpenCV hue range (0-179) of the foam colour; default blue")
     ap.add_argument("--min-saturation", type=int, default=DEFAULT_MIN_SATURATION)
+    ap.add_argument("--csv", type=Path, default=None,
+                    help=f"measurement CSV (default: {CSV_FILE} next to the images, one folder up, or here)")
+    ap.add_argument("--no-csv", action="store_true", help="ignore the CSV and pick cells by colour")
+    ap.add_argument("--row", default=None,
+                    help="CSV row: index (0 first, -1 last) or part of a timestamp; "
+                         "default: the row timestamped like the image file name")
+    ap.add_argument("--min-mm", type=float, default=None, help="only CSV cells at least this diameter (mm)")
+    ap.add_argument("--max-mm", type=float, default=None, help="only CSV cells at most this diameter (mm)")
     ap.add_argument("--tables", action="store_true",
                     help="also write a CSV per image and anisotropy.xlsx (default: pictures only)")
     args = ap.parse_args()
@@ -369,10 +480,19 @@ def main() -> None:
     out = args.out or args.image.parent / "anisotropy_results"
     out.mkdir(parents=True, exist_ok=True)
 
+    csv_rows = None
+    if not args.no_csv:
+        csv_path = args.csv or find_csv(args.image)
+        if csv_path is None:
+            print(f"no {CSV_FILE} found: picking cells by colour (use --csv to point to it)")
+        else:
+            print(f"reading {csv_path}")
+            csv_rows = read_csv_rows(csv_path)
+
     tables = []
     for i, (img, seg) in enumerate(pairs, 1):
         try:
-            t = analyse(img, seg, out, args)
+            t = analyse(img, seg, out, args, csv_rows)
         except Exception as exc:
             print(f"[{i}/{len(pairs)}] {img.name}: FAILED ({exc})")
             continue
