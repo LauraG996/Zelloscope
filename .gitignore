@@ -3,3 +3,4 @@ __pycache__/
 *_cells/
 cell_results/
 anisotropy_results/
+cell_tracks/

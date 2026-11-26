@@ -167,8 +167,10 @@ def parse_row(row: dict) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     return d, x, y
 
 
-def foam_cells(image, seg, args, row: dict | None = None) -> tuple[np.ndarray, pd.DataFrame, dict]:
-    """Interior cells with their edge-fitted ellipses. Returns (cell label image, table, info)."""
+def foam_cells(image, seg, args, row: dict | None = None, keep_edge: bool = False):
+    """Interior cells (all foam cells with keep_edge) with their edge-fitted ellipses.
+
+    Returns (cell label image, table, info, foam footprint)."""
     labels = label_regions(seg, DEFAULT_WALL_THRESHOLD)
     info = {}
     if row is not None:
@@ -199,7 +201,7 @@ def foam_cells(image, seg, args, row: dict | None = None) -> tuple[np.ndarray, p
         raise ValueError("no cells found")
     is_cell, footprint = main_foam_body(labels, is_cell)
     _, is_edge = neighbour_info(labels, is_cell)
-    keep = is_cell & ~is_edge
+    keep = is_cell if keep_edge else is_cell & ~is_edge
     cell_labels = np.where(keep, np.arange(keep.size), 0)[labels]
 
     rows = []
