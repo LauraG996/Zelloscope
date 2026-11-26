@@ -23,12 +23,11 @@ branch (used there for the insulation foams):
                of all the cells' ellipses (each weighted by its area);
                1 = isotropic
 
-Outputs (default: anisotropy_results/ next to the images):
-  <name>_anisotropy.png   cells coloured by lean from vertical, a direction bar
-                          per square (length = alignment), and a table of the
-                          squares laid out like the grid
-  <name>_anisotropy.csv   one row per square plus one for the whole foam
-  anisotropy.xlsx         all images together
+Output (default: anisotropy_results/ next to the images): one picture per
+image, <name>_anisotropy.png, with the cells coloured by lean from vertical, a
+direction bar per square (length = alignment) and a table of the squares laid
+out like the grid. Pass --tables to also write a CSV per image and an
+anisotropy.xlsx with all images.
 
 Examples:
   python foam_anisotropy.py foam.png foam_seg.png
@@ -339,7 +338,8 @@ def analyse(image_path: Path, seg_path: Path, out: Path, args) -> pd.DataFrame:
                        sq["grid_col"] + 1, sq["count"], sq["anisotropy"]) for sq in squares]
     table.append(table_row(image_path.name, "whole foam", "", "", len(cells), whole))
     df = pd.DataFrame(table)
-    df.round(3).to_csv(out / f"{image_path.stem}_anisotropy.csv", index=False)
+    if args.tables:
+        df.round(3).to_csv(out / f"{image_path.stem}_anisotropy.csv", index=False)
     return df
 
 
@@ -354,6 +354,8 @@ def main() -> None:
     ap.add_argument("--hue", type=int, nargs=2, default=DEFAULT_HUE_RANGE, metavar=("MIN", "MAX"),
                     help="OpenCV hue range (0-179) of the foam colour; default blue")
     ap.add_argument("--min-saturation", type=int, default=DEFAULT_MIN_SATURATION)
+    ap.add_argument("--tables", action="store_true",
+                    help="also write a CSV per image and anisotropy.xlsx (default: pictures only)")
     args = ap.parse_args()
 
     if args.image.is_dir():
@@ -381,9 +383,9 @@ def main() -> None:
         t.insert(0, "image", img.name)
         tables.append(t)
 
-    if tables:
+    if tables and args.tables:
         pd.concat(tables, ignore_index=True).round(3).to_excel(out / "anisotropy.xlsx", index=False)
-        print(f"\nResults in {out}")
+    print(f"\nPictures in {out}")
 
 
 if __name__ == "__main__":
