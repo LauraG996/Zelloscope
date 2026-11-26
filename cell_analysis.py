@@ -192,9 +192,10 @@ def measure_cells(
         major = p.axis_major_length
         minor = p.axis_minor_length
         perim = p.perimeter
-        # skimage orientation: angle between row axis and major axis. Convert
-        # to degrees from the horizontal image axis, in [0, 180).
-        orient = (90.0 - np.degrees(p.orientation)) % 180.0
+        # skimage orientation: angle between the row axis and the major axis.
+        # Convert to degrees from horizontal, counter-clockwise as seen on
+        # screen, in [0, 180) (90 = vertical), as in foam_anisotropy.py.
+        orient = (90.0 + np.degrees(p.orientation)) % 180.0
         rows.append(
             {
                 "cell_id": p.label,
