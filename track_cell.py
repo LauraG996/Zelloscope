@@ -94,12 +94,15 @@ def load_steps(pairs, args, csv_rows) -> list[dict]:
     return steps
 
 
-def feature_matches(a: dict, b: dict) -> tuple[np.ndarray, np.ndarray] | None:
-    """Matched SIFT feature positions (full-res px) between a (on its foam) and b."""
+def feature_matches(a: dict, b: dict, on_foam: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+    """Matched SIFT feature positions (full-res px) between a and b; features of a taken on its foam
+    (on_foam) or everywhere else, i.e. on the jig/holder/background (not on_foam)."""
     s = 0.5
     ga = cv2.resize(a["gray"], None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
     gb = cv2.resize(b["gray"], None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
-    mask = cv2.resize(a["footprint"].astype(np.uint8) * 255, ga.shape[::-1], interpolation=cv2.INTER_NEAREST)
+    region = a["footprint"] if on_foam else ~cv2.dilate(a["footprint"].astype(np.uint8),
+                                                         np.ones((61, 61), np.uint8)).astype(bool)
+    mask = cv2.resize(region.astype(np.uint8) * 255, ga.shape[::-1], interpolation=cv2.INTER_NEAREST)
     sift = cv2.SIFT_create(nfeatures=30000)
     ka, da = sift.detectAndCompute(ga, mask)
     kb, db = sift.detectAndCompute(gb, None)
@@ -145,6 +148,30 @@ def displacement_guide(a: dict, b: dict, shape_small) -> tuple[np.ndarray, np.nd
     return field, A
 
 
+def frame_transform(a: dict, b: dict) -> np.ndarray:
+    """How the camera view moved between a and b, from features on the jig/holder/background
+    (shift + rotation + scale, 2x3). Used to show the foam's movement relative to the jig rather
+    than in image pixels. Identity if it can't be measured (e.g. a fixed camera)."""
+    identity = np.array([[1, 0, 0], [0, 1, 0]], np.float64)
+    m = feature_matches(a, b, on_foam=False)
+    if m is None:
+        return identity
+    F, inl = cv2.estimateAffinePartial2D(m[0], m[1], ransacReprojThreshold=4, maxIters=5000)
+    if F is None or inl.sum() < 30:
+        return identity
+    return F
+
+
+def to_frame(steps: list[dict], x: float, y: float, j: int, k: int) -> tuple[float, float]:
+    """Image position (x, y) in step j expressed in step k's image (j <= k), following the camera only."""
+    p = np.array([x, y, 1.0])
+    for i in range(j, k):
+        F = steps[i].get("frame_to_next")
+        if F is not None:
+            p = np.array([*(F @ p), 1.0])
+    return float(p[0]), float(p[1])
+
+
 def flow_between(a: dict, b: dict) -> np.ndarray:
     """Low-resolution flow a -> b, in full-resolution pixels.
 
@@ -154,6 +181,7 @@ def flow_between(a: dict, b: dict) -> np.ndarray:
     h, w = a["small"].shape
     guide, A = displacement_guide(a, b, (h, w))
     a["affine_to_next"] = A
+    a["frame_to_next"] = frame_transform(a, b)
     ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
     map_x = xs + guide[..., 0] * FLOW_SCALE
     map_y = ys + guide[..., 1] * FLOW_SCALE
@@ -445,7 +473,8 @@ def summary_figure(steps, rec_list, n: int, size: int, mm_per_px, dst: Path) -> 
         ang = rec.get("angle_deg", float("nan"))
         ax.set_title(f"{rec['step']}   match {rec['iou']:.2f}", fontsize=10, color=col if rec["status"] != "good"
                      else "#222222")
-        dx, dy = rec["x"] - rec_list[0]["x"], rec["y"] - rec_list[0]["y"]
+        x0, y0 = to_frame(steps, rec_list[0]["x"], rec_list[0]["y"], 0, i)  # relative to the jig
+        dx, dy = rec["x"] - x0, rec["y"] - y0
         moved = f"moved {dx * f:+.2f}, {dy * f:+.2f} {unit} from step 1" if i else "start position"
         ax.set_xlabel(f"AR {ar:.2f}   {ang:.0f}°   {rec['area_px'] * f * f:.3g} {unit}²\n{moved}"
                       + (f"\n{short_note(rec['note'])}" if rec["note"] and rec["note"] != "picked" else ""),
@@ -534,9 +563,12 @@ def pair_summary(steps, tracks: dict, sizes: dict, mm_per_px, dst: Path) -> None
         for sp in ax.spines.values():
             sp.set_edgecolor(col); sp.set_linewidth(3)
         da = 100 * (b["area_px"] / a["area_px"] - 1)
+        x0, y0 = to_frame(steps, a["x"], a["y"], 0, len(steps) - 1)
+        mvx, mvy = (b["x"] - x0) * f, (b["y"] - y0) * f
         ar_a, ar_b = a.get("aspect_ratio", np.nan), b.get("aspect_ratio", np.nan)
         an_a, an_b = a.get("angle_deg", np.nan), b.get("angle_deg", np.nan)
-        ax.set_title(f"cell {cid}      before   |   after", fontsize=10, loc="left")
+        ax.set_title(f"cell {cid}      before   |   after        moved {mvx:+.2f}, {mvy:+.2f} {unit} "
+                     f"(right/down +)", fontsize=10, loc="left")
         note = short_note(b["note"]) if b["note"] else ""
         ax.set_xlabel(f"area {a['area_px'] * f * f:.3g} -> {b['area_px'] * f * f:.3g} {unit}² ({da:+.0f}%)   "
                       f"AR {ar_a:.2f} -> {ar_b:.2f}   angle {an_a:.0f} -> {an_b:.0f}°"
@@ -551,7 +583,7 @@ def pair_summary(steps, tracks: dict, sizes: dict, mm_per_px, dst: Path) -> None
     plt.close(fig)
 
 
-def overview(step: dict, tracks: dict, dst: Path, k: int = 0) -> None:
+def overview(step: dict, tracks: dict, dst: Path, k: int = 0, steps: list[dict] | None = None) -> None:
     """The k-th step's image with each tracked cell outlined and numbered, and its path drawn."""
     img = step["rgb"].copy()
     th = max(2, img.shape[0] // 600)
@@ -559,7 +591,10 @@ def overview(step: dict, tracks: dict, dst: Path, k: int = 0) -> None:
         if k >= len(recs):
             continue
         r = recs[k]
-        pts = np.array([(int(q["x"]), int(q["y"])) for q in recs[:k + 1]], np.int32)
+        # earlier positions moved into this image's view (camera movement taken out), so the
+        # line shows how the cell moved relative to the jig
+        pts = np.array([to_frame(steps, q["x"], q["y"], j, k) if steps else (q["x"], q["y"])
+                        for j, q in enumerate(recs[:k + 1])], np.int32)
         cv2.polylines(img, [pts], False, (255, 255, 255), th * 2, cv2.LINE_AA)
         for q in pts[1:]:
             cv2.circle(img, tuple(int(v) for v in q), th * 3, (255, 255, 255), -1, cv2.LINE_AA)
@@ -636,7 +671,9 @@ def main() -> None:
     flows = [flow_between(steps[k], steps[k + 1]) for k in range(len(steps) - 1)]
     for k in range(len(steps) - 1):
         A = steps[k]["affine_to_next"]
-        print(f"  {steps[k]['label']} -> {steps[k + 1]['label']}: overall shift ({A[0, 2]:+.0f}, {A[1, 2]:+.0f}) px, "
+        F = steps[k]["frame_to_next"]
+        print(f"  {steps[k]['label']} -> {steps[k + 1]['label']}: camera/jig moved ({F[0, 2]:+.0f}, {F[1, 2]:+.0f}) px; "
+              f"foam overall: shift ({A[0, 2]:+.0f}, {A[1, 2]:+.0f}) px, "
               f"width x{A[0, 0]:.3f}, height x{A[1, 1]:.3f}")
 
     out = args.out or args.images.parent / "cell_tracks"
@@ -659,8 +696,13 @@ def main() -> None:
         print(f"cell {n} at ({xy[0]:.0f}, {xy[1]:.0f}): {statuses.count('good')} good, "
               f"{statuses.count('uncertain')} uncertain, {statuses.count('lost')} lost of {len(recs)} steps; "
               f"AR {recs[0].get('aspect_ratio', float('nan')):.2f} -> {recs[-1].get('aspect_ratio', float('nan')):.2f}")
-        for r in recs:
+        for j, r in enumerate(recs):
             row = {"cell": n} | {k: v for k, v in r.items() if not k.startswith("_")}
+            # movement since step 1 relative to the jig (camera movement taken out), image axes
+            x0, y0 = to_frame(steps, recs[0]["x"], recs[0]["y"], 0, j)
+            row["moved_x_px"], row["moved_y_px"] = r["x"] - x0, r["y"] - y0
+            if mm_per_px:
+                row["moved_x_mm"], row["moved_y_mm"] = row["moved_x_px"] * mm_per_px, row["moved_y_px"] * mm_per_px
             if mm_per_px:
                 for key in ("length_px", "width_px"):
                     if key in row:
@@ -669,8 +711,8 @@ def main() -> None:
             table.append(row)
 
     if tracks:
-        overview(steps[0], tracks, out / "cells_overview.png")
-        overview(steps[-1], tracks, out / "cells_overview_last.png", k=len(steps) - 1)
+        overview(steps[0], tracks, out / "cells_overview.png", steps=steps)
+        overview(steps[-1], tracks, out / "cells_overview_last.png", k=len(steps) - 1, steps=steps)
         if len(steps) == 2:
             pair_summary(steps, tracks, sizes, mm_per_px, out / "before_after.png")
         pd.DataFrame(table).round(3).to_csv(out / "cell_tracks.csv", index=False)
