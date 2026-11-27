@@ -37,6 +37,7 @@ Examples:
   python track_cell.py videocompressed\\images videocompressed\\Segmentation
   python track_cell.py videocompressed\\images videocompressed\\Segmentation --cell 2500 2100
   python track_cell.py videocompressed\\images videocompressed\\Segmentation --auto 6 --video
+  python track_cell.py --files before.png before_seg.png after.png after_seg.png --auto 6
 """
 from __future__ import annotations
 
@@ -55,6 +56,7 @@ import pandas as pd  # noqa: E402
 
 import foam_anisotropy as fa  # noqa: E402
 from cell_analysis import load_images, pair_files  # noqa: E402
+from segmentation_score import zelloscope_metadata  # noqa: E402
 
 FLOW_SCALE = 0.25  # optical flow is computed on images shrunk by this factor
 GOOD_IOU, LOST_IOU = 0.5, 0.25
@@ -83,18 +85,110 @@ def load_steps(pairs, args, csv_rows) -> list[dict]:
         gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         steps.append({
             "path": img_path, "label": step_label(img_path, i), "rgb": cv2.cvtColor(image, cv2.COLOR_BGR2RGB),
+            "gray": gray,
             "small": cv2.resize(gray, None, fx=FLOW_SCALE, fy=FLOW_SCALE, interpolation=cv2.INTER_AREA),
             "labels": labels, "areas": np.bincount(labels.ravel()), "footprint": footprint,
-            "mm_per_px": info.get("mm_per_px"),
+            "mm_per_px": info.get("mm_per_px") or zelloscope_metadata(img_path).get("p2mm"),
         })
-        print(f"  loaded {img_path.name}: {len(np.unique(labels)) - 1} foam cells")
+        print(f"  loaded {img_path.name}: {len(np.unique(labels)) - 1} foam cells (from {info['source']})")
     return steps
 
 
+def feature_matches(a: dict, b: dict, on_foam: bool = True) -> tuple[np.ndarray, np.ndarray] | None:
+    """Matched SIFT feature positions (full-res px) between a and b; features of a taken on its foam
+    (on_foam) or everywhere else, i.e. on the jig/holder/background (not on_foam)."""
+    s = 0.5
+    ga = cv2.resize(a["gray"], None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    gb = cv2.resize(b["gray"], None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    region = a["footprint"] if on_foam else ~cv2.dilate(a["footprint"].astype(np.uint8),
+                                                         np.ones((61, 61), np.uint8)).astype(bool)
+    mask = cv2.resize(region.astype(np.uint8) * 255, ga.shape[::-1], interpolation=cv2.INTER_NEAREST)
+    sift = cv2.SIFT_create(nfeatures=30000)
+    ka, da = sift.detectAndCompute(ga, mask)
+    kb, db = sift.detectAndCompute(gb, None)
+    if da is None or db is None or len(ka) < 10 or len(kb) < 10:
+        return None
+    pairs = cv2.BFMatcher().knnMatch(da, db, k=2)
+    good = [m for m, n in (p for p in pairs if len(p) == 2) if m.distance < 0.75 * n.distance]
+    if len(good) < 20:
+        return None
+    pa = np.float32([ka[m.queryIdx].pt for m in good]) / s
+    pb = np.float32([kb[m.trainIdx].pt for m in good]) / s
+    return pa, pb
+
+
+def displacement_guide(a: dict, b: dict, shape_small) -> tuple[np.ndarray, np.ndarray]:
+    """Smooth displacement field a -> b on the low-res grid (full-res px) from feature matches:
+    an overall affine fit (big shifts, overall squeezing) plus the matches' local deviations
+    from it, interpolated and smoothed. Returns (field h x w x 2, affine 2x3)."""
+    h, w = shape_small
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32) / FLOW_SCALE
+    identity = np.array([[1, 0, 0], [0, 1, 0]], np.float64)
+    m = feature_matches(a, b)
+    if m is None:
+        return np.zeros((h, w, 2), np.float32), identity
+    pa, pb = m
+    A, inl = cv2.estimateAffine2D(pa, pb, ransacReprojThreshold=6, maxIters=5000)
+    if A is None or inl.sum() < 20:
+        return np.zeros((h, w, 2), np.float32), identity
+    field = np.dstack([A[0, 0] * xs + A[0, 1] * ys + A[0, 2] - xs,
+                       A[1, 0] * xs + A[1, 1] * ys + A[1, 2] - ys]).astype(np.float32)
+    # local deviations of consistent matches from the affine fit
+    res = pb - cv2.transform(pa[None], A)[0]
+    ok = np.hypot(res[:, 0], res[:, 1]) < 60
+    if ok.sum() >= 30:
+        from scipy.interpolate import griddata
+        pts = pa[ok] * FLOW_SCALE
+        grid = (xs * FLOW_SCALE, ys * FLOW_SCALE)
+        for c in range(2):
+            lin = griddata(pts, res[ok, c], grid, method="linear")
+            near = griddata(pts, res[ok, c], grid, method="nearest")
+            dev = np.where(np.isnan(lin), near, lin).astype(np.float32)
+            field[..., c] += cv2.GaussianBlur(dev, (0, 0), 60 * FLOW_SCALE)
+    return field, A
+
+
+def frame_transform(a: dict, b: dict) -> np.ndarray:
+    """How the camera view moved between a and b, from features on the jig/holder/background
+    (shift + rotation + scale, 2x3). Used to show the foam's movement relative to the jig rather
+    than in image pixels. Identity if it can't be measured (e.g. a fixed camera)."""
+    identity = np.array([[1, 0, 0], [0, 1, 0]], np.float64)
+    m = feature_matches(a, b, on_foam=False)
+    if m is None:
+        return identity
+    F, inl = cv2.estimateAffinePartial2D(m[0], m[1], ransacReprojThreshold=4, maxIters=5000)
+    if F is None or inl.sum() < 30:
+        return identity
+    return F
+
+
+def to_frame(steps: list[dict], x: float, y: float, j: int, k: int) -> tuple[float, float]:
+    """Image position (x, y) in step j expressed in step k's image (j <= k), following the camera only."""
+    p = np.array([x, y, 1.0])
+    for i in range(j, k):
+        F = steps[i].get("frame_to_next")
+        if F is not None:
+            p = np.array([*(F @ p), 1.0])
+    return float(p[0]), float(p[1])
+
+
 def flow_between(a: dict, b: dict) -> np.ndarray:
-    """Low-resolution flow a -> b, in full-resolution pixels."""
-    flow = cv2.calcOpticalFlowFarneback(a["small"], b["small"], None, 0.5, 6, 41, 5, 7, 1.5, 0)
-    return flow / FLOW_SCALE
+    """Low-resolution flow a -> b, in full-resolution pixels.
+
+    A smooth guide from matched features (handles large shifts and overall
+    squeezing), refined by dense optical flow that may only move a short way
+    from it, so it can't drift off where the texture changes a lot."""
+    h, w = a["small"].shape
+    guide, A = displacement_guide(a, b, (h, w))
+    a["affine_to_next"] = A
+    a["frame_to_next"] = frame_transform(a, b)
+    ys, xs = np.mgrid[0:h, 0:w].astype(np.float32)
+    map_x = xs + guide[..., 0] * FLOW_SCALE
+    map_y = ys + guide[..., 1] * FLOW_SCALE
+    b_in_a = cv2.remap(b["small"], map_x, map_y, cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+    r = cv2.calcOpticalFlowFarneback(a["small"], b_in_a, None, 0.5, 2, 21, 5, 7, 1.5, 0)
+    r = np.clip(r, -8, 8)  # at most ~32 full-res px away from the guide
+    return guide + r / FLOW_SCALE
 
 
 # ---------------------------------------------------------------- tracking
@@ -197,8 +291,41 @@ def track(steps: list[dict], flows: list[np.ndarray], start_xy: tuple[float, flo
             anchor_ys, anchor_xs = pys, pxs
             status, note = "lost", "no matching cell; carried outline shown"
         rec = measure(ys, xs) | {"step": steps[k]["label"], "iou": iou, "status": status, "note": note}
+        # independent check: match the texture around the cell in the previous step
+        prev = rows[-1]
+        off = texture_check(steps[k - 1], steps[k], prev, rec)
+        rec["texture_check_px"] = off
+        diam = 2 * math.sqrt(max(prev["area_px"], 1) / math.pi)
+        if off is not None and off > 0.5 * diam and rec["status"] == "good":
+            rec["status"] = "uncertain"
+            rec["note"] = (rec["note"] + "; " if rec["note"] else "") + f"texture check off by {off:.0f} px"
         rows.append(rec | {"_ys": ys, "_xs": xs})
     return rows
+
+
+def texture_check(a: dict, b: dict, rec_a: dict, rec_b: dict) -> float | None:
+    """Distance (px) between the tracked position in b and where the image patch around the cell
+    in a best matches in b (the patch squeezed by the overall deformation). None if not possible."""
+    diam = 2 * math.sqrt(max(rec_a["area_px"], 1) / math.pi)
+    half = int(max(2.5 * diam, 30))
+    x, y = int(round(rec_a["x"])), int(round(rec_a["y"]))
+    h, w = a["gray"].shape
+    if not (half <= x < w - half and half <= y < h - half):
+        return None
+    tpl = a["gray"][y - half:y + half, x - half:x + half]
+    A = a.get("affine_to_next")
+    if A is not None:  # squeeze the patch like the foam as a whole
+        tpl = cv2.resize(tpl, (max(int(2 * half * abs(A[0, 0])), 8), max(int(2 * half * abs(A[1, 1])), 8)))
+    search = int(3 * diam)
+    tx, ty = int(round(rec_b["x"])), int(round(rec_b["y"]))
+    y0, x0 = max(ty - search - tpl.shape[0] // 2, 0), max(tx - search - tpl.shape[1] // 2, 0)
+    win = b["gray"][y0:ty + search + tpl.shape[0] // 2, x0:tx + search + tpl.shape[1] // 2]
+    if win.shape[0] <= tpl.shape[0] or win.shape[1] <= tpl.shape[1]:
+        return None
+    r = cv2.matchTemplate(win, tpl, cv2.TM_CCOEFF_NORMED)
+    _, _, _, loc = cv2.minMaxLoc(r)
+    mx, my = x0 + loc[0] + tpl.shape[1] / 2, y0 + loc[1] + tpl.shape[0] / 2
+    return float(math.hypot(mx - rec_b["x"], my - rec_b["y"]))
 
 
 def auto_pick(steps: list[dict], n: int) -> list[tuple[float, float]]:
@@ -346,7 +473,8 @@ def summary_figure(steps, rec_list, n: int, size: int, mm_per_px, dst: Path) -> 
         ang = rec.get("angle_deg", float("nan"))
         ax.set_title(f"{rec['step']}   match {rec['iou']:.2f}", fontsize=10, color=col if rec["status"] != "good"
                      else "#222222")
-        dx, dy = rec["x"] - rec_list[0]["x"], rec["y"] - rec_list[0]["y"]
+        x0, y0 = to_frame(steps, rec_list[0]["x"], rec_list[0]["y"], 0, i)  # relative to the jig
+        dx, dy = rec["x"] - x0, rec["y"] - y0
         moved = f"moved {dx * f:+.2f}, {dy * f:+.2f} {unit} from step 1" if i else "start position"
         ax.set_xlabel(f"AR {ar:.2f}   {ang:.0f}°   {rec['area_px'] * f * f:.3g} {unit}²\n{moved}"
                       + (f"\n{short_note(rec['note'])}" if rec["note"] and rec["note"] != "picked" else ""),
@@ -415,12 +543,58 @@ def write_video(steps, rec_list, size: int, dst: Path, fps: float = 25, hold: fl
     close()
 
 
-def overview(step: dict, tracks: dict, dst: Path) -> None:
+def pair_summary(steps, tracks: dict, sizes: dict, mm_per_px, dst: Path) -> None:
+    """Two-image series: every tracked cell before | after, with how it changed."""
+    n = len(tracks)
+    cols = min(n, 4)
+    rows = math.ceil(n / cols)
+    fig = plt.figure(figsize=(5.2 * cols, 3.3 * rows + 0.8), dpi=110)
+    unit = "mm" if mm_per_px else "px"
+    f = mm_per_px if mm_per_px else 1.0
+    for i, (cid, recs) in enumerate(tracks.items()):
+        a, b = recs[0], recs[-1]
+        ta = tile(steps[0], a, sizes[cid])
+        tb = tile(steps[-1], b, sizes[cid])
+        pair = np.hstack([ta, np.full((TILE, 8, 3), 255, np.uint8), tb])
+        ax = fig.add_subplot(rows, cols, i + 1)
+        ax.imshow(pair)
+        ax.set_xticks([]); ax.set_yticks([])
+        col = np.array(CONF_COLOURS[b["status"]]) / 255
+        for sp in ax.spines.values():
+            sp.set_edgecolor(col); sp.set_linewidth(3)
+        da = 100 * (b["area_px"] / a["area_px"] - 1)
+        x0, y0 = to_frame(steps, a["x"], a["y"], 0, len(steps) - 1)
+        mvx, mvy = (b["x"] - x0) * f, (b["y"] - y0) * f
+        ar_a, ar_b = a.get("aspect_ratio", np.nan), b.get("aspect_ratio", np.nan)
+        an_a, an_b = a.get("angle_deg", np.nan), b.get("angle_deg", np.nan)
+        ax.set_title(f"cell {cid}      before   |   after        moved {mvx:+.2f}, {mvy:+.2f} {unit} "
+                     f"(right/down +)", fontsize=10, loc="left")
+        note = short_note(b["note"]) if b["note"] else ""
+        ax.set_xlabel(f"area {a['area_px'] * f * f:.3g} -> {b['area_px'] * f * f:.3g} {unit}² ({da:+.0f}%)   "
+                      f"AR {ar_a:.2f} -> {ar_b:.2f}   angle {an_a:.0f} -> {an_b:.0f}°"
+                      + (f"\n{note}" if note else ""), fontsize=8.5,
+                      color="#222222" if b["status"] == "good" else col)
+    fig.suptitle(f"{steps[0]['path'].name}  ->  {steps[-1]['path'].name}      green frame = after-image cell "
+                 "matched cleanly; orange/red = the segmentation outlines it differently after compression, so the "
+                 "outline carried along by the measured motion is shown", fontsize=9.5, x=0.01, ha="left",
+                 color="#555555")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.savefig(dst)
+    plt.close(fig)
+
+
+def overview(step: dict, tracks: dict, dst: Path, k: int = 0, steps: list[dict] | None = None) -> None:
+    """The k-th step's image with each tracked cell outlined and numbered, and its path drawn."""
     img = step["rgb"].copy()
     th = max(2, img.shape[0] // 600)
     for n, recs in tracks.items():
-        r = recs[0]
-        pts = np.array([(int(q["x"]), int(q["y"])) for q in recs], np.int32)
+        if k >= len(recs):
+            continue
+        r = recs[k]
+        # earlier positions moved into this image's view (camera movement taken out), so the
+        # line shows how the cell moved relative to the jig
+        pts = np.array([to_frame(steps, q["x"], q["y"], j, k) if steps else (q["x"], q["y"])
+                        for j, q in enumerate(recs[:k + 1])], np.int32)
         cv2.polylines(img, [pts], False, (255, 255, 255), th * 2, cv2.LINE_AA)
         for q in pts[1:]:
             cv2.circle(img, tuple(int(v) for v in q), th * 3, (255, 255, 255), -1, cv2.LINE_AA)
@@ -439,8 +613,10 @@ def overview(step: dict, tracks: dict, dst: Path) -> None:
 # ---------------------------------------------------------------- main
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("images", type=Path, help="folder of images (the series, in file-name order)")
-    ap.add_argument("segmentation", type=Path, help="folder of segmentations")
+    ap.add_argument("images", type=Path, nargs="?", help="folder of images (the series, in file-name order)")
+    ap.add_argument("segmentation", type=Path, nargs="?", help="folder of segmentations")
+    ap.add_argument("--files", type=Path, nargs="+", metavar="FILE",
+                    help="instead of folders: IMAGE1 SEG1 IMAGE2 SEG2 ... in series order")
     ap.add_argument("-o", "--out", type=Path, default=None, help="output folder (default: cell_tracks/ next to images)")
     ap.add_argument("--cell", type=float, nargs=2, action="append", metavar=("X", "Y"),
                     help="a cell to track, by its pixel position in the first image (repeatable)")
@@ -458,10 +634,18 @@ def main() -> None:
     args.min_mm = args.max_mm = None
     args.row = None
 
-    pairs, unmatched = pair_files(args.images, args.segmentation)
-    for img in unmatched:
-        print(f"no segmentation for {img.name} (skipped)")
-    pairs.sort(key=lambda p: natural_key(p[0]))
+    if args.files:
+        if len(args.files) % 2:
+            raise SystemExit("--files takes pairs: IMAGE SEGMENTATION IMAGE SEGMENTATION ...")
+        pairs = list(zip(args.files[::2], args.files[1::2]))
+        args.images = args.files[0].parent
+    else:
+        if not (args.images and args.segmentation):
+            raise SystemExit("give an images folder and a segmentation folder, or --files")
+        pairs, unmatched = pair_files(args.images, args.segmentation)
+        for img in unmatched:
+            print(f"no segmentation for {img.name} (skipped)")
+        pairs.sort(key=lambda p: natural_key(p[0]))
     if len(pairs) < 2:
         raise SystemExit("need at least two image/segmentation pairs")
 
@@ -485,11 +669,17 @@ def main() -> None:
 
     print("estimating motion between steps...")
     flows = [flow_between(steps[k], steps[k + 1]) for k in range(len(steps) - 1)]
+    for k in range(len(steps) - 1):
+        A = steps[k]["affine_to_next"]
+        F = steps[k]["frame_to_next"]
+        print(f"  {steps[k]['label']} -> {steps[k + 1]['label']}: camera/jig moved ({F[0, 2]:+.0f}, {F[1, 2]:+.0f}) px; "
+              f"foam overall: shift ({A[0, 2]:+.0f}, {A[1, 2]:+.0f}) px, "
+              f"width x{A[0, 0]:.3f}, height x{A[1, 1]:.3f}")
 
     out = args.out or args.images.parent / "cell_tracks"
     out.mkdir(parents=True, exist_ok=True)
     mm_per_px = steps[0]["mm_per_px"]
-    tracks, table = {}, []
+    tracks, table, sizes = {}, [], {}
     for n, xy in enumerate(starts, 1):
         recs = track(steps, flows, xy)
         if recs is None:
@@ -498,6 +688,7 @@ def main() -> None:
         tracks[n] = recs
         diam = 2 * math.sqrt(recs[0]["area_px"] / math.pi)
         size = int(min(max(args.zoom * diam, 160), min(steps[0]["labels"].shape)))
+        sizes[n] = size
         summary_figure(steps, recs, n, size, mm_per_px, out / f"cell_{n}_track.png")
         if args.video:
             write_video(steps, recs, size, out / f"cell_{n}_track.mp4")
@@ -505,8 +696,13 @@ def main() -> None:
         print(f"cell {n} at ({xy[0]:.0f}, {xy[1]:.0f}): {statuses.count('good')} good, "
               f"{statuses.count('uncertain')} uncertain, {statuses.count('lost')} lost of {len(recs)} steps; "
               f"AR {recs[0].get('aspect_ratio', float('nan')):.2f} -> {recs[-1].get('aspect_ratio', float('nan')):.2f}")
-        for r in recs:
+        for j, r in enumerate(recs):
             row = {"cell": n} | {k: v for k, v in r.items() if not k.startswith("_")}
+            # movement since step 1 relative to the jig (camera movement taken out), image axes
+            x0, y0 = to_frame(steps, recs[0]["x"], recs[0]["y"], 0, j)
+            row["moved_x_px"], row["moved_y_px"] = r["x"] - x0, r["y"] - y0
+            if mm_per_px:
+                row["moved_x_mm"], row["moved_y_mm"] = row["moved_x_px"] * mm_per_px, row["moved_y_px"] * mm_per_px
             if mm_per_px:
                 for key in ("length_px", "width_px"):
                     if key in row:
@@ -515,7 +711,10 @@ def main() -> None:
             table.append(row)
 
     if tracks:
-        overview(steps[0], tracks, out / "cells_overview.png")
+        overview(steps[0], tracks, out / "cells_overview.png", steps=steps)
+        overview(steps[-1], tracks, out / "cells_overview_last.png", k=len(steps) - 1, steps=steps)
+        if len(steps) == 2:
+            pair_summary(steps, tracks, sizes, mm_per_px, out / "before_after.png")
         pd.DataFrame(table).round(3).to_csv(out / "cell_tracks.csv", index=False)
         print(f"\nResults in {out}")
 
