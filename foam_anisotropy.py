@@ -197,6 +197,18 @@ def foam_cells(image, seg, args, row: dict | None = None, keep_edge: bool = Fals
         is_cell = classify_foam_regions(labels, image, tuple(args.hue), args.min_saturation,
                                         DEFAULT_MIN_AREA_PX, None)
         info = {"source": "colour (blue regions)"}
+        n_regions = int((np.bincount(labels.ravel())[1:] >= DEFAULT_MIN_AREA_PX).sum())
+        if is_cell.sum() < max(50, 0.1 * n_regions):
+            # not a blue foam (e.g. black PU): find the foam by its dense, textured cells instead
+            from segmentation_score import foam_region
+            region = foam_region(cv2.cvtColor(image, cv2.COLOR_BGR2GRAY), labels)
+            areas = np.bincount(labels.ravel(), minlength=labels.max() + 1)
+            inside = np.bincount(labels[region], minlength=labels.max() + 1)
+            ok = areas >= DEFAULT_MIN_AREA_PX
+            ok[0] = False
+            med = np.median(areas[ok & (inside > 0.5 * areas)]) if (ok & (inside > 0.5 * areas)).any() else 0
+            is_cell = ok & (inside > 0.5 * areas) & (areas <= 6 * med)
+            info = {"source": "texture (non-blue foam)"}
     if not is_cell.any():
         raise ValueError("no cells found")
     is_cell, footprint = main_foam_body(labels, is_cell)
