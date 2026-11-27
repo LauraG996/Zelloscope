@@ -28,6 +28,8 @@ Output (default: cell_tracks/ next to the images), per tracked cell:
   cell_<n>_track.png   close-ups of the cell at every step with its outline,
                        and graphs of its area, aspect ratio and angle
   cell_<n>_track.mp4   the close-ups as a short video (--video)
+  series_video.mp4     (--video) the whole foam, aligned on the jig, with all tracked cells
+                       outlined, their paths, and a close-up of each; also as .gif
 and for all cells:
   cells_overview.png   the first image with the tracked cells marked
   cell_tracks.csv      every cell, every step: position, area, length, width,
@@ -580,6 +582,135 @@ def series_summary(steps, tracks: dict, sizes: dict, mm_per_px, dst: Path) -> No
     plt.close(fig)
 
 
+def camera_matrix(steps: list[dict], k: int) -> np.ndarray:
+    """3x3 map from step 0's image to step k's image, following the camera/jig only."""
+    M = np.eye(3)
+    for i in range(k):
+        F = steps[i].get("frame_to_next")
+        if F is not None:
+            M = np.vstack([F, [0, 0, 1]]) @ M
+    return M
+
+
+def series_video(steps, tracks: dict, sizes: dict, mm_per_px, dst: Path, fps: float = 25,
+                 hold: float = 1.5, fade: float = 0.6) -> None:
+    """Whole-foam video: every image aligned to the first one's jig (camera moves taken out), the
+    tracked cells outlined with their paths, and a close-up of each cell beside it."""
+    W, H, LW = 1920, 1080, 1080
+    f = mm_per_px if mm_per_px else 1.0
+    unit = "mm" if mm_per_px else "px"
+    h0, w0 = steps[0]["labels"].shape
+    inv = [np.linalg.inv(camera_matrix(steps, k)) for k in range(len(steps))]  # step k -> step 0
+
+    # view: the foam in every step, in step 0's frame, padded, square
+    xs, ys = [], []
+    for k, st in enumerate(steps):
+        fy, fx = np.nonzero(st["footprint"][::8, ::8])
+        pts = np.c_[fx * 8, fy * 8, np.ones(len(fx))] @ inv[k].T
+        xs += [pts[:, 0].min(), pts[:, 0].max()]; ys += [pts[:, 1].min(), pts[:, 1].max()]
+    side = int(max(max(xs) - min(xs), max(ys) - min(ys)) * 1.12)
+    cx, cy = (max(xs) + min(xs)) / 2, (max(ys) + min(ys)) / 2
+    view = np.array([[1, 0, side / 2 - cx], [0, 1, side / 2 - cy], [0, 0, 1]])  # step-0 coords -> view
+    scale = LW / side
+    S = np.diag([scale, scale, 1]) @ view
+
+    def to_view(k, x, y):
+        p = S @ inv[k] @ np.array([x, y, 1.0])
+        return int(round(p[0])), int(round(p[1]))
+
+    # foam height relative to step 0 (from the overall foam fits)
+    heights = [1.0]
+    for k in range(len(steps) - 1):
+        A = steps[k].get("affine_to_next")
+        F = steps[k].get("frame_to_next")
+        sa = abs(A[1, 1]) if A is not None else 1.0
+        sf = math.hypot(F[0, 0], F[1, 0]) if F is not None else 1.0
+        heights.append(heights[-1] * sa / sf)
+
+    n = len(tracks)
+    gcols = 4 if n > 9 else 3 if n > 4 else 2
+    grows = math.ceil(n / gcols)
+    gap = 10
+    tsize = int(min((W - LW - 40 - gap * (gcols - 1)) / gcols, (H - 200 - gap * (grows - 1)) / grows))
+    font = cv2.FONT_HERSHEY_SIMPLEX
+
+    frames = []
+    for k, st in enumerate(steps):
+        M = (S @ inv[k])[:2]
+        left = cv2.warpAffine(st["rgb"], M, (LW, LW), flags=cv2.INTER_AREA, borderValue=(0, 0, 0))
+        th = 2
+        for cid, recs in tracks.items():
+            if k >= len(recs):
+                continue
+            r = recs[k]
+            trail = [to_view(j, q["x"], q["y"]) for j, q in enumerate(recs[:k + 1])]
+            for p0, p1 in zip(trail[:-1], trail[1:]):
+                cv2.line(left, p0, p1, (255, 255, 255), th, cv2.LINE_AA)
+            for p in trail[:-1]:
+                cv2.circle(left, p, 4, (255, 255, 255), -1, cv2.LINE_AA)
+            m = np.zeros((h0, w0), np.uint8) if st["labels"].shape == (h0, w0) else np.zeros(st["labels"].shape, np.uint8)
+            m[r["_ys"], r["_xs"]] = 1
+            cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+            cs = [cv2.transform(c.astype(np.float32), M).astype(np.int32) for c in cs]
+            col = OUTLINE if r["status"] != "lost" else CONF_COLOURS["lost"]
+            cv2.drawContours(left, cs, -1, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.drawContours(left, cs, -1, col, 2, cv2.LINE_AA)
+            px, py = to_view(k, r["x"], r["y"])
+            cv2.putText(left, str(cid), (px + 12, py - 10), font, 0.7, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(left, str(cid), (px + 12, py - 10), font, 0.7, OUTLINE, 2, cv2.LINE_AA)
+
+        frame = np.full((H, W, 3), 255, np.uint8)
+        frame[:, :LW] = left
+        x0 = LW + 20
+        cv2.putText(frame, f"{st['label']}  ({k + 1} of {len(steps)})", (x0, 50), font, 1.1, (30, 30, 30), 2,
+                    cv2.LINE_AA)
+        cv2.putText(frame, st["path"].name, (x0, 82), font, 0.55, (110, 110, 110), 1, cv2.LINE_AA)
+        cv2.putText(frame, f"foam height {100 * (heights[k] - 1):+.1f}% vs first image   "
+                           f"(view aligned on the jig)", (x0, 118), font, 0.65, (30, 30, 30), 2, cv2.LINE_AA)
+        cv2.putText(frame, "yellow = tracked cell, white = its path; close-ups: frame colour = match quality",
+                    (x0, 150), font, 0.5, (110, 110, 110), 1, cv2.LINE_AA)
+        for i, (cid, recs) in enumerate(tracks.items()):
+            if k >= len(recs):
+                continue
+            r = recs[k]
+            t = cv2.resize(tile(st, r, sizes[cid]), (tsize, tsize), interpolation=cv2.INTER_AREA)
+            cv2.rectangle(t, (0, 0), (tsize - 1, tsize - 1), CONF_COLOURS[r["status"]], 4)
+            da = 100 * (r["area_px"] / recs[0]["area_px"] - 1)
+            label = f"{cid}  area {da:+.0f}%  AR {r.get('aspect_ratio', float('nan')):.2f}"
+            cv2.putText(t, label, (6, tsize - 10), font, 0.45, (0, 0, 0), 4, cv2.LINE_AA)
+            cv2.putText(t, label, (6, tsize - 10), font, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+            gx = x0 + (i % gcols) * (tsize + gap)
+            gy = 175 + (i // gcols) * (tsize + gap)
+            frame[gy:gy + tsize, gx:gx + tsize] = t
+        frames.append(frame)
+
+    try:
+        import imageio_ffmpeg
+        gen = imageio_ffmpeg.write_frames(str(dst), (W, H), fps=fps, codec="libx264", pix_fmt_out="yuv420p",
+                                          quality=8, macro_block_size=8)
+        gen.send(None)
+        write, close = (lambda fr: gen.send(np.ascontiguousarray(fr))), gen.close
+    except ImportError:
+        vw = cv2.VideoWriter(str(dst), cv2.VideoWriter_fourcc(*"mp4v"), fps, (W, H))
+        write, close = (lambda fr: vw.write(cv2.cvtColor(fr, cv2.COLOR_RGB2BGR))), vw.release
+    n_hold, n_fade = int(hold * fps), int(fade * fps)
+    for i, fr in enumerate(frames):
+        for _ in range(n_hold):
+            write(fr)
+        if i + 1 < len(frames):
+            for j in range(1, n_fade + 1):
+                t = j / (n_fade + 1)
+                write(cv2.addWeighted(fr, 1 - t, frames[i + 1], t, 0))
+    for _ in range(n_hold):
+        write(frames[-1])
+    close()
+    gif = dst.with_suffix(".gif")
+    from PIL import Image
+    small = [Image.fromarray(cv2.resize(fr, (W // 2, H // 2), interpolation=cv2.INTER_AREA)) for fr in frames]
+    small[0].save(gif, save_all=True, append_images=small[1:], duration=[int(hold * 1000)] * (len(small) - 1)
+                  + [int(hold * 2000)], loop=0, optimize=True)
+
+
 def overview(step: dict, tracks: dict, dst: Path, k: int = 0, steps: list[dict] | None = None) -> None:
     """The k-th step's image with each tracked cell outlined and numbered, and its path drawn."""
     img = step["rgb"].copy()
@@ -712,6 +843,9 @@ def main() -> None:
         overview(steps[-1], tracks, out / "cells_overview_last.png", k=len(steps) - 1, steps=steps)
         if len(steps) <= 4:
             series_summary(steps, tracks, sizes, mm_per_px, out / "all_steps.png")
+        if args.video:
+            series_video(steps, tracks, sizes, mm_per_px, out / "series_video.mp4")
+            print(f"wrote {out / 'series_video.mp4'} and .gif")
         pd.DataFrame(table).round(3).to_csv(out / "cell_tracks.csv", index=False)
         print(f"\nResults in {out}")
 
