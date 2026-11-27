@@ -543,41 +543,38 @@ def write_video(steps, rec_list, size: int, dst: Path, fps: float = 25, hold: fl
     close()
 
 
-def pair_summary(steps, tracks: dict, sizes: dict, mm_per_px, dst: Path) -> None:
-    """Two-image series: every tracked cell before | after, with how it changed."""
-    n = len(tracks)
-    cols = min(n, 4)
+def series_summary(steps, tracks: dict, sizes: dict, mm_per_px, dst: Path) -> None:
+    """Short series (2-4 images): every tracked cell at every step side by side, with how it changed."""
+    n, k = len(tracks), len(steps)
+    cols = max(1, min(n, 8 // k))
     rows = math.ceil(n / cols)
-    fig = plt.figure(figsize=(5.2 * cols, 3.3 * rows + 0.8), dpi=110)
+    fig = plt.figure(figsize=(2.6 * k * cols, 3.4 * rows + 0.8), dpi=110)
     unit = "mm" if mm_per_px else "px"
     f = mm_per_px if mm_per_px else 1.0
     for i, (cid, recs) in enumerate(tracks.items()):
-        a, b = recs[0], recs[-1]
-        ta = tile(steps[0], a, sizes[cid])
-        tb = tile(steps[-1], b, sizes[cid])
-        pair = np.hstack([ta, np.full((TILE, 8, 3), 255, np.uint8), tb])
+        tiles = []
+        for j, r in enumerate(recs):
+            t = tile(steps[j], r, sizes[cid])
+            cv2.rectangle(t, (0, 0), (TILE - 1, TILE - 1), CONF_COLOURS[r["status"]], 6)
+            tiles += [t, np.full((TILE, 8, 3), 255, np.uint8)]
         ax = fig.add_subplot(rows, cols, i + 1)
-        ax.imshow(pair)
+        ax.imshow(np.hstack(tiles[:-1]))
         ax.set_xticks([]); ax.set_yticks([])
-        col = np.array(CONF_COLOURS[b["status"]]) / 255
         for sp in ax.spines.values():
-            sp.set_edgecolor(col); sp.set_linewidth(3)
-        da = 100 * (b["area_px"] / a["area_px"] - 1)
-        x0, y0 = to_frame(steps, a["x"], a["y"], 0, len(steps) - 1)
+            sp.set_visible(False)
+        a, b = recs[0], recs[-1]
+        x0, y0 = to_frame(steps, a["x"], a["y"], 0, len(recs) - 1)
         mvx, mvy = (b["x"] - x0) * f, (b["y"] - y0) * f
-        ar_a, ar_b = a.get("aspect_ratio", np.nan), b.get("aspect_ratio", np.nan)
-        an_a, an_b = a.get("angle_deg", np.nan), b.get("angle_deg", np.nan)
-        ax.set_title(f"cell {cid}      before   |   after        moved {mvx:+.2f}, {mvy:+.2f} {unit} "
-                     f"(right/down +)", fontsize=10, loc="left")
-        note = short_note(b["note"]) if b["note"] else ""
-        ax.set_xlabel(f"area {a['area_px'] * f * f:.3g} -> {b['area_px'] * f * f:.3g} {unit}² ({da:+.0f}%)   "
-                      f"AR {ar_a:.2f} -> {ar_b:.2f}   angle {an_a:.0f} -> {an_b:.0f}°"
-                      + (f"\n{note}" if note else ""), fontsize=8.5,
-                      color="#222222" if b["status"] == "good" else col)
-    fig.suptitle(f"{steps[0]['path'].name}  ->  {steps[-1]['path'].name}      green frame = after-image cell "
-                 "matched cleanly; orange/red = the segmentation outlines it differently after compression, so the "
-                 "outline carried along by the measured motion is shown", fontsize=9.5, x=0.01, ha="left",
-                 color="#555555")
+        ax.set_title(f"cell {cid}:  " + "   |   ".join(r["step"] for r in recs)
+                     + f"\nmoved {mvx:+.2f}, {mvy:+.2f} {unit} in total (right/down +)", fontsize=9, loc="left")
+        area = " > ".join(f"{r['area_px'] * f * f:.3g}" for r in recs)
+        ar = " > ".join(f"{r.get('aspect_ratio', np.nan):.2f}" for r in recs)
+        ang = " > ".join(f"{r.get('angle_deg', np.nan):.0f}" for r in recs)
+        ax.set_xlabel(f"area {area} {unit}² ({100 * (b['area_px'] / a['area_px'] - 1):+.0f}%)\n"
+                      f"AR {ar}    angle {ang}°", fontsize=8.5)
+    fig.suptitle(f"{steps[0]['path'].name}  ->  {steps[-1]['path'].name}      frame per image: green = cell matched "
+                 "cleanly; orange/red = the segmentation outlines it differently, so the outline carried along by "
+                 "the measured motion is shown", fontsize=9.5, x=0.01, ha="left", color="#555555")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(dst)
     plt.close(fig)
@@ -713,8 +710,8 @@ def main() -> None:
     if tracks:
         overview(steps[0], tracks, out / "cells_overview.png", steps=steps)
         overview(steps[-1], tracks, out / "cells_overview_last.png", k=len(steps) - 1, steps=steps)
-        if len(steps) == 2:
-            pair_summary(steps, tracks, sizes, mm_per_px, out / "before_after.png")
+        if len(steps) <= 4:
+            series_summary(steps, tracks, sizes, mm_per_px, out / "all_steps.png")
         pd.DataFrame(table).round(3).to_csv(out / "cell_tracks.csv", index=False)
         print(f"\nResults in {out}")
 
